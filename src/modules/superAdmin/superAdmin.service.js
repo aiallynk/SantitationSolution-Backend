@@ -1,0 +1,1511 @@
+const bcrypt = require('bcrypt');
+const { Op, fn, col, literal } = require('sequelize');
+const {
+  sequelize,
+  Tenant,
+  Geography,
+  PlatformUser,
+  UserRole,
+  Facility,
+  Inspection,
+  AiAnalysisResult,
+  SensorDevice,
+  SensorReading,
+  InspectionTask,
+  Complaint,
+  Alert,
+  NotificationEvent,
+  AuditLog,
+  Role,
+  Permission,
+  IntegrationConfig,
+  StorageUsageMetric,
+  DashboardAggregate,
+  SuperAdminProject,
+  SuperAdminApproval,
+  SuperAdminSupportTicket,
+  SuperAdminReleaseRecord,
+  SuperAdminBackupRecord,
+  SuperAdminSyncFailure,
+  SuperAdminTenantHealth,
+} = require('../../models');
+const AppError = require('../../core/errors/AppError');
+const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const { createAuditLog, listAuditLogs: listAuditLogsService } = require('../audit/audit.service');
+const { getQueueMetrics, isRedisEnabled } = require('../../core/queue/queueManager');
+const { ANALYSIS_QUEUE } = require('../analysis/analysis.queue');
+
+const TENANT_ADMIN_ROLE_CODES = ['tenant_admin', 'country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin'];
+
+const ensureSuperAdmin = (req) => {
+  if (!req.user?.isSuperAdmin) {
+    throw new AppError('Only super admin can access this endpoint', 403, { code: 'SUPER_ADMIN_ONLY' });
+  }
+};
+
+const resolveLimit = (value, fallback = 50, max = 500) => {
+  const parsed = Number.parseInt(String(value || fallback), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+};
+
+const toNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const mapConfigRow = (row) => ({
+  id: row.id,
+  name: row.name,
+  configType: row.config_type,
+  enabled: row.enabled,
+  config: row.config_json,
+  updatedAt: row.updated_at,
+});
+
+const getConfigs = (configType) =>
+  IntegrationConfig.findAll({
+    where: { tenant_id: null, config_type: configType },
+    order: [['updated_at', 'DESC']],
+  });
+
+const upsertConfig = async ({ configType, name, config, enabled = true }) => {
+  const existing = await IntegrationConfig.findOne({
+    where: { tenant_id: null, config_type: configType, name },
+  });
+  if (existing) {
+    await existing.update({ config_json: config, enabled, updated_at: new Date() });
+    return existing;
+  }
+  return IntegrationConfig.create({
+    tenant_id: null,
+    config_type: configType,
+    name,
+    config_json: config,
+    enabled,
+  });
+};
+
+const getTenantMetadata = (tenant) => {
+  if (!tenant?.metadata) {
+    return {};
+  }
+  if (typeof tenant.metadata === 'string') {
+    try {
+      const parsed = JSON.parse(tenant.metadata);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+      return {};
+    } catch (error) {
+      return {};
+    }
+  }
+  if (typeof tenant.metadata !== 'object' || Array.isArray(tenant.metadata)) {
+    return {};
+  }
+  return tenant.metadata;
+};
+
+const mapTenant = (tenant, metrics = null) => {
+  const metadata = getTenantMetadata(tenant);
+  return {
+    id: tenant.id,
+    name: tenant.name,
+    code: tenant.code,
+    status: tenant.status,
+    countryCode: tenant.country_code,
+    plan: metadata.plan || null,
+    metadata,
+    createdAt: tenant.created_at,
+    updatedAt: tenant.updated_at,
+    metrics: metrics || undefined,
+  };
+};
+
+const fetchTenantMetrics = async (tenantId, { transaction } = {}) => {
+  const [facilities, activeUsers, totalUsers, openAlerts, inspections, sectors, sites] = await Promise.all([
+    Facility.count({ where: { tenant_id: tenantId }, transaction }),
+    PlatformUser.count({ where: { tenant_id: tenantId, status: 'active' }, transaction }),
+    PlatformUser.count({ where: { tenant_id: tenantId }, transaction }),
+    Alert.count({
+      where: {
+        tenant_id: tenantId,
+        status: { [Op.in]: ['open', 'acknowledged'] },
+      },
+      transaction,
+    }),
+    Inspection.count({ where: { tenant_id: tenantId }, transaction }),
+    Geography.count({
+      where: {
+        tenant_id: tenantId,
+        level: { [Op.in]: ['zone', 'ward', 'cluster'] },
+      },
+      transaction,
+    }),
+    Facility.count({ where: { tenant_id: tenantId }, transaction }),
+  ]);
+  return {
+    facilities,
+    activeUsers,
+    totalUsers,
+    openAlerts,
+    inspections,
+    sectors,
+    sites,
+  };
+};
+
+const ensureRoleByCode = async (roleCode, { transaction } = {}) => {
+  const role = await Role.findOne({
+    where: { code: roleCode },
+    transaction,
+  });
+  if (!role) {
+    throw new AppError(`Role ${roleCode} is not configured`, 500, {
+      code: 'ROLE_CONFIG_MISSING',
+    });
+  }
+  return role;
+};
+
+const createTenantAdminUser = async ({ req, tenant, admin, transaction }) => {
+  const role = await ensureRoleByCode('tenant_admin', { transaction });
+  const email = String(admin.email).trim().toLowerCase();
+  const fullName = sanitizeText(admin.fullName, 180);
+  const phone = admin.phone ? sanitizeText(admin.phone, 32) : null;
+
+  const existingUser = await PlatformUser.findOne({
+    where: { email },
+    transaction,
+  });
+  if (existingUser) {
+    throw new AppError('Admin email already exists', 409, { code: 'EMAIL_EXISTS' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(admin.password), 10);
+  const createdUser = await PlatformUser.create(
+    {
+      tenant_id: tenant.id,
+      geography_id: admin.geographyId || null,
+      full_name: fullName,
+      email,
+      phone,
+      employee_code: admin.employeeCode ? sanitizeText(admin.employeeCode, 64) : null,
+      password_hash: passwordHash,
+      auth_provider: 'local',
+      status: admin.status || 'active',
+      metadata: admin.metadata || null,
+    },
+    { transaction }
+  );
+
+  await UserRole.create(
+    {
+      user_id: createdUser.id,
+      role_id: role.id,
+      tenant_id: tenant.id,
+      geography_id: admin.geographyId || null,
+    },
+    { transaction }
+  );
+
+  await createAuditLog({
+    req,
+    action: 'super_admin.tenant_admin_create',
+    entityType: 'platform_user',
+    entityId: createdUser.id,
+    tenantId: tenant.id,
+    details: {
+      roleCode: 'tenant_admin',
+      email: createdUser.email,
+    },
+  });
+
+  return {
+    id: createdUser.id,
+    fullName: createdUser.full_name,
+    email: createdUser.email,
+    phone: createdUser.phone,
+    status: createdUser.status,
+    roleCode: 'tenant_admin',
+  };
+};
+
+const getTenants = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await Tenant.findAll({ order: [['name', 'ASC']] });
+  return rows.map((row) => mapTenant(row));
+};
+
+const getTenantById = async (req) => {
+  ensureSuperAdmin(req);
+  const tenant = await Tenant.findByPk(req.params.id);
+  if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+
+  const [metrics, adminRows] = await Promise.all([
+    fetchTenantMetrics(tenant.id),
+    PlatformUser.findAll({
+      where: { tenant_id: tenant.id },
+      include: [
+        {
+          model: Role,
+          where: { code: { [Op.in]: TENANT_ADMIN_ROLE_CODES } },
+          attributes: ['id', 'code', 'name'],
+          through: { attributes: ['tenant_id', 'geography_id'] },
+          required: true,
+        },
+      ],
+      order: [['created_at', 'DESC']],
+      limit: 50,
+    }),
+  ]);
+
+  const admins = adminRows.map((row) => ({
+    id: row.id,
+    fullName: row.full_name,
+    email: row.email,
+    phone: row.phone,
+    status: row.status,
+    roleCodes: [...new Set((row.Roles || []).map((role) => role.code))],
+    geographyId: row.geography_id,
+    createdAt: row.created_at,
+  }));
+
+  return {
+    ...mapTenant(tenant, metrics),
+    admins,
+  };
+};
+
+const getRegions = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await Geography.findAll({
+    where: { level: { [Op.in]: ['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'] } },
+    order: [['name', 'ASC']],
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    level: row.level,
+    code: row.code,
+    name: row.name,
+    parentId: row.parent_id,
+  }));
+};
+
+const getPlatformMetrics = async (req) => {
+  ensureSuperAdmin(req);
+  const [tenants, activeUsers, facilities, inspections, openAlerts] = await Promise.all([
+    Tenant.count(),
+    PlatformUser.count({ where: { status: 'active' } }),
+    Facility.count(),
+    Inspection.count(),
+    Alert.count({ where: { status: { [Op.ne]: 'resolved' } } }),
+  ]);
+  return { tenants, activeUsers, facilities, inspections, openAlerts };
+};
+
+const getStorage = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await StorageUsageMetric.findAll({
+    order: [['measured_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 100, 1000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    bucketName: row.bucket_name,
+    usedBytes: Number(row.used_bytes),
+    objectCount: Number(row.object_count),
+    measuredAt: row.measured_at,
+  }));
+};
+
+const getApiUsage = async (req) => {
+  ensureSuperAdmin(req);
+  const now = Date.now();
+  const [hourly, daily, weekly] = await Promise.all([
+    AuditLog.count({ where: { created_at: { [Op.gte]: new Date(now - 60 * 60 * 1000) } } }),
+    AuditLog.count({ where: { created_at: { [Op.gte]: new Date(now - 24 * 60 * 60 * 1000) } } }),
+    AuditLog.count({ where: { created_at: { [Op.gte]: new Date(now - 7 * 24 * 60 * 60 * 1000) } } }),
+  ]);
+  return { requestsLastHour: hourly, requestsLast24Hours: daily, requestsLast7Days: weekly };
+};
+
+const getSystemHealth = async (req) => {
+  ensureSuperAdmin(req);
+  const [latestSensor, openIncidents, openSyncFailures] = await Promise.all([
+    SensorReading.findOne({ order: [['timestamp', 'DESC']] }),
+    Alert.count({ where: { status: { [Op.in]: ['open', 'acknowledged'] } } }),
+    SuperAdminSyncFailure.count({ where: { status: 'open' } }),
+  ]);
+  return {
+    status: 'ok',
+    time: new Date().toISOString(),
+    latestSensorReadingAt: latestSensor?.timestamp || null,
+    redisEnabled: Boolean(process.env.REDIS_URL && isRedisEnabled()),
+    analysisMode: process.env.ANALYSIS_MODEL_NAME || 'deterministic-rule-analyzer',
+    openIncidents,
+    openSyncFailures,
+  };
+};
+
+const getAuditLogs = async (req) => {
+  ensureSuperAdmin(req);
+  const payload = await listAuditLogsService({
+    ...req,
+    query: {
+      ...req.query,
+      page: req.query.page || 1,
+      limit: req.query.limit || 200,
+    },
+  });
+  return payload;
+};
+
+const postTenantProvision = async (req) => {
+  ensureSuperAdmin(req);
+  return sequelize.transaction(async (transaction) => {
+    const tenantCode = sanitizeText(req.body.code, 120).toUpperCase();
+    const tenantName = sanitizeText(req.body.name, 200);
+    const existingTenant = await Tenant.findOne({
+      where: { code: { [Op.iLike]: tenantCode } },
+      transaction,
+    });
+    if (existingTenant) {
+      throw new AppError('Tenant code already exists', 409, { code: 'TENANT_CODE_EXISTS' });
+    }
+
+    const metadata =
+      req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
+        ? { ...req.body.metadata }
+        : {};
+    if (req.body.plan) {
+      metadata.plan = sanitizeText(req.body.plan, 80);
+    }
+
+    const tenant = await Tenant.create(
+      {
+        name: tenantName,
+        code: tenantCode,
+        status: req.body.status || 'active',
+        country_code: req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null,
+        metadata: Object.keys(metadata).length > 0 ? metadata : null,
+      },
+      { transaction }
+    );
+
+    let onboardedAdmin = null;
+    if (req.body.admin) {
+      onboardedAdmin = await createTenantAdminUser({
+        req,
+        tenant,
+        admin: req.body.admin,
+        transaction,
+      });
+    }
+
+    await createAuditLog({
+      req,
+      action: 'super_admin.tenant_provision',
+      entityType: 'tenant',
+      entityId: tenant.id,
+      tenantId: tenant.id,
+      details: {
+        code: tenant.code,
+        status: tenant.status,
+        plan: metadata.plan || null,
+        onboardedAdminUserId: onboardedAdmin?.id || null,
+      },
+    });
+
+    const metrics = await fetchTenantMetrics(tenant.id, { transaction });
+    return {
+      tenant: mapTenant(tenant, metrics),
+      onboardedAdmin,
+    };
+  });
+};
+
+const patchTenant = async (req) => {
+  ensureSuperAdmin(req);
+  return sequelize.transaction(async (transaction) => {
+    const tenant = await Tenant.findByPk(req.params.id, { transaction });
+    if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+
+    const updates = {};
+    if (req.body.name !== undefined) {
+      updates.name = sanitizeText(req.body.name, 200);
+    }
+    if (req.body.status !== undefined) {
+      updates.status = req.body.status;
+    }
+    if (req.body.countryCode !== undefined) {
+      updates.country_code = req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null;
+    }
+    if (req.body.code !== undefined) {
+      const nextCode = sanitizeText(req.body.code, 120).toUpperCase();
+      const duplicate = await Tenant.findOne({
+        where: {
+          id: { [Op.ne]: tenant.id },
+          code: { [Op.iLike]: nextCode },
+        },
+        transaction,
+      });
+      if (duplicate) {
+        throw new AppError('Tenant code already exists', 409, { code: 'TENANT_CODE_EXISTS' });
+      }
+      updates.code = nextCode;
+    }
+
+    let metadata = getTenantMetadata(tenant);
+    if (req.body.metadata !== undefined) {
+      if (req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)) {
+        metadata = { ...metadata, ...req.body.metadata };
+      } else if (req.body.metadata === null) {
+        metadata = {};
+      }
+    }
+    if (req.body.plan !== undefined) {
+      if (req.body.plan) {
+        metadata.plan = sanitizeText(req.body.plan, 80);
+      } else {
+        delete metadata.plan;
+      }
+    }
+    if (req.body.metadata !== undefined || req.body.plan !== undefined) {
+      updates.metadata = Object.keys(metadata).length ? metadata : null;
+    }
+
+    if (Object.keys(updates).length > 0) {
+      updates.updated_at = new Date();
+      await tenant.update(updates, { transaction });
+    }
+
+    await createAuditLog({
+      req,
+      action: 'super_admin.tenant_update',
+      entityType: 'tenant',
+      entityId: tenant.id,
+      tenantId: tenant.id,
+      details: { changedFields: Object.keys(req.body || {}) },
+    });
+
+    const refreshed = await Tenant.findByPk(tenant.id, { transaction });
+    const metrics = await fetchTenantMetrics(tenant.id, { transaction });
+    return mapTenant(refreshed, metrics);
+  });
+};
+
+const patchFeatureFlags = async (req) => {
+  ensureSuperAdmin(req);
+  const config = await upsertConfig({
+    configType: 'feature_flags',
+    name: req.body.name || 'global_feature_flags',
+    config: req.body.flags || {},
+    enabled: req.body.enabled ?? true,
+  });
+  await createAuditLog({
+    req,
+    action: 'super_admin.feature_flags_update',
+    entityType: 'integration_config',
+    entityId: config.id,
+  });
+  return {
+    id: config.id,
+    name: config.name,
+    enabled: config.enabled,
+    flags: config.config_json,
+  };
+};
+
+const getActionCenter = async (req) => {
+  ensureSuperAdmin(req);
+  const [criticalAlerts, pendingApprovals, openSyncFailures, openSupportTickets, queue] = await Promise.all([
+    Alert.findAll({
+      where: {
+        status: { [Op.in]: ['open', 'acknowledged'] },
+        severity: { [Op.in]: ['high', 'critical'] },
+      },
+      order: [['created_at', 'DESC']],
+      limit: 10,
+    }),
+    SuperAdminApproval.count({ where: { status: 'pending' } }),
+    SuperAdminSyncFailure.count({ where: { status: 'open' } }),
+    SuperAdminSupportTicket.count({ where: { status: { [Op.in]: ['open', 'in_progress'] } } }),
+    getQueueMetrics(ANALYSIS_QUEUE),
+  ]);
+
+  return {
+    counters: {
+      pendingApprovals,
+      openSyncFailures,
+      openSupportTickets,
+      queueBacklog: Number(queue.counts.waiting || 0) + Number(queue.counts.active || 0),
+    },
+    criticalAlerts: criticalAlerts.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      severity: row.severity,
+      message: row.message,
+      status: row.status,
+      facilityId: row.facility_id,
+      createdAt: row.created_at,
+    })),
+  };
+};
+
+const getNotificationsFeed = async (req) => {
+  ensureSuperAdmin(req);
+  const where = {};
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  if (req.query.status) where.status = req.query.status;
+  const rows = await NotificationEvent.findAll({
+    where,
+    order: [['created_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 100, 1000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    userId: row.user_id,
+    eventType: row.event_type,
+    channel: row.channel,
+    payload: row.payload,
+    status: row.status,
+    createdAt: row.created_at,
+  }));
+};
+
+const getMultiCityRollups = async (req) => {
+  ensureSuperAdmin(req);
+  const cities = await Geography.findAll({ where: { level: 'city' }, order: [['name', 'ASC']] });
+  const facilities = await Facility.findAll({ attributes: ['id', 'geography_id'] });
+  const alerts = await Alert.findAll({
+    where: { status: { [Op.in]: ['open', 'acknowledged'] } },
+    attributes: ['facility_id'],
+  });
+
+  const cityIndex = new Map(
+    cities.map((city) => [
+      city.id,
+      {
+        geographyId: city.id,
+        cityName: city.name,
+        cityCode: city.code,
+        facilityCount: 0,
+        openAlerts: 0,
+      },
+    ])
+  );
+  const facilityToCity = new Map();
+  facilities.forEach((facility) => {
+    facilityToCity.set(facility.id, facility.geography_id);
+    const bucket = cityIndex.get(facility.geography_id);
+    if (bucket) bucket.facilityCount += 1;
+  });
+  alerts.forEach((alert) => {
+    const cityId = facilityToCity.get(alert.facility_id);
+    const bucket = cityIndex.get(cityId);
+    if (bucket) bucket.openAlerts += 1;
+  });
+  return [...cityIndex.values()];
+};
+
+const getOrganizations = async (req) => {
+  ensureSuperAdmin(req);
+  const tenants = await Tenant.findAll({ order: [['name', 'ASC']] });
+  const tenantIds = tenants.map((tenant) => tenant.id);
+  if (tenantIds.length === 0) {
+    return [];
+  }
+
+  const tenantAdminRole = await Role.findOne({ where: { code: 'tenant_admin' }, attributes: ['id'] });
+  const [facilityCounts, userCounts, alertCounts, tenantAdminCounts] = await Promise.all([
+    Facility.findAll({
+      attributes: ['tenant_id', [fn('COUNT', col('id')), 'count']],
+      where: { tenant_id: { [Op.in]: tenantIds } },
+      group: ['tenant_id'],
+      raw: true,
+    }),
+    PlatformUser.findAll({
+      attributes: ['tenant_id', [fn('COUNT', col('id')), 'count']],
+      where: { tenant_id: { [Op.in]: tenantIds }, status: 'active' },
+      group: ['tenant_id'],
+      raw: true,
+    }),
+    Alert.findAll({
+      attributes: ['tenant_id', [fn('COUNT', col('id')), 'count']],
+      where: {
+        tenant_id: { [Op.in]: tenantIds },
+        status: { [Op.in]: ['open', 'acknowledged'] },
+      },
+      group: ['tenant_id'],
+      raw: true,
+    }),
+    tenantAdminRole
+      ? UserRole.findAll({
+          attributes: ['tenant_id', [fn('COUNT', col('id')), 'count']],
+          where: {
+            tenant_id: { [Op.in]: tenantIds },
+            role_id: tenantAdminRole.id,
+          },
+          group: ['tenant_id'],
+          raw: true,
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const facilityMap = new Map(facilityCounts.map((row) => [row.tenant_id, Number(row.count || 0)]));
+  const userMap = new Map(userCounts.map((row) => [row.tenant_id, Number(row.count || 0)]));
+  const alertMap = new Map(alertCounts.map((row) => [row.tenant_id, Number(row.count || 0)]));
+  const tenantAdminMap = new Map(tenantAdminCounts.map((row) => [row.tenant_id, Number(row.count || 0)]));
+
+  return tenants.map((tenant) => ({
+    ...mapTenant(tenant),
+    metrics: {
+      facilities: facilityMap.get(tenant.id) || 0,
+      activeUsers: userMap.get(tenant.id) || 0,
+      openAlerts: alertMap.get(tenant.id) || 0,
+      tenantAdmins: tenantAdminMap.get(tenant.id) || 0,
+    },
+  }));
+};
+
+const getClientWorkspace = async (req) => {
+  ensureSuperAdmin(req);
+  const tenantId = req.query.tenantId;
+  if (!tenantId) throw new AppError('tenantId is required', 400, { code: 'TENANT_REQUIRED' });
+
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+
+  const [facilities, users, alerts, projects] = await Promise.all([
+    Facility.findAll({ where: { tenant_id: tenantId }, order: [['name', 'ASC']], limit: 100 }),
+    PlatformUser.findAll({ where: { tenant_id: tenantId }, order: [['created_at', 'DESC']], limit: 100 }),
+    Alert.findAll({ where: { tenant_id: tenantId }, order: [['created_at', 'DESC']], limit: 25 }),
+    SuperAdminProject.findAll({ where: { tenant_id: tenantId }, order: [['updated_at', 'DESC']], limit: 50 }),
+  ]);
+
+  return {
+    tenant: {
+      id: tenant.id,
+      name: tenant.name,
+      code: tenant.code,
+      status: tenant.status,
+      countryCode: tenant.country_code,
+    },
+    summary: {
+      facilities: facilities.length,
+      users: users.length,
+      openAlerts: alerts.filter((row) => row.status !== 'resolved').length,
+      activeProjects: projects.filter((row) => row.status === 'active').length,
+    },
+    facilities: facilities.map((row) => ({ id: row.id, code: row.code, name: row.name, status: row.status })),
+    users: users.map((row) => ({ id: row.id, fullName: row.full_name, email: row.email, status: row.status })),
+    recentAlerts: alerts.map((row) => ({
+      id: row.id,
+      severity: row.severity,
+      message: row.message,
+      status: row.status,
+      createdAt: row.created_at,
+    })),
+    projects: projects.map((row) => ({
+      id: row.id,
+      name: row.name,
+      code: row.code,
+      status: row.status,
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+    })),
+  };
+};
+
+const listProjects = async (req) => {
+  ensureSuperAdmin(req);
+  const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 25, maxLimit: 200 });
+  const where = {};
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  if (req.query.status) where.status = req.query.status;
+  const { rows, count } = await SuperAdminProject.findAndCountAll({
+    where,
+    order: [['updated_at', 'DESC']],
+    limit,
+    offset,
+  });
+  return {
+    items: rows.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      name: row.name,
+      code: row.code,
+      category: row.category,
+      status: row.status,
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+      geographyId: row.geography_id,
+      metadata: row.metadata,
+    })),
+    meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
+  };
+};
+
+const createProject = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminProject.create({
+    tenant_id: req.body.tenantId || null,
+    name: sanitizeText(req.body.name, 220),
+    code: sanitizeText(req.body.code, 120),
+    category: sanitizeText(req.body.category || 'deployment', 80),
+    status: req.body.status || 'planned',
+    starts_at: req.body.startsAt ? new Date(req.body.startsAt) : null,
+    ends_at: req.body.endsAt ? new Date(req.body.endsAt) : null,
+    geography_id: req.body.geographyId || null,
+    metadata: req.body.metadata || null,
+  });
+  await createAuditLog({
+    req,
+    action: 'super_admin.project_create',
+    entityType: 'super_admin_project',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+  });
+  return row;
+};
+
+const getTopology = async (req) => {
+  ensureSuperAdmin(req);
+  const tenants = await Tenant.findAll({ order: [['name', 'ASC']] });
+  const tenantIds = tenants.map((tenant) => tenant.id);
+  const [facilities, sensors, projects] = await Promise.all([
+    Facility.findAll({ attributes: ['tenant_id'], where: { tenant_id: { [Op.in]: tenantIds } }, raw: true }),
+    SensorDevice.findAll({ attributes: ['tenant_id', 'status'], where: { tenant_id: { [Op.in]: tenantIds } }, raw: true }),
+    SuperAdminProject.findAll({ attributes: ['tenant_id', 'status'], where: { tenant_id: { [Op.in]: tenantIds } }, raw: true }),
+  ]);
+  return tenants.map((tenant) => ({
+    tenantId: tenant.id,
+    tenantName: tenant.name,
+    facilities: facilities.filter((row) => row.tenant_id === tenant.id).length,
+    sensors: sensors.filter((row) => row.tenant_id === tenant.id).length,
+    activeSensors: sensors.filter((row) => row.tenant_id === tenant.id && row.status === 'active').length,
+    activeProjects: projects.filter((row) => row.tenant_id === tenant.id && row.status === 'active').length,
+  }));
+};
+
+const getGlobalUsers = async (req) => {
+  ensureSuperAdmin(req);
+  const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 25, maxLimit: 200 });
+  const where = {};
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.search) {
+    const query = sanitizeText(req.query.search, 120);
+    where[Op.or] = [
+      { full_name: { [Op.iLike]: `%${query}%` } },
+      { email: { [Op.iLike]: `%${query}%` } },
+      { phone: { [Op.iLike]: `%${query}%` } },
+      { employee_code: { [Op.iLike]: `%${query}%` } },
+    ];
+  }
+  const { rows, count } = await PlatformUser.findAndCountAll({
+    where,
+    include: [
+      { model: Tenant, attributes: ['id', 'name', 'code', 'status'] },
+      {
+        model: Role,
+        attributes: ['id', 'code', 'name'],
+        through: { attributes: ['tenant_id', 'geography_id'] },
+      },
+    ],
+    order: [['created_at', 'DESC']],
+    limit,
+    offset,
+    distinct: true,
+  });
+  return {
+    items: rows.map((row) => {
+      const memberships = [...new Set(
+        (row.Roles || []).map((role) =>
+          JSON.stringify({
+            roleCode: role.code,
+            roleName: role.name,
+            tenantId: role?.UserRole?.tenant_id || row.tenant_id || null,
+            geographyId: role?.UserRole?.geography_id || row.geography_id || null,
+          })
+        )
+      )].map((serialized) => JSON.parse(serialized));
+
+      return {
+        id: row.id,
+        tenantId: row.tenant_id,
+        tenantName: row.Tenant?.name || null,
+        tenantCode: row.Tenant?.code || null,
+        fullName: row.full_name,
+        email: row.email,
+        phone: row.phone,
+        employeeCode: row.employee_code || null,
+        status: row.status,
+        lastLoginAt: row.last_login_at,
+        roleCodes: [...new Set((row.Roles || []).map((role) => role.code))],
+        memberships,
+      };
+    }),
+    meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
+  };
+};
+
+const getRolesPermissions = async (req) => {
+  ensureSuperAdmin(req);
+  const [roles, permissions] = await Promise.all([
+    Role.findAll({ include: [{ model: Permission }], order: [['name', 'ASC']] }),
+    Permission.findAll({ order: [['name', 'ASC']] }),
+  ]);
+  return {
+    roles: roles.map((role) => ({
+      id: role.id,
+      code: role.code,
+      name: role.name,
+      description: role.description,
+      permissionCodes: (role.Permissions || []).map((item) => item.code),
+    })),
+    permissions: permissions.map((permission) => ({
+      id: permission.id,
+      code: permission.code,
+      name: permission.name,
+      description: permission.description,
+    })),
+  };
+};
+
+const listApprovals = async (req) => {
+  ensureSuperAdmin(req);
+  const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 25, maxLimit: 200 });
+  const where = {};
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  const { rows, count } = await SuperAdminApproval.findAndCountAll({
+    where,
+    order: [['created_at', 'DESC']],
+    limit,
+    offset,
+  });
+  return {
+    items: rows.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      category: row.category,
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      status: row.status,
+      requestedByUserId: row.requested_by_user_id,
+      reviewedByUserId: row.reviewed_by_user_id,
+      notes: row.notes,
+      reviewedAt: row.reviewed_at,
+      createdAt: row.created_at,
+    })),
+    meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
+  };
+};
+
+const createApproval = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminApproval.create({
+    tenant_id: req.body.tenantId || null,
+    requested_by_user_id: req.user.id,
+    category: sanitizeText(req.body.category, 120),
+    entity_type: sanitizeText(req.body.entityType, 120),
+    entity_id: req.body.entityId ? String(req.body.entityId) : null,
+    status: req.body.status || 'pending',
+    notes: req.body.notes ? sanitizeText(req.body.notes, 800) : null,
+  });
+  await createAuditLog({
+    req,
+    action: 'super_admin.approval_create',
+    entityType: 'super_admin_approval',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+  });
+  return row;
+};
+
+const patchApprovalStatus = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminApproval.findByPk(req.params.id);
+  if (!row) throw new AppError('Approval not found', 404, { code: 'APPROVAL_NOT_FOUND' });
+  await row.update({
+    status: req.body.status,
+    reviewed_by_user_id: req.user.id,
+    reviewed_at: new Date(),
+    notes: req.body.notes ? sanitizeText(req.body.notes, 800) : row.notes,
+    updated_at: new Date(),
+  });
+  await createAuditLog({
+    req,
+    action: 'super_admin.approval_update',
+    entityType: 'super_admin_approval',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+    details: { status: req.body.status },
+  });
+  return row;
+};
+
+const getMasterData = async (req) => {
+  ensureSuperAdmin(req);
+  const [roles, permissions, geographies, facilityTypes] = await Promise.all([
+    Role.count(),
+    Permission.count(),
+    Geography.count(),
+    Facility.findAll({
+      attributes: ['facility_type', [fn('COUNT', col('id')), 'count']],
+      group: ['facility_type'],
+      raw: true,
+    }),
+  ]);
+  return {
+    totals: {
+      roles,
+      permissions,
+      geographies,
+      facilityTypes: facilityTypes.length,
+    },
+    facilityTypes: facilityTypes.map((row) => ({
+      facilityType: row.facility_type,
+      count: Number(row.count || 0),
+    })),
+  };
+};
+
+const getScoringThresholds = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await getConfigs('scoring_thresholds');
+  return rows.map(mapConfigRow);
+};
+
+const patchScoringThresholds = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: 'scoring_thresholds',
+    name: req.body.name || 'global_scoring_thresholds',
+    config: req.body.config || req.body.thresholds || {},
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const getEscalationPolicies = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await getConfigs('escalation_policies');
+  return rows.map(mapConfigRow);
+};
+
+const patchEscalationPolicies = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: 'escalation_policies',
+    name: req.body.name || 'global_escalation_policies',
+    config: req.body.config || req.body.policy || {},
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const getTemplates = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await getConfigs('message_template');
+  return rows.map(mapConfigRow);
+};
+
+const upsertTemplate = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: 'message_template',
+    name: req.body.name,
+    config: req.body.config || req.body.template || {},
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const getLocalization = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await getConfigs('localization');
+  return rows.map(mapConfigRow);
+};
+
+const patchLocalization = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: 'localization',
+    name: req.body.name || 'global_localization',
+    config: req.body.config || {},
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const getPlatformAnalytics = async (req) => {
+  ensureSuperAdmin(req);
+  const days = Math.min(Number(req.query.days || 14), 90);
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  const [inspectionRows, aggregateRows] = await Promise.all([
+    Inspection.findAll({
+      attributes: [[fn('DATE', col('captured_at')), 'date'], [fn('COUNT', col('id')), 'count']],
+      where: { captured_at: { [Op.gte]: start } },
+      group: [literal('DATE("Inspection"."captured_at")')],
+      raw: true,
+    }),
+    DashboardAggregate.findAll({
+      where: { aggregate_date: { [Op.gte]: start.toISOString().slice(0, 10) } },
+      order: [['aggregate_date', 'ASC']],
+      raw: true,
+    }),
+  ]);
+  return {
+    inspections: inspectionRows.map((row) => ({ date: String(row.date), count: Number(row.count || 0) })),
+    aggregates: aggregateRows.map((row) => ({ date: row.aggregate_date, metrics: row.metrics })),
+  };
+};
+
+const getStorageAnalytics = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await StorageUsageMetric.findAll({
+    order: [['measured_at', 'ASC']],
+    limit: resolveLimit(req.query.limit, 200, 2000),
+  });
+  const grouped = new Map();
+  rows.forEach((row) => {
+    const date = new Date(row.measured_at).toISOString().slice(0, 10);
+    const current = grouped.get(date) || { date, usedBytes: 0, objectCount: 0 };
+    current.usedBytes += Number(row.used_bytes || 0);
+    current.objectCount += Number(row.object_count || 0);
+    grouped.set(date, current);
+  });
+  return { points: [...grouped.values()] };
+};
+
+const getAiUsage = async (req) => {
+  ensureSuperAdmin(req);
+  const [daily, byModel] = await Promise.all([
+    AiAnalysisResult.findAll({
+      attributes: [[fn('DATE', col('processed_at')), 'date'], [fn('COUNT', col('id')), 'count']],
+      group: [literal('DATE("AiAnalysisResult"."processed_at")')],
+      raw: true,
+      order: [[literal('DATE("AiAnalysisResult"."processed_at")'), 'ASC']],
+    }),
+    AiAnalysisResult.findAll({
+      attributes: ['model_name', 'model_version', [fn('COUNT', col('id')), 'count']],
+      group: ['model_name', 'model_version'],
+      raw: true,
+      order: [[literal('count'), 'DESC']],
+    }),
+  ]);
+  return {
+    daily: daily.map((row) => ({ date: String(row.date), count: Number(row.count || 0) })),
+    byModel: byModel.map((row) => ({
+      modelName: row.model_name,
+      modelVersion: row.model_version,
+      count: Number(row.count || 0),
+    })),
+  };
+};
+
+const getQueueHealth = async (req) => {
+  ensureSuperAdmin(req);
+  return {
+    redisEnabled: isRedisEnabled(),
+    queues: [await getQueueMetrics(ANALYSIS_QUEUE)],
+  };
+};
+
+const getSyncFailures = async (req) => {
+  ensureSuperAdmin(req);
+  const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 50, maxLimit: 500 });
+  const where = {};
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  if (req.query.severity) where.severity = req.query.severity;
+  const { rows, count } = await SuperAdminSyncFailure.findAndCountAll({
+    where,
+    order: [['last_seen_at', 'DESC']],
+    limit,
+    offset,
+  });
+  return {
+    items: rows.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      sourceModule: row.source_module,
+      referenceId: row.reference_id,
+      severity: row.severity,
+      reason: row.reason,
+      status: row.status,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      resolvedAt: row.resolved_at,
+      payload: row.payload,
+    })),
+    meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
+  };
+};
+
+const patchSyncFailureStatus = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminSyncFailure.findByPk(req.params.id);
+  if (!row) throw new AppError('Sync failure not found', 404, { code: 'SYNC_FAILURE_NOT_FOUND' });
+  await row.update({
+    status: req.body.status,
+    resolved_at: req.body.status === 'resolved' ? new Date() : null,
+    updated_at: new Date(),
+  });
+  return row;
+};
+
+const getDeviceFleet = async (req) => {
+  ensureSuperAdmin(req);
+  const devices = await SensorDevice.findAll({ order: [['last_seen_at', 'DESC']], limit: resolveLimit(req.query.limit, 1000, 5000) });
+  const now = Date.now();
+  const staleMs = Number(req.query.staleMinutes || 60) * 60 * 1000;
+  const counters = { total: devices.length, active: 0, inactive: 0, faulty: 0, stale: 0 };
+  const staleDevices = [];
+  devices.forEach((device) => {
+    if (device.status === 'active') counters.active += 1;
+    if (device.status === 'inactive') counters.inactive += 1;
+    if (device.status === 'faulty') counters.faulty += 1;
+    const lastSeen = device.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
+    if (!lastSeen || now - lastSeen > staleMs) {
+      counters.stale += 1;
+      staleDevices.push({
+        id: device.id,
+        tenantId: device.tenant_id,
+        facilityId: device.facility_id,
+        deviceId: device.device_id,
+        status: device.status,
+        lastSeenAt: device.last_seen_at,
+      });
+    }
+  });
+  return { counters, staleDevices: staleDevices.slice(0, 200) };
+};
+
+const getTenantHealth = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await SuperAdminTenantHealth.findAll({
+    order: [['snapshot_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 200, 2000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    snapshotAt: row.snapshot_at,
+    healthScore: toNumber(row.health_score, 0),
+    openAlerts: row.open_alerts,
+    pendingTasks: row.pending_tasks,
+    failedSyncs: row.failed_syncs,
+    activeSensors: row.active_sensors,
+    totalSensors: row.total_sensors,
+    metadata: row.metadata,
+  }));
+};
+
+const getSupportConsole = async (req) => {
+  ensureSuperAdmin(req);
+  const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 25, maxLimit: 200 });
+  const where = {};
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.severity) where.severity = req.query.severity;
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  const { rows, count } = await SuperAdminSupportTicket.findAndCountAll({
+    where,
+    order: [['created_at', 'DESC']],
+    limit,
+    offset,
+  });
+  return {
+    items: rows.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      subject: row.subject,
+      description: row.description,
+      severity: row.severity,
+      status: row.status,
+      openedByUserId: row.opened_by_user_id,
+      assignedToUserId: row.assigned_to_user_id,
+      resolvedAt: row.resolved_at,
+      metadata: row.metadata,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
+  };
+};
+
+const createSupportTicket = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminSupportTicket.create({
+    tenant_id: req.body.tenantId || null,
+    opened_by_user_id: req.user.id,
+    assigned_to_user_id: req.body.assignedToUserId || null,
+    subject: sanitizeText(req.body.subject, 240),
+    description: sanitizeText(req.body.description, 2000),
+    severity: req.body.severity || 'medium',
+    status: req.body.status || 'open',
+    metadata: req.body.metadata || null,
+  });
+  return row;
+};
+
+const patchSupportTicket = async (req) => {
+  ensureSuperAdmin(req);
+  const row = await SuperAdminSupportTicket.findByPk(req.params.id);
+  if (!row) throw new AppError('Support ticket not found', 404, { code: 'SUPPORT_TICKET_NOT_FOUND' });
+  await row.update({
+    status: req.body.status || row.status,
+    severity: req.body.severity || row.severity,
+    assigned_to_user_id: req.body.assignedToUserId ?? row.assigned_to_user_id,
+    resolved_at: req.body.status === 'resolved' ? new Date() : row.resolved_at,
+    metadata: req.body.metadata ?? row.metadata,
+    updated_at: new Date(),
+  });
+  return row;
+};
+
+const listIntegrations = async (req) => {
+  ensureSuperAdmin(req);
+  const where = { tenant_id: null };
+  if (req.query.configType) where.config_type = req.query.configType;
+  const rows = await IntegrationConfig.findAll({
+    where,
+    order: [['updated_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 200, 1000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    configType: row.config_type,
+    configJson: row.config_json,
+    enabled: row.enabled,
+    updatedAt: row.updated_at,
+  }));
+};
+
+const upsertIntegration = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: req.body.configType,
+    name: req.body.name,
+    config: req.body.configJson,
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const listReleases = async (req) => {
+  ensureSuperAdmin(req);
+  const where = {};
+  if (req.query.environment) where.environment = req.query.environment;
+  if (req.query.status) where.status = req.query.status;
+  const rows = await SuperAdminReleaseRecord.findAll({
+    where,
+    order: [['created_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 200, 1000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    version: row.version,
+    environment: row.environment,
+    status: row.status,
+    deployedByUserId: row.deployed_by_user_id,
+    deployedAt: row.deployed_at,
+    notes: row.notes,
+    metadata: row.metadata,
+    createdAt: row.created_at,
+  }));
+};
+
+const createRelease = async (req) => {
+  ensureSuperAdmin(req);
+  return SuperAdminReleaseRecord.create({
+    version: sanitizeText(req.body.version, 80),
+    environment: sanitizeText(req.body.environment, 40),
+    status: req.body.status || 'planned',
+    deployed_by_user_id: req.user.id,
+    deployed_at: req.body.deployedAt ? new Date(req.body.deployedAt) : null,
+    notes: req.body.notes ? sanitizeText(req.body.notes, 1200) : null,
+    metadata: req.body.metadata || null,
+  });
+};
+
+const listBackups = async (req) => {
+  ensureSuperAdmin(req);
+  const where = {};
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.tenantId) where.tenant_id = req.query.tenantId;
+  const rows = await SuperAdminBackupRecord.findAll({
+    where,
+    order: [['created_at', 'DESC']],
+    limit: resolveLimit(req.query.limit, 200, 1000),
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    backupType: row.backup_type,
+    storageKey: row.storage_key,
+    sizeBytes: Number(row.size_bytes || 0),
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    retentionUntil: row.retention_until,
+    metadata: row.metadata,
+  }));
+};
+
+const createBackup = async (req) => {
+  ensureSuperAdmin(req);
+  return SuperAdminBackupRecord.create({
+    tenant_id: req.body.tenantId || null,
+    backup_type: sanitizeText(req.body.backupType || 'database', 60),
+    storage_key: req.body.storageKey ? sanitizeText(req.body.storageKey, 500) : null,
+    size_bytes: req.body.sizeBytes || null,
+    status: req.body.status || 'queued',
+    started_at: req.body.startedAt ? new Date(req.body.startedAt) : new Date(),
+    completed_at: req.body.completedAt ? new Date(req.body.completedAt) : null,
+    retention_until: req.body.retentionUntil ? new Date(req.body.retentionUntil) : null,
+    metadata: req.body.metadata || null,
+  });
+};
+
+const getPolicy = async (req) => {
+  ensureSuperAdmin(req);
+  const rows = await getConfigs('policy_document');
+  return rows.map(mapConfigRow);
+};
+
+const patchPolicy = async (req) => {
+  ensureSuperAdmin(req);
+  return upsertConfig({
+    configType: 'policy_document',
+    name: req.body.name || 'global_policy_docs',
+    config: req.body.config || req.body.policy || {},
+    enabled: req.body.enabled ?? true,
+  });
+};
+
+const getReliability = async (req) => {
+  ensureSuperAdmin(req);
+  const [openAlerts, faultySensors, activeSensors, totalSensors, openSyncFailures] = await Promise.all([
+    Alert.count({ where: { status: { [Op.in]: ['open', 'acknowledged'] } } }),
+    SensorDevice.count({ where: { status: 'faulty' } }),
+    SensorDevice.count({ where: { status: 'active' } }),
+    SensorDevice.count(),
+    SuperAdminSyncFailure.count({ where: { status: 'open' } }),
+  ]);
+  const sensorUptimePercent = totalSensors === 0 ? 100 : Number(((activeSensors / totalSensors) * 100).toFixed(2));
+  const reliabilityScore = Math.max(0, Math.min(100, sensorUptimePercent - openAlerts - faultySensors * 1.5 - openSyncFailures * 2));
+  return {
+    sensorUptimePercent,
+    openAlerts,
+    faultySensors,
+    openSyncFailures,
+    reliabilityScore: Number(reliabilityScore.toFixed(2)),
+  };
+};
+
+const getSettings = async (req) => {
+  ensureSuperAdmin(req);
+  const [featureFlags, scoringThresholds, escalationPolicies, localization, policyDocuments] = await Promise.all([
+    getConfigs('feature_flags'),
+    getConfigs('scoring_thresholds'),
+    getConfigs('escalation_policies'),
+    getConfigs('localization'),
+    getConfigs('policy_document'),
+  ]);
+  return {
+    featureFlags: featureFlags.map(mapConfigRow),
+    scoringThresholds: scoringThresholds.map(mapConfigRow),
+    escalationPolicies: escalationPolicies.map(mapConfigRow),
+    localization: localization.map(mapConfigRow),
+    policyDocuments: policyDocuments.map(mapConfigRow),
+  };
+};
+
+const patchSettings = async (req) => {
+  ensureSuperAdmin(req);
+  const sections = req.body.sections || {};
+  const updateMap = [
+    ['featureFlags', 'feature_flags', 'global_feature_flags'],
+    ['scoringThresholds', 'scoring_thresholds', 'global_scoring_thresholds'],
+    ['escalationPolicies', 'escalation_policies', 'global_escalation_policies'],
+    ['localization', 'localization', 'global_localization'],
+    ['policyDocuments', 'policy_document', 'global_policy_docs'],
+  ];
+  const updated = [];
+  for (const [key, configType, defaultName] of updateMap) {
+    if (!sections[key]) continue;
+    const payload = sections[key];
+    const row = await upsertConfig({
+      configType,
+      name: payload.name || defaultName,
+      config: payload.config || {},
+      enabled: payload.enabled ?? true,
+    });
+    updated.push(mapConfigRow(row));
+  }
+  return { updated };
+};
+
+module.exports = {
+  getTenants,
+  getTenantById,
+  getRegions,
+  getPlatformMetrics,
+  getStorage,
+  getApiUsage,
+  getSystemHealth,
+  getAuditLogs,
+  postTenantProvision,
+  patchTenant,
+  patchFeatureFlags,
+  getActionCenter,
+  getNotificationsFeed,
+  getMultiCityRollups,
+  getOrganizations,
+  getClientWorkspace,
+  listProjects,
+  createProject,
+  getTopology,
+  getGlobalUsers,
+  getRolesPermissions,
+  listApprovals,
+  createApproval,
+  patchApprovalStatus,
+  getMasterData,
+  getScoringThresholds,
+  patchScoringThresholds,
+  getEscalationPolicies,
+  patchEscalationPolicies,
+  getTemplates,
+  upsertTemplate,
+  getLocalization,
+  patchLocalization,
+  getPlatformAnalytics,
+  getStorageAnalytics,
+  getAiUsage,
+  getQueueHealth,
+  getSyncFailures,
+  patchSyncFailureStatus,
+  getDeviceFleet,
+  getTenantHealth,
+  getSupportConsole,
+  createSupportTicket,
+  patchSupportTicket,
+  listIntegrations,
+  upsertIntegration,
+  listReleases,
+  createRelease,
+  listBackups,
+  createBackup,
+  getPolicy,
+  patchPolicy,
+  getReliability,
+  getSettings,
+  patchSettings,
+};

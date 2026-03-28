@@ -1,0 +1,306 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Unified Sanitation Platform API",
+    "version": "1.0.0",
+    "description": "API contracts for sanitation monitoring platform"
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/auth/login": {
+      "post": {
+        "summary": "Login",
+        "requestBody": {
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Login success"
+          }
+        }
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "summary": "Refresh tokens",
+        "responses": {
+          "200": {
+            "description": "Refresh success"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "Logout",
+        "responses": {
+          "200": {
+            "description": "Logout success"
+          }
+        }
+      }
+    },
+    "/auth/forgot-password": {
+      "post": {
+        "summary": "Forgot password",
+        "responses": {
+          "200": {
+            "description": "Reset initiated"
+          }
+        }
+      }
+    },
+    "/auth/reset-password": {
+      "post": {
+        "summary": "Reset password",
+        "responses": {
+          "200": {
+            "description": "Reset success"
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "summary": "Get current user",
+        "responses": {
+          "200": {
+            "description": "User profile"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update current user",
+        "responses": {
+          "200": {
+            "description": "Profile updated"
+          }
+        }
+      }
+    },
+    "/users": {
+      "get": {
+        "summary": "List users",
+        "responses": {
+          "200": {
+            "description": "Users list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create user",
+        "responses": {
+          "201": {
+            "description": "User created"
+          }
+        }
+      }
+    },
+    "/roles": {
+      "get": {
+        "summary": "List roles",
+        "responses": {
+          "200": {
+            "description": "Roles list"
+          }
+        }
+      }
+    },
+    "/permissions": {
+      "get": {
+        "summary": "List permissions",
+        "responses": {
+          "200": {
+            "description": "Permissions list"
+          }
+        }
+      }
+    },
+    "/tasks/my": {
+      "get": {
+        "summary": "My tasks",
+        "responses": {
+          "200": {
+            "description": "Task list"
+          }
+        }
+      }
+    },
+    "/inspections": {
+      "post": {
+        "summary": "Create inspection",
+        "responses": {
+          "201": {
+            "description": "Inspection created"
+          }
+        }
+      },
+      "get": {
+        "summary": "List inspections",
+        "responses": {
+          "200": {
+            "description": "Inspection list"
+          }
+        }
+      }
+    },
+    "/inspections/{id}": {
+      "get": {
+        "summary": "Get inspection by id",
+        "responses": {
+          "200": {
+            "description": "Inspection details"
+          }
+        }
+      }
+    },
+    "/inspections/{id}/submit": {
+      "post": {
+        "summary": "Submit inspection",
+        "responses": {
+          "202": {
+            "description": "Inspection submitted"
+          }
+        }
+      }
+    },
+    "/inspections/{id}/media": {
+      "post": {
+        "summary": "Upload inspection media",
+        "responses": {
+          "201": {
+            "description": "Media uploaded"
+          }
+        }
+      }
+    },
+    "/media/upload-init": {
+      "post": {
+        "summary": "Initialize media upload",
+        "responses": {
+          "201": {
+            "description": "Upload initialized"
+          }
+        }
+      }
+    },
+    "/media/upload-complete": {
+      "post": {
+        "summary": "Complete media upload",
+        "responses": {
+          "200": {
+            "description": "Upload completed"
+          }
+        }
+      }
+    },
+    "/analysis/inspections/{inspectionId}/run": {
+      "post": {
+        "summary": "Run inspection analysis",
+        "responses": {
+          "202": {
+            "description": "Analysis queued"
+          }
+        }
+      }
+    },
+    "/analysis/inspections/{inspectionId}/result": {
+      "get": {
+        "summary": "Get analysis result",
+        "responses": {
+          "200": {
+            "description": "Analysis status/result"
+          }
+        }
+      }
+    },
+    "/sensor-ingestion/readings": {
+      "post": {
+        "summary": "Ingest sensor reading",
+        "responses": {
+          "202": {
+            "description": "Reading ingested"
+          }
+        }
+      }
+    },
+    "/sensors": {
+      "get": {
+        "summary": "List sensors",
+        "responses": {
+          "200": {
+            "description": "Sensor list"
+          }
+        }
+      }
+    },
+    "/dashboard/overview": {
+      "get": {
+        "summary": "Dashboard overview",
+        "responses": {
+          "200": {
+            "description": "Overview data"
+          }
+        }
+      }
+    },
+    "/dashboard/heatmap": {
+      "get": {
+        "summary": "Dashboard heatmap",
+        "responses": {
+          "200": {
+            "description": "Heatmap points"
+          }
+        }
+      }
+    },
+    "/super-admin/platform-metrics": {
+      "get": {
+        "summary": "Super admin metrics",
+        "responses": {
+          "200": {
+            "description": "Platform metrics"
+          }
+        }
+      }
+    },
+    "/reports/export": {
+      "get": {
+        "summary": "Export reports",
+        "responses": {
+          "200": {
+            "description": "File download"
+          }
+        }
+      }
+    },
+    "/live/stream": {
+      "get": {
+        "summary": "SSE stream",
+        "responses": {
+          "200": {
+            "description": "Event stream"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,104 +1,117 @@
+const { sendSuccess } = require('../../core/http/response');
 const inspectionService = require('./inspection.service');
-const { sendSuccess } = require('../../utils/response');
+const { getInspectionAnalysisTrend } = require('../analysis/analysis.service');
 
-const uploadLegacyInspection = async (req, res, next) => {
+const postInspection = async (req, res, next) => {
   try {
-    const result = await inspectionService.createLegacyInspection({
-      workerId: req.user.id,
-      file: req.file,
-    });
-
-    sendSuccess(res, {
+    const data = await inspectionService.createInspection(req);
+    return sendSuccess(res, {
       statusCode: 201,
-      message: result.message,
-      data: result,
+      message: 'Inspection created successfully',
+      data,
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 };
 
-const submitInspection = async (req, res, next) => {
+const postInspectionMedia = async (req, res, next) => {
   try {
-    const result = await inspectionService.submitInspection({
-      workerId: req.user.id,
-      body: req.body,
-      files: req.files,
-    });
-
-    sendSuccess(res, {
+    const data = await inspectionService.uploadInspectionMedia(req);
+    return sendSuccess(res, {
       statusCode: 201,
-      message: 'Inspection submitted successfully',
-      data: result,
+      message: 'Inspection media uploaded successfully',
+      data,
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 };
 
-const getAllInspections = async (req, res, next) => {
+const postSubmitInspection = async (req, res, next) => {
   try {
-    const result = await inspectionService.getAllInspections(req.query);
-
-    sendSuccess(res, {
-      statusCode: 200,
-      message: 'Inspections fetched successfully',
-      data: result.inspections,
-      meta: result.meta,
+    const data = await inspectionService.submitInspection(req);
+    return sendSuccess(res, {
+      statusCode: 202,
+      message: 'Inspection submitted and queued for analysis',
+      data,
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 };
 
-const getRecentInspections = async (req, res, next) => {
+const patchReviewInspection = async (req, res, next) => {
   try {
-    const inspections = await inspectionService.getRecentInspections(req.query);
-
-    sendSuccess(res, {
-      statusCode: 200,
-      message: 'Recent inspections fetched successfully',
-      data: inspections,
+    const data = await inspectionService.reviewInspection(req);
+    return sendSuccess(res, {
+      message: 'Inspection review updated successfully',
+      data,
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 };
 
 const getInspectionById = async (req, res, next) => {
   try {
-    const inspection = await inspectionService.getInspectionById(req.params.id);
-
-    sendSuccess(res, {
-      statusCode: 200,
-      message: 'Inspection details fetched successfully',
-      data: inspection,
+    const data = await inspectionService.getInspectionById(req);
+    return sendSuccess(res, {
+      message: 'Inspection fetched successfully',
+      data,
     });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 };
 
 const getMyInspections = async (req, res, next) => {
   try {
-    const result = await inspectionService.getMyInspections(req.user.id, req.query);
-
-    sendSuccess(res, {
-      statusCode: 200,
-      message: 'Worker inspection history fetched successfully',
-      data: result.inspections,
+    const result = await inspectionService.listInspections(req, true);
+    return sendSuccess(res, {
+      message: 'My inspections fetched successfully',
+      data: result.items,
       meta: result.meta,
     });
   } catch (error) {
-    next(error);
+    return next(error);
+  }
+};
+
+const getAllInspections = async (req, res, next) => {
+  try {
+    const result = await inspectionService.listInspections(req, false);
+    return sendSuccess(res, {
+      message: 'Inspections fetched successfully',
+      data: result.items,
+      meta: result.meta,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getInspectionTrend = async (req, res, next) => {
+  try {
+    const data = await getInspectionAnalysisTrend(req.params.id, req, {
+      limit: req.query.limit,
+    });
+    return sendSuccess(res, {
+      message: 'Inspection trend fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
   }
 };
 
 module.exports = {
-  uploadLegacyInspection,
-  submitInspection,
-  getAllInspections,
-  getRecentInspections,
+  postInspection,
+  postInspectionMedia,
+  postSubmitInspection,
   getInspectionById,
+  getInspectionTrend,
   getMyInspections,
+  getAllInspections,
+  patchReviewInspection,
 };
