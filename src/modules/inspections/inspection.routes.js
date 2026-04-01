@@ -12,6 +12,7 @@ const {
   validateReviewInspection,
 } = require('./inspection.validator');
 const { protect, requirePermissions } = require('../../core/middleware/auth');
+const requireScope = require('../../core/rbac/requireScope');
 
 const router = express.Router();
 
@@ -69,10 +70,10 @@ const upload = multer({
 router.use(protect);
 
 router.post('/inspections', requirePermissions('inspection.create'), validate(validateCreateInspection), inspectionController.postInspection);
-router.get('/inspections', requirePermissions('inspection.review'), validate(validateInspectionListQuery), inspectionController.getAllInspections);
-router.get('/inspections/my', requirePermissions('inspection.create'), validate(validateInspectionListQuery), inspectionController.getMyInspections);
-router.get('/inspections/:id/trend', requirePermissions('dashboard.read'), inspectionController.getInspectionTrend);
-router.get('/inspections/:id', requirePermissions('dashboard.read'), inspectionController.getInspectionById);
+router.get('/inspections', requirePermissions('inspection.review'), requireScope(), validate(validateInspectionListQuery), inspectionController.getAllInspections);
+router.get('/inspections/my', requirePermissions('inspection.create'), requireScope(), validate(validateInspectionListQuery), inspectionController.getMyInspections);
+router.get('/inspections/:id/trend', requirePermissions('dashboard.read'), requireScope(), inspectionController.getInspectionTrend);
+router.get('/inspections/:id', requirePermissions('dashboard.read'), requireScope(), inspectionController.getInspectionById);
 router.post(
   '/inspections/:id/media',
   requirePermissions('inspection.create'),

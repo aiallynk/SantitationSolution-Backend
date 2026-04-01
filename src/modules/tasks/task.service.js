@@ -4,11 +4,13 @@ const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 
 const scopedWhere = (req, extra = {}) => {
-  const where = { ...extra };
+  const result = { ...extra };
   if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
+    result.tenant_id = req.user.tenantId;
   }
-  return where;
+  // Note: geographyFilter is handled via JOIN in listTasks/getMyTasks 
+  // because InspectionTask doesn't have geography_id column natively.
+  return result;
 };
 
 const mapTask = (task) => ({
@@ -46,6 +48,7 @@ const listTasks = async (req) => {
     limit: 20,
     maxLimit: 100,
   });
+  
   const where = scopedWhere(req);
   if (req.query.status) {
     where.status = req.query.status;
@@ -57,9 +60,17 @@ const listTasks = async (req) => {
     where.facility_id = req.query.facilityId;
   }
 
+  const geoFilter = req.scope?.geographyFilter || {};
   const { rows, count } = await InspectionTask.findAndCountAll({
     where,
-    include: [{ model: Facility }, { model: ToiletUnit }],
+    include: [
+      { 
+        model: Facility, 
+        required: true, 
+        where: geoFilter.geography_id ? geoFilter : {} 
+      }, 
+      { model: ToiletUnit }
+    ],
     order: [['scheduled_at', 'DESC']],
     limit,
     offset,

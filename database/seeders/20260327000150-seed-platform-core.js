@@ -176,7 +176,6 @@ module.exports = {
       ['super_admin', 'Super Admin'],
       ['platform_ops', 'Platform Operations'],
       ['tenant_admin', 'Tenant Admin'],
-      ['country_admin', 'Country Admin'],
       ['state_admin', 'State Admin'],
       ['district_admin', 'District Admin'],
       ['city_admin', 'City Admin'],
@@ -187,6 +186,7 @@ module.exports = {
       ['contractor_manager', 'Contractor Manager'],
       ['viewer', 'Viewer'],
       ['auditor', 'Auditor'],
+      ['country_admin', 'Country Admin'],
     ];
 
     const roleRows = roles.map(([code, name], index) => ({
@@ -232,9 +232,18 @@ module.exports = {
 
     const rolePermissions = [
       ['super_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'super_admin.read', 'super_admin.write', 'users.manage', 'reports.read', 'reports.export', 'tenants.manage', 'audit.read']],
+      ['platform_ops', ['auth.read', 'dashboard.read', 'inspection.review', 'super_admin.read', 'super_admin.write', 'sensor.read', 'alerts.manage', 'audit.read', 'reports.read']],
       ['tenant_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['country_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['state_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['district_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['city_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['zone_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
+      ['facility_manager', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'reports.read', 'reports.export']],
+      ['contractor_manager', ['auth.read', 'dashboard.read', 'task.manage', 'alerts.manage', 'reports.read', 'reports.export']],
       ['supervisor', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'reports.read']],
-      ['field_worker', ['auth.read', 'inspection.create', 'dashboard.read']],
+      ['field_worker', ['auth.read', 'inspection.create']],
+      ['auditor', ['auth.read', 'audit.read', 'reports.read', 'reports.export']],
       ['viewer', ['auth.read', 'dashboard.read', 'reports.read']],
     ];
 

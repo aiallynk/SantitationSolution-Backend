@@ -25,6 +25,7 @@ const PlatformUser = sequelize.define(
   {
     id: defineUuidId(),
     tenant_id: { type: DataTypes.UUID, allowNull: true },
+    geography_type: { type: DataTypes.STRING(80), allowNull: true },
     geography_id: { type: DataTypes.UUID, allowNull: true },
     full_name: { type: DataTypes.STRING(180), allowNull: false },
     email: { type: DataTypes.STRING(180), allowNull: false, unique: true },

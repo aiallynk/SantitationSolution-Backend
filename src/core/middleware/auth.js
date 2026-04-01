@@ -1,9 +1,18 @@
 const jwt = require('jsonwebtoken');
 const AppError = require('../errors/AppError');
 const { PlatformUser, Role, Permission } = require('../../models');
+const { ROLE_CODES } = require('../rbac/policy');
 
 const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET || 'change-me-access-secret';
-const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
+const GLOBAL_ROLE_CODES = new Set([
+  ROLE_CODES.SUPER_ADMIN,
+  ROLE_CODES.PLATFORM_OPS,
+  ROLE_CODES.COUNTRY_ADMIN,
+  ROLE_CODES.STATE_ADMIN,
+  ROLE_CODES.DISTRICT_ADMIN,
+  ROLE_CODES.CITY_ADMIN,
+  ROLE_CODES.AUDITOR,
+]);
 
 const parseBearer = (req) => {
   const auth = req.headers.authorization;
@@ -210,12 +219,29 @@ const applyTenantFilter = (tenantKey = 'tenant_id') => {
 
 const tenantScoped = () => {
   return (req, res, next) => {
+    const activeGeographyIds = [
+      ...new Set((req.user?.activeMemberships || []).map((item) => item.geographyId).filter(Boolean)),
+    ];
     req.scope = {
       tenantId: req.user?.tenantId || null,
       geographyId: req.user?.geographyId || null,
+      geographyIds: activeGeographyIds,
       isSuperAdmin: Boolean(req.user?.isSuperAdmin),
     };
     return next();
+  };
+};
+
+const requireApprovalAccess = () => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    const permissionSet = new Set(req.user.permissionCodes || []);
+    if (req.user.isSuperAdmin || permissionSet.has('super_admin.write')) {
+      return next();
+    }
+    return next(new AppError('Approval privileges are required', 403, { code: 'APPROVAL_FORBIDDEN' }));
   };
 };
 
@@ -223,6 +249,7 @@ module.exports = {
   protect,
   requireRoles,
   requirePermissions,
+  requireApprovalAccess,
   requireTenantContext,
   applyTenantFilter,
   tenantScoped,

@@ -160,8 +160,11 @@ const listSensors = async (req) => {
     where.facility_id = req.query.facilityId;
   }
 
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const { rows, count } = await SensorDevice.findAndCountAll({
     where,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     order: [['last_seen_at', 'DESC']],
     limit,
     offset,
@@ -186,12 +189,20 @@ const listSensors = async (req) => {
 };
 
 const listSensorReadings = async (req) => {
-  const device = await SensorDevice.findByPk(req.params.id);
+  const device = await SensorDevice.findByPk(req.params.id, {
+    include: [{ model: Facility }],
+  });
   if (!device) {
     throw new AppError('Sensor device not found', 404, { code: 'SENSOR_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
     throw new AppError('Sensor out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  // Verify geography scope if applicable
+  const geoFilter = req.scope?.geographyFilter || {};
+  if (geoFilter.geography_id && device.Facility && !geoFilter.geography_id.includes(device.Facility.geography_id)) {
+    throw new AppError('Sensor out of geography scope', 403, { code: 'GEOGRAPHY_SCOPE_FORBIDDEN' });
   }
   const { page, limit, offset } = normalizePagination(req.query);
   const { rows, count } = await SensorReading.findAndCountAll({
@@ -214,6 +225,12 @@ const getFacilityLiveMetrics = async (req) => {
   }
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  // Verify geography scope if applicable
+  const geoFilter = req.scope?.geographyFilter || {};
+  if (geoFilter.geography_id && !geoFilter.geography_id.includes(facility.geography_id)) {
+    throw new AppError('Facility out of geography scope', 403, { code: 'GEOGRAPHY_SCOPE_FORBIDDEN' });
   }
 
   const devices = await SensorDevice.findAll({
@@ -268,8 +285,11 @@ const getLiveAlerts = async (req) => {
     where.tenant_id = req.query.tenantId;
   }
 
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const alerts = await Alert.findAll({
     where,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     order: [['created_at', 'DESC']],
     limit: Number(req.query.limit || 100),
   });

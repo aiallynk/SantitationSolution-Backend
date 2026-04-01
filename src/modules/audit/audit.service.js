@@ -11,6 +11,7 @@ const {
   SuperAdminSupportTicket,
 } = require('../../models');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const { APPROVAL_REQUIRED_ACTIONS } = require('../../core/rbac/policy');
 
 const ACTION_LABELS = {
   'auth.login': 'User Logged In',
@@ -252,6 +253,18 @@ const createAuditLog = async ({
   details = null,
 }) => {
   try {
+    const nextDetails =
+      details && typeof details === 'object'
+        ? {
+            ...details,
+            approvalRequired:
+              details.approvalRequired === undefined
+                ? APPROVAL_REQUIRED_ACTIONS.has(action)
+                : details.approvalRequired,
+          }
+        : APPROVAL_REQUIRED_ACTIONS.has(action)
+          ? { approvalRequired: true }
+          : details;
     await AuditLog.create({
       tenant_id: tenantId || req?.user?.tenantId || null,
       actor_user_id: actorUserId || req?.user?.id || null,
@@ -261,7 +274,7 @@ const createAuditLog = async ({
       request_id: req?.requestId || null,
       ip_address: req?.ip || req?.headers['x-forwarded-for'] || null,
       user_agent: req?.headers['user-agent'] || null,
-      details,
+      details: nextDetails,
     });
   } catch (error) {
     // eslint-disable-next-line no-console

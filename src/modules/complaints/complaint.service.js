@@ -19,13 +19,22 @@ const mapComplaint = (row) => ({
 });
 
 const loadScopedComplaint = async (req) => {
-  const complaint = await Complaint.findByPk(req.params.id);
+  const complaint = await Complaint.findByPk(req.params.id, {
+    include: [{ model: Facility }],
+  });
   if (!complaint) {
     throw new AppError('Complaint not found', 404, { code: 'COMPLAINT_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && complaint.tenant_id !== req.user.tenantId) {
     throw new AppError('Complaint out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+
+  // Verify geography scope if applicable
+  const geoFilter = req.scope?.geographyFilter || {};
+  if (geoFilter.geography_id && complaint.Facility && !geoFilter.geography_id.includes(complaint.Facility.geography_id)) {
+    throw new AppError('Complaint out of geography scope', 403, { code: 'GEOGRAPHY_SCOPE_FORBIDDEN' });
+  }
+
   return complaint;
 };
 
@@ -39,8 +48,11 @@ const listComplaints = async (req) => {
   if (req.query.priority) where.priority = req.query.priority;
   if (req.query.facilityId) where.facility_id = req.query.facilityId;
 
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const { rows, count } = await Complaint.findAndCountAll({
     where,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     order: [['created_at', 'DESC']],
     limit,
     offset,

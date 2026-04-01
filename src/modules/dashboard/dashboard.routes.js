@@ -1,10 +1,11 @@
 const express = require('express');
 const dashboardController = require('./dashboard.controller');
 const { protect, requirePermissions } = require('../../core/middleware/auth');
+const requireScope = require('../../core/rbac/requireScope');
 
 const router = express.Router();
 
-router.use('/dashboard', protect, requirePermissions('dashboard.read'));
+router.use('/dashboard', protect, requirePermissions('dashboard.read'), requireScope());
 
 router.get('/dashboard/overview', dashboardController.getOverview);
 router.get('/dashboard/map', dashboardController.getMap);

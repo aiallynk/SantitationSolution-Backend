@@ -1,22 +1,23 @@
 const { Op } = require('sequelize');
 const AppError = require('../../core/errors/AppError');
-const { Alert } = require('../../models');
+const { Alert, Facility, PlatformUser } = require('../../models');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 
 const scopedWhere = (req) => {
-  const where = {};
+  const result = {};
   if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
+    result.tenant_id = req.user.tenantId;
   } else if (req.query.tenantId) {
-    where.tenant_id = req.query.tenantId;
+    result.tenant_id = req.query.tenantId;
   }
-  if (req.query.status) where.status = req.query.status;
-  if (req.query.severity) where.severity = req.query.severity;
-  if (req.query.facilityId) where.facility_id = req.query.facilityId;
-  if (req.query.sourceType) where.source_type = req.query.sourceType;
-  return where;
+
+  if (req.query.status) result.status = req.query.status;
+  if (req.query.severity) result.severity = req.query.severity;
+  if (req.query.facilityId) result.facility_id = req.query.facilityId;
+  if (req.query.sourceType) result.source_type = req.query.sourceType;
+  return result;
 };
 
 const mapAlert = (alert) => ({
@@ -37,8 +38,12 @@ const mapAlert = (alert) => ({
 
 const listAlerts = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
+  const tenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const { rows, count } = await Alert.findAndCountAll({
-    where: scopedWhere(req),
+    where: tenantFilter,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     order: [['created_at', 'DESC']],
     limit,
     offset,
@@ -55,13 +60,22 @@ const listAlerts = async (req) => {
 };
 
 const getAlertById = async (req) => {
-  const alert = await Alert.findByPk(req.params.id);
+  const alert = await Alert.findByPk(req.params.id, {
+    include: [{ model: Facility }],
+  });
   if (!alert) {
     throw new AppError('Alert not found', 404, { code: 'ALERT_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && alert.tenant_id !== req.user.tenantId) {
     throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  
+  // Verify geography scope if applicable
+  const geoFilter = req.scope?.geographyFilter || {};
+  if (geoFilter.geography_id && !geoFilter.geography_id.includes(alert.Facility?.geography_id)) {
+    throw new AppError('Alert out of geography scope', 403, { code: 'GEOGRAPHY_SCOPE_FORBIDDEN' });
+  }
+
   return mapAlert(alert);
 };
 
@@ -133,11 +147,14 @@ const resolveAlert = async (req) => {
 };
 
 const getAlertSummary = async (req) => {
-  const where = scopedWhere(req);
+  const tenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
+  const include = geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [];
+
   const [open, acknowledged, critical] = await Promise.all([
-    Alert.count({ where: { ...where, status: 'open' } }),
-    Alert.count({ where: { ...where, status: 'acknowledged' } }),
-    Alert.count({ where: { ...where, severity: 'critical', status: { [Op.ne]: 'resolved' } } }),
+    Alert.count({ where: { ...tenantFilter, status: 'open' }, include }),
+    Alert.count({ where: { ...tenantFilter, status: 'acknowledged' }, include }),
+    Alert.count({ where: { ...tenantFilter, severity: 'critical', status: { [Op.ne]: 'resolved' } }, include }),
   ]);
 
   return {

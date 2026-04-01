@@ -59,10 +59,11 @@ const normalizeInspectionType = (value) => {
 };
 
 const scopedWhere = (req, where = {}) => {
+  const result = { ...where };
   if (!req.user.isSuperAdmin) {
-    return { ...where, tenant_id: req.user.tenantId };
+    result.tenant_id = req.user.tenantId;
   }
-  return where;
+  return result;
 };
 
 const includeInspectionRelations = () => [
@@ -529,9 +530,13 @@ const listInspections = async (req, myOnly = false) => {
     where.facility_id = req.query.facilityId;
   }
 
+  const geoFilter = req.scope?.geographyFilter || {};
   const { rows, count } = await Inspection.findAndCountAll({
     where,
-    include: includeInspectionRelations(),
+    include: [
+      ...includeInspectionRelations(),
+      ...(geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : []),
+    ],
     order: [['captured_at', 'DESC']],
     limit,
     offset,

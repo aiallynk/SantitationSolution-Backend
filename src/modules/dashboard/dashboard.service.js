@@ -15,13 +15,16 @@ const {
 } = require('../../models');
 
 const scopedWhere = (req, key = 'tenant_id') => {
+  const where = {};
   if (req.user.isSuperAdmin) {
     if (req.query.tenantId) {
-      return { [key]: req.query.tenantId };
+      where[key] = req.query.tenantId;
     }
-    return {};
+  } else {
+    where[key] = req.user.tenantId;
   }
-  return { [key]: req.user.tenantId };
+
+  return where;
 };
 
 const toNumber = (value, fallback = 0) => {
@@ -31,11 +34,7 @@ const toNumber = (value, fallback = 0) => {
 
 const getOverview = async (req) => {
   const tenantFilter = scopedWhere(req);
-  const inspectionTenantFilter = scopedWhere(req);
-  const alertTenantFilter = scopedWhere(req);
-  const taskTenantFilter = scopedWhere(req);
-  const complaintTenantFilter = scopedWhere(req);
-  const sensorTenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -51,13 +50,17 @@ const getOverview = async (req) => {
     tasksInProgress,
     usersActive,
   ] = await Promise.all([
-    Facility.count({ where: tenantFilter }),
-    Alert.count({ where: { ...alertTenantFilter, status: { [Op.in]: ['open', 'acknowledged'] } } }),
+    Facility.count({ where: { ...tenantFilter, ...geoFilter } }),
+    Alert.count({
+      where: { ...tenantFilter, status: { [Op.in]: ['open', 'acknowledged'] } },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
+    }),
     Inspection.count({
       where: {
-        ...inspectionTenantFilter,
+        ...tenantFilter,
         created_at: { [Op.gte]: todayStart },
       },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     }),
     AiAnalysisResult.findOne({
       attributes: [[fn('AVG', col('cleanliness_score')), 'avgCleanliness']],
@@ -66,16 +69,31 @@ const getOverview = async (req) => {
           model: Inspection,
           attributes: [],
           required: true,
-          where: inspectionTenantFilter,
+          where: tenantFilter,
+          include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
         },
       ],
       raw: true,
     }),
-    SensorDevice.count({ where: { ...sensorTenantFilter, status: 'active' } }),
-    SensorDevice.count({ where: sensorTenantFilter }),
-    Complaint.count({ where: { ...complaintTenantFilter, status: { [Op.ne]: 'resolved' } } }),
-    InspectionTask.count({ where: { ...taskTenantFilter, status: 'in_progress' } }),
-    PlatformUser.count({ where: { ...tenantFilter, status: 'active' } }),
+    SensorDevice.count({ 
+      where: { ...tenantFilter, status: 'active' },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
+    }),
+    SensorDevice.count({ 
+      where: tenantFilter,
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
+    }),
+    Complaint.count({ 
+      where: { ...tenantFilter, status: { [Op.ne]: 'resolved' } },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
+    }),
+    InspectionTask.count({ 
+      where: { ...tenantFilter, status: 'in_progress' },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
+    }),
+    PlatformUser.count({ 
+      where: { ...tenantFilter, status: 'active', ...geoFilter },
+    }),
   ]);
 
   return {
@@ -238,6 +256,12 @@ const getTrends = async (req) => {
     tenantClause = 'AND i.tenant_id = :tenantId';
   }
 
+  let geoClause = '';
+  if (req.scope?.geographyFilter?.geography_id) {
+    replacements.geographyIds = req.scope.geographyFilter.geography_id;
+    geoClause = 'AND f.geography_id IN (:geographyIds)';
+  }
+
   const rows = await sequelize.query(
     `
       SELECT
@@ -245,9 +269,11 @@ const getTrends = async (req) => {
         COUNT(i.id)::int AS "inspectionCount",
         COALESCE(AVG(a.cleanliness_score), 0)::numeric AS "avgCleanliness"
       FROM inspections i
+      JOIN facilities f ON f.id = i.facility_id
       LEFT JOIN ai_analysis_results a ON a.inspection_id = i.id
       WHERE i.captured_at >= :start
         ${tenantClause}
+        ${geoClause}
       GROUP BY DATE(i.captured_at)
       ORDER BY DATE(i.captured_at) ASC
     `,
@@ -274,8 +300,12 @@ const getTrends = async (req) => {
 };
 
 const getWorkforce = async (req) => {
+  const tenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
+    where: tenantFilter,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     attributes: ['assigned_to_user_id', 'status', 'completed_at', 'created_at'],
   });
 
@@ -311,8 +341,12 @@ const getWorkforce = async (req) => {
 };
 
 const getSla = async (req) => {
+  const tenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
+    where: tenantFilter,
+    include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     order: [['scheduled_at', 'DESC']],
     limit: 500,
   });
@@ -368,18 +402,23 @@ const getPlatformHealth = async (req) => {
     order: [['aggregate_date', 'DESC']],
   });
 
+  const tenantFilter = scopedWhere(req);
+  const geoFilter = req.scope?.geographyFilter || {};
+
   const [alerts, sensorsFaulty] = await Promise.all([
     Alert.count({
       where: {
-        ...scopedWhere(req),
+        ...tenantFilter,
         status: 'open',
       },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     }),
     SensorDevice.count({
       where: {
-        ...scopedWhere(req),
+        ...tenantFilter,
         status: 'faulty',
       },
+      include: geoFilter.geography_id ? [{ model: Facility, where: geoFilter, required: true }] : [],
     }),
   ]);
 
