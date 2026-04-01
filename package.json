@@ -4,6 +4,7 @@
   "description": "Unified sanitation monitoring backend API",
   "main": "src/server.js",
   "scripts": {
+    "build": "npm install --no-audit --no-fund",
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "worker:analysis": "node src/workers/analysis-worker.js",
