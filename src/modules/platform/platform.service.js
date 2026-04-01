@@ -9,6 +9,11 @@ const {
 } = require('../../models');
 const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const {
+  getQrImageUrl,
+  ensureQrImageForToilet,
+  ensureQrImagesForToilets,
+} = require('./toiletQr.service');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -30,6 +35,21 @@ const normalizeIdentifierPart = (value, fallback) => {
     .replace(/[^A-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return normalized || fallback;
+};
+
+const normalizeSectorCode = (value) => {
+  const text = sanitizeText(value, 40)
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return text || null;
+};
+
+const toOptionalCoordinate = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric;
 };
 
 const buildAutoToiletId = async ({ facility, toiletBlock }) => {
@@ -298,6 +318,7 @@ const getFacilityById = async (req) => {
     ToiletBlock.findAll({ where: { facility_id: facility.id }, order: [['name', 'ASC']] }),
     ToiletUnit.findAll({ where: { facility_id: facility.id }, order: [['code', 'ASC']] }),
   ]);
+  await ensureQrImagesForToilets(units).catch(() => null);
 
   return {
     id: facility.id,
@@ -322,9 +343,20 @@ const getFacilityById = async (req) => {
       id: unit.id,
       code: unit.code,
       qrCode: unit.qr_code || unit.code,
+      qrImageUrl: getQrImageUrl(unit.id),
       unitType: unit.unit_type,
       status: unit.status,
       toiletBlockId: unit.toilet_block_id,
+      sectorCode: unit.sector_code || null,
+      locationLabel: unit.location_label || null,
+      latitude:
+        unit.latitude !== null && unit.latitude !== undefined
+          ? Number(unit.latitude)
+          : null,
+      longitude:
+        unit.longitude !== null && unit.longitude !== undefined
+          ? Number(unit.longitude)
+          : null,
     })),
   };
 };
@@ -388,7 +420,16 @@ const listUnits = async (req) => {
   const where = {};
   const facilityInclude = {
     model: Facility,
-    attributes: ['id', 'tenant_id', 'code', 'name'],
+    attributes: [
+      'id',
+      'tenant_id',
+      'code',
+      'name',
+      'address_line',
+      'latitude',
+      'longitude',
+      'metadata',
+    ],
     required: true,
   };
   if (!req.user.isSuperAdmin) {
@@ -402,6 +443,12 @@ const listUnits = async (req) => {
   if (req.query.toiletBlockId) {
     where.toilet_block_id = req.query.toiletBlockId;
   }
+  if (req.query.sector) {
+    const normalizedSector = normalizeSectorCode(req.query.sector);
+    if (normalizedSector) {
+      where.sector_code = normalizedSector;
+    }
+  }
   if (req.query.qrCode) {
     const qrCode = normalizePermanentQrCode(req.query.qrCode);
     where[Op.or] = [
@@ -414,6 +461,7 @@ const listUnits = async (req) => {
     include: [facilityInclude],
     order: [['code', 'ASC']],
   });
+  await ensureQrImagesForToilets(rows).catch(() => null);
   return rows.map((row) => ({
     id: row.id,
     facilityId: row.facility_id,
@@ -422,8 +470,65 @@ const listUnits = async (req) => {
     toiletBlockId: row.toilet_block_id,
     code: row.code,
     qrCode: row.qr_code || row.code,
+    qrImageUrl: getQrImageUrl(row.id),
     unitType: row.unit_type,
     status: row.status,
+    sectorCode:
+      row.sector_code ||
+      row.Facility?.metadata?.sector ||
+      row.Facility?.metadata?.zone ||
+      null,
+    locationLabel:
+      row.location_label ||
+      row.Facility?.address_line ||
+      row.Facility?.name ||
+      null,
+    latitude:
+      row.latitude !== null && row.latitude !== undefined
+        ? Number(row.latitude)
+        : row.Facility?.latitude !== null && row.Facility?.latitude !== undefined
+          ? Number(row.Facility.latitude)
+          : null,
+    longitude:
+      row.longitude !== null && row.longitude !== undefined
+        ? Number(row.longitude)
+        : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
+          ? Number(row.Facility.longitude)
+          : null,
+    latestScore:
+      row.latest_score !== null && row.latest_score !== undefined
+        ? Number(row.latest_score)
+        : null,
+    latestBeforeScore:
+      row.latest_before_score !== null && row.latest_before_score !== undefined
+        ? Number(row.latest_before_score)
+        : null,
+    latestAfterScore:
+      row.latest_after_score !== null && row.latest_after_score !== undefined
+        ? Number(row.latest_after_score)
+        : null,
+    avgBeforeScore:
+      row.avg_before_score !== null && row.avg_before_score !== undefined
+        ? Number(row.avg_before_score)
+        : null,
+    avgAfterScore:
+      row.avg_after_score !== null && row.avg_after_score !== undefined
+        ? Number(row.avg_after_score)
+        : null,
+    avgImprovementScore:
+      row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
+        ? Number(row.avg_improvement_score)
+        : null,
+    totalInspections: Number(row.total_inspections || 0),
+    lastInspectionAt: row.last_inspection_at || null,
+    dirtyFrequency:
+      row.dirty_frequency !== null && row.dirty_frequency !== undefined
+        ? Number(row.dirty_frequency)
+        : 0,
+    lowPerformanceFrequency:
+      row.low_performance_frequency !== null && row.low_performance_frequency !== undefined
+        ? Number(row.low_performance_frequency)
+        : 0,
   }));
 };
 
@@ -487,6 +592,14 @@ const createUnit = async (req) => {
     qr_code: qrCode,
     unit_type: unitType,
     status: req.body.status || 'moderate',
+    sector_code: normalizeSectorCode(
+      req.body.sectorCode || req.body.sector || facility.metadata?.sector || null
+    ),
+    location_label: req.body.locationLabel
+      ? sanitizeText(req.body.locationLabel, 300)
+      : facility.address_line || facility.name,
+    latitude: toOptionalCoordinate(req.body.latitude ?? facility.latitude),
+    longitude: toOptionalCoordinate(req.body.longitude ?? facility.longitude),
   });
   await createAuditLog({
     req,
@@ -495,14 +608,29 @@ const createUnit = async (req) => {
     entityId: row.id,
     tenantId: facility.tenant_id,
   });
+
+  await ensureQrImageForToilet({
+    toiletUnitId: row.id,
+    qrCodeValue: row.qr_code || row.code,
+  });
+
   return {
     id: row.id,
     facilityId: row.facility_id,
     toiletBlockId: row.toilet_block_id,
     code: row.code,
     qrCode: row.qr_code || row.code,
+    qrImageUrl: getQrImageUrl(row.id),
     unitType: row.unit_type,
     status: row.status,
+    sectorCode: row.sector_code || null,
+    locationLabel: row.location_label || null,
+    latitude:
+      row.latitude !== null && row.latitude !== undefined ? Number(row.latitude) : null,
+    longitude:
+      row.longitude !== null && row.longitude !== undefined
+        ? Number(row.longitude)
+        : null,
   };
 };
 

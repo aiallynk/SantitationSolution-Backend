@@ -191,6 +191,21 @@ const ToiletUnit = sequelize.define(
     qr_code: { type: DataTypes.STRING(180), allowNull: false },
     unit_type: { type: DataTypes.STRING(40), allowNull: false },
     status: { type: DataTypes.ENUM('clean', 'moderate', 'poor', 'critical', 'out_of_service'), allowNull: false, defaultValue: 'moderate' },
+    sector_code: { type: DataTypes.STRING(40), allowNull: true },
+    location_label: { type: DataTypes.STRING(300), allowNull: true },
+    latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    latest_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    latest_before_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    latest_after_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    avg_before_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    avg_after_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    avg_improvement_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    last_inspection_at: { type: DataTypes.DATE, allowNull: true },
+    last_cleaned_at: { type: DataTypes.DATE, allowNull: true },
+    total_inspections: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    dirty_frequency: { type: DataTypes.DECIMAL(6, 2), allowNull: false, defaultValue: 0 },
+    low_performance_frequency: { type: DataTypes.DECIMAL(6, 2), allowNull: false, defaultValue: 0 },
     ...commonTimestamps,
   },
   { tableName: 'toilet_units', timestamps: false }
@@ -243,6 +258,27 @@ const Inspection = sequelize.define(
       allowNull: false,
       defaultValue: 'draft',
     },
+    pipeline_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'draft' },
+    review_required: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    last_processing_error: { type: DataTypes.STRING(2000), allowNull: true },
+    assignment_id: { type: DataTypes.UUID, allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'DRAFT' },
+    before_image_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    after_image_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    avg_before_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    avg_after_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    improvement_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    confidence_avg: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    inspection_result: { type: DataTypes.STRING(40), allowNull: true },
+    before_issue_tags: { type: DataTypes.JSONB, allowNull: true },
+    after_issue_tags: { type: DataTypes.JSONB, allowNull: true },
+    resolved_issues: { type: DataTypes.JSONB, allowNull: true },
+    remaining_issues: { type: DataTypes.JSONB, allowNull: true },
+    suspicious_flag: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    suspicious_reasons: { type: DataTypes.JSONB, allowNull: true },
+    validation_failed_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    rejected_image_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    last_scored_at: { type: DataTypes.DATE, allowNull: true },
     overall_status: {
       type: DataTypes.ENUM('clean', 'moderate', 'poor', 'critical'),
       allowNull: true,
@@ -257,8 +293,53 @@ const InspectionMedia = sequelize.define(
   {
     id: defineUuidId(),
     inspection_id: { type: DataTypes.UUID, allowNull: true },
+    toilet_unit_id: { type: DataTypes.UUID, allowNull: true },
+    worker_id: { type: DataTypes.UUID, allowNull: true },
+    assignment_id: { type: DataTypes.UUID, allowNull: true },
+    client_image_id: { type: DataTypes.STRING(120), allowNull: true },
     media_type: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'image' },
     capture_stage: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'evidence' },
+    upload_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'pending' },
+    ai_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'PENDING_UPLOAD' },
+    image_quality_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'unknown' },
+    image_quality_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    toilet_detected: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    validation_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'PENDING' },
+    validation_reason: { type: DataTypes.STRING(500), allowNull: true },
+    visibility_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    perceptual_hash: { type: DataTypes.STRING(128), allowNull: true },
+    similarity_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    etag: { type: DataTypes.STRING(160), allowNull: true },
+    sha256: { type: DataTypes.STRING(128), allowNull: true },
+    content_length: { type: DataTypes.BIGINT, allowNull: true },
+    width: { type: DataTypes.INTEGER, allowNull: true },
+    height: { type: DataTypes.INTEGER, allowNull: true },
+    gps_lat: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    gps_lng: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    device_id: { type: DataTypes.STRING(160), allowNull: true },
+    watermark_meta: { type: DataTypes.JSONB, allowNull: true },
+    captured_at: { type: DataTypes.DATE, allowNull: true },
+    confirmed_at: { type: DataTypes.DATE, allowNull: true },
+    ordinal: { type: DataTypes.INTEGER, allowNull: true },
+    upload_duration_ms: { type: DataTypes.INTEGER, allowNull: true },
+    overall_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    confidence_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    floor_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    commode_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    stain_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    garbage_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    water_score: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    issue_tags: { type: DataTypes.JSONB, allowNull: true },
+    issue_summary: { type: DataTypes.STRING(1000), allowNull: true },
+    severity: { type: DataTypes.STRING(20), allowNull: true },
+    review_required: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    model_version: { type: DataTypes.STRING(80), allowNull: true },
+    prompt_version: { type: DataTypes.STRING(40), allowNull: true },
+    scoring_version: { type: DataTypes.STRING(40), allowNull: true },
+    scoring_rejected: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    explanation_summary: { type: DataTypes.STRING(2000), allowNull: true },
+    ai_processed_at: { type: DataTypes.DATE, allowNull: true },
+    ai_error: { type: DataTypes.STRING(2000), allowNull: true },
     file_url: { type: DataTypes.STRING(500), allowNull: true },
     storage_key: { type: DataTypes.STRING(500), allowNull: true },
     thumbnail_url: { type: DataTypes.STRING(500), allowNull: true },
@@ -282,12 +363,144 @@ const AiAnalysisResult = sequelize.define(
     wetness_score: { type: DataTypes.DECIMAL(5, 2), allowNull: false },
     stain_score: { type: DataTypes.DECIMAL(5, 2), allowNull: false },
     litter_score: { type: DataTypes.DECIMAL(5, 2), allowNull: false },
+    confidence_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
+    review_required: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    sub_scores: { type: DataTypes.JSONB, allowNull: true },
+    issue_tags: { type: DataTypes.JSONB, allowNull: true },
+    severity_label: { type: DataTypes.STRING(40), allowNull: true },
+    explanation_text: { type: DataTypes.STRING(2000), allowNull: true },
+    processing_ms: { type: DataTypes.INTEGER, allowNull: true },
+    schema_version: { type: DataTypes.STRING(40), allowNull: true },
+    provider: { type: DataTypes.STRING(40), allowNull: true },
     anomaly_flags: { type: DataTypes.JSONB, allowNull: true },
     raw_result: { type: DataTypes.JSONB, allowNull: true },
     processed_at: { type: DataTypes.DATE, allowNull: false },
     ...commonTimestamps,
   },
   { tableName: 'ai_analysis_results', timestamps: false }
+);
+
+const ImageSession = sequelize.define(
+  'ImageSession',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    inspection_id: { type: DataTypes.UUID, allowNull: false },
+    media_id: { type: DataTypes.UUID, allowNull: true },
+    client_submission_id: { type: DataTypes.STRING(120), allowNull: true },
+    client_image_id: { type: DataTypes.STRING(120), allowNull: false },
+    capture_stage: { type: DataTypes.STRING(40), allowNull: false },
+    ordinal: { type: DataTypes.INTEGER, allowNull: true },
+    object_key: { type: DataTypes.STRING(500), allowNull: true },
+    upload_method: { type: DataTypes.STRING(10), allowNull: false, defaultValue: 'PUT' },
+    content_type: { type: DataTypes.STRING(120), allowNull: false, defaultValue: 'image/jpeg' },
+    expected_size: { type: DataTypes.BIGINT, allowNull: true },
+    expected_sha256: { type: DataTypes.STRING(128), allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'created' },
+    upload_url_expires_at: { type: DataTypes.DATE, allowNull: true },
+    uploaded_at: { type: DataTypes.DATE, allowNull: true },
+    confirmed_at: { type: DataTypes.DATE, allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'image_sessions', timestamps: false }
+);
+
+const InspectionSubmission = sequelize.define(
+  'InspectionSubmission',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    inspection_id: { type: DataTypes.UUID, allowNull: false },
+    client_submission_id: { type: DataTypes.STRING(120), allowNull: true },
+    idempotency_key: { type: DataTypes.STRING(200), allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'queued_for_ai' },
+    submitted_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    acknowledged_at: { type: DataTypes.DATE, allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'inspection_submissions', timestamps: false }
+);
+
+const AiProcessingJob = sequelize.define(
+  'AiProcessingJob',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    inspection_id: { type: DataTypes.UUID, allowNull: false },
+    submission_id: { type: DataTypes.UUID, allowNull: true },
+    image_id: { type: DataTypes.UUID, allowNull: true },
+    job_type: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'AI_ANALYSIS' },
+    queue_name: { type: DataTypes.STRING(120), allowNull: false },
+    queue_job_id: { type: DataTypes.STRING(180), allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'queued' },
+    attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    max_attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 3 },
+    last_error: { type: DataTypes.STRING(2000), allowNull: true },
+    dead_lettered_at: { type: DataTypes.DATE, allowNull: true },
+    queued_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    started_at: { type: DataTypes.DATE, allowNull: true },
+    completed_at: { type: DataTypes.DATE, allowNull: true },
+    duration_ms: { type: DataTypes.INTEGER, allowNull: true },
+    payload: { type: DataTypes.JSONB, allowNull: true },
+    result: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'ai_processing_jobs', timestamps: false }
+);
+
+const InspectionEvent = sequelize.define(
+  'InspectionEvent',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    inspection_id: { type: DataTypes.UUID, allowNull: false },
+    toilet_id: { type: DataTypes.UUID, allowNull: true },
+    image_id: { type: DataTypes.UUID, allowNull: true },
+    event_type: { type: DataTypes.STRING(120), allowNull: false },
+    event_status: { type: DataTypes.STRING(60), allowNull: true },
+    source: { type: DataTypes.STRING(60), allowNull: false, defaultValue: 'system' },
+    actor_user_id: { type: DataTypes.UUID, allowNull: true },
+    payload: { type: DataTypes.JSONB, allowNull: true },
+    occurred_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    ...commonTimestamps,
+  },
+  { tableName: 'inspection_events', timestamps: false }
+);
+
+const IdempotencyKey = sequelize.define(
+  'IdempotencyKey',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    scope: { type: DataTypes.STRING(140), allowNull: false },
+    idempotency_key: { type: DataTypes.STRING(220), allowNull: false },
+    request_hash: { type: DataTypes.STRING(200), allowNull: true },
+    response_code: { type: DataTypes.INTEGER, allowNull: true },
+    response_body: { type: DataTypes.JSONB, allowNull: true },
+    locked_until: { type: DataTypes.DATE, allowNull: true },
+    expires_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'idempotency_keys', timestamps: false }
+);
+
+const ToiletScoreDaily = sequelize.define(
+  'ToiletScoreDaily',
+  {
+    id: defineUuidId(),
+    toilet_id: { type: DataTypes.UUID, allowNull: false },
+    date: { type: DataTypes.DATEONLY, allowNull: false },
+    avg_before_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    avg_after_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    inspection_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    dirty_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    cleaned_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    avg_improvement: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'toilet_score_daily', timestamps: false }
 );
 
 const SensorDevice = sequelize.define(
@@ -688,10 +901,56 @@ Inspection.belongsTo(InspectionTask, { foreignKey: 'task_id' });
 Inspection.belongsTo(Facility, { foreignKey: 'facility_id' });
 Inspection.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id' });
 Inspection.belongsTo(PlatformUser, { foreignKey: 'inspector_user_id', as: 'inspector' });
+Inspection.belongsTo(WorkerAssignment, { foreignKey: 'assignment_id', as: 'assignment' });
+WorkerAssignment.hasMany(Inspection, { foreignKey: 'assignment_id', as: 'inspections' });
 Inspection.hasMany(InspectionMedia, { foreignKey: 'inspection_id' });
 InspectionMedia.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+ToiletUnit.hasMany(InspectionMedia, { foreignKey: 'toilet_unit_id', as: 'inspectionMedia' });
+InspectionMedia.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id' });
+PlatformUser.hasMany(InspectionMedia, { foreignKey: 'worker_id', as: 'inspectionMedia' });
+InspectionMedia.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
+WorkerAssignment.hasMany(InspectionMedia, { foreignKey: 'assignment_id', as: 'inspectionMedia' });
+InspectionMedia.belongsTo(WorkerAssignment, { foreignKey: 'assignment_id', as: 'assignment' });
 Inspection.hasMany(AiAnalysisResult, { foreignKey: 'inspection_id' });
 AiAnalysisResult.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+Inspection.hasMany(ImageSession, { foreignKey: 'inspection_id', as: 'imageSessions' });
+ImageSession.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+ImageSession.belongsTo(InspectionMedia, { foreignKey: 'media_id', as: 'media' });
+InspectionMedia.hasMany(ImageSession, { foreignKey: 'media_id', as: 'sessions' });
+Inspection.hasMany(InspectionSubmission, {
+  foreignKey: 'inspection_id',
+  as: 'inspectionSubmissions',
+});
+InspectionSubmission.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+InspectionSubmission.hasMany(AiProcessingJob, {
+  foreignKey: 'submission_id',
+  as: 'processingJobs',
+});
+AiProcessingJob.belongsTo(InspectionSubmission, { foreignKey: 'submission_id', as: 'submission' });
+Inspection.hasMany(AiProcessingJob, { foreignKey: 'inspection_id', as: 'processingJobs' });
+AiProcessingJob.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+InspectionMedia.hasMany(AiProcessingJob, { foreignKey: 'image_id', as: 'processingJobs' });
+AiProcessingJob.belongsTo(InspectionMedia, { foreignKey: 'image_id', as: 'image' });
+Inspection.hasMany(InspectionEvent, { foreignKey: 'inspection_id', as: 'events' });
+InspectionEvent.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+ToiletUnit.hasMany(InspectionEvent, { foreignKey: 'toilet_id', as: 'events' });
+InspectionEvent.belongsTo(ToiletUnit, { foreignKey: 'toilet_id', as: 'toilet' });
+InspectionMedia.hasMany(InspectionEvent, { foreignKey: 'image_id', as: 'events' });
+InspectionEvent.belongsTo(InspectionMedia, { foreignKey: 'image_id', as: 'image' });
+PlatformUser.hasMany(InspectionEvent, { foreignKey: 'actor_user_id', as: 'inspectionEvents' });
+InspectionEvent.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
+Tenant.hasMany(ImageSession, { foreignKey: 'tenant_id' });
+ImageSession.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Tenant.hasMany(InspectionSubmission, { foreignKey: 'tenant_id' });
+InspectionSubmission.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Tenant.hasMany(AiProcessingJob, { foreignKey: 'tenant_id' });
+AiProcessingJob.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Tenant.hasMany(InspectionEvent, { foreignKey: 'tenant_id' });
+InspectionEvent.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Tenant.hasMany(IdempotencyKey, { foreignKey: 'tenant_id' });
+IdempotencyKey.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+ToiletUnit.hasMany(ToiletScoreDaily, { foreignKey: 'toilet_id', as: 'dailyScores' });
+ToiletScoreDaily.belongsTo(ToiletUnit, { foreignKey: 'toilet_id' });
 
 SensorDevice.belongsTo(Facility, { foreignKey: 'facility_id' });
 SensorDevice.belongsTo(ToiletBlock, { foreignKey: 'toilet_block_id' });
@@ -741,6 +1000,12 @@ module.exports = {
   Inspection,
   InspectionMedia,
   AiAnalysisResult,
+  ImageSession,
+  InspectionSubmission,
+  AiProcessingJob,
+  InspectionEvent,
+  IdempotencyKey,
+  ToiletScoreDaily,
   SensorDevice,
   SensorReading,
   Alert,

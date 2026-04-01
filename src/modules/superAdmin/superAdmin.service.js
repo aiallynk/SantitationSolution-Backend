@@ -345,7 +345,7 @@ const getSystemHealth = async (req) => {
     time: new Date().toISOString(),
     latestSensorReadingAt: latestSensor?.timestamp || null,
     redisEnabled: Boolean(process.env.REDIS_URL && isRedisEnabled()),
-    analysisMode: process.env.ANALYSIS_MODEL_NAME || 'deterministic-rule-analyzer',
+    analysisMode: `${String(process.env.ANALYSIS_PROVIDER || 'openai').toLowerCase()}:${process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o'}`,
     openIncidents,
     openSyncFailures,
   };

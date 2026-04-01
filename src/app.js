@@ -8,6 +8,7 @@ require('./config/env');
 
 const { apiRateLimit } = require('./core/security/rateLimit');
 const { attachRequestId } = require('./core/middleware/requestId');
+const { requestLogger } = require('./core/middleware/requestLogger');
 const { notFound } = require('./core/middleware/notFound');
 const { handleError } = require('./core/errors/handleError');
 const apiV1Router = require('./api/v1');
@@ -32,6 +33,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 
 app.use(attachRequestId);
+app.use(requestLogger);
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },

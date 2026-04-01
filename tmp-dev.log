@@ -1,0 +1,9 @@
+Checking and applying pending database migrations...
+
+[4mSequelize CLI [Node: 22.18.0, CLI: 6.6.2, ORM: 6.37.8][24m
+
+Loaded configuration file "src\config\sequelize-cli.js".
+Using environment "development".
+No migrations were executed, database schema was already up to date.
+Database migrations are up to date
+Database connection established

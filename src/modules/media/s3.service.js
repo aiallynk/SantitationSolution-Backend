@@ -1,6 +1,12 @@
 const fs = require('fs');
 const path = require('path');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+} = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const normalizeBool = (value) => String(value || '').toLowerCase() === 'true';
 
@@ -126,6 +132,69 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
   };
 };
 
+const getPresignedPutObjectUrl = async ({
+  objectKey,
+  contentType = 'image/jpeg',
+  contentLength = null,
+  metadata = null,
+  expiresInSeconds = Number(process.env.S3_PRESIGNED_URL_TTL_SEC || 900),
+}) => {
+  const client = getS3Client();
+  if (!client) {
+    throw new Error('S3 is not configured');
+  }
+
+  const command = new PutObjectCommand({
+    Bucket: s3Config.bucket,
+    Key: objectKey,
+    ContentType: contentType,
+    ...(Number.isFinite(Number(contentLength)) && Number(contentLength) > 0
+      ? { ContentLength: Number(contentLength) }
+      : {}),
+    ...(metadata && typeof metadata === 'object' ? { Metadata: metadata } : {}),
+    ...(s3Config.objectAcl ? { ACL: s3Config.objectAcl } : {}),
+  });
+
+  const safeExpires = Math.min(Math.max(Number(expiresInSeconds || 900), 60), 3600);
+  const uploadUrl = await getSignedUrl(client, command, {
+    expiresIn: safeExpires,
+  });
+
+  return {
+    uploadUrl,
+    expiresAt: new Date(Date.now() + safeExpires * 1000).toISOString(),
+    headers: {
+      'Content-Type': contentType,
+      ...(metadata && typeof metadata === 'object'
+        ? Object.fromEntries(
+            Object.entries(metadata).map(([key, value]) => [
+              `x-amz-meta-${String(key).toLowerCase()}`,
+              String(value),
+            ])
+          )
+        : {}),
+    },
+  };
+};
+
+const getPresignedGetObjectUrl = async ({
+  storageKey,
+  expiresInSeconds = Number(process.env.S3_PRESIGNED_GET_TTL_SEC || 900),
+}) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  const objectKey = normalizeS3ObjectKey(storageKey);
+  if (!objectKey) return null;
+
+  const command = new GetObjectCommand({
+    Bucket: s3Config.bucket,
+    Key: objectKey,
+  });
+  const safeExpires = Math.min(Math.max(Number(expiresInSeconds || 900), 60), 3600);
+  return getSignedUrl(client, command, { expiresIn: safeExpires });
+};
+
 const streamToBuffer = async (stream) => {
   const chunks = [];
   for await (const chunk of stream) {
@@ -175,9 +244,43 @@ const getObjectDataUrlFromS3 = async (storageKey) => {
   }
 };
 
+const headObjectFromS3 = async (storageKey) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  const objectKey = normalizeS3ObjectKey(storageKey);
+  if (!objectKey) return null;
+
+  try {
+    const response = await client.send(
+      new HeadObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: objectKey,
+      })
+    );
+
+    return {
+      bucket: s3Config.bucket,
+      objectKey,
+      eTag: response.ETag || null,
+      contentLength: Number(response.ContentLength || 0),
+      contentType: response.ContentType || null,
+      lastModified: response.LastModified || null,
+      metadata: response.Metadata || null,
+      fileUrl: buildObjectUrl(objectKey),
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
 module.exports = {
   isS3Enabled,
   uploadFileToS3,
+  getPresignedPutObjectUrl,
+  getPresignedGetObjectUrl,
   getObjectDataUrlFromS3,
+  headObjectFromS3,
   normalizeS3ObjectKey,
+  buildObjectUrl,
 };

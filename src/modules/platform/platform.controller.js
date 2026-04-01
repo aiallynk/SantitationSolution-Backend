@@ -1,5 +1,6 @@
 const { sendSuccess } = require('../../core/http/response');
 const platformService = require('./platform.service');
+const inspectionService = require('../inspections/inspection.service');
 
 const getTenants = async (req, res, next) => {
   try {
@@ -122,6 +123,59 @@ const postToiletUnit = async (req, res, next) => {
   }
 };
 
+const getToiletDetails = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletDetailsById(req);
+    return sendSuccess(res, { message: 'Toilet details fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletLatestInspection = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletLatestInspectionById(req);
+    return sendSuccess(res, { message: 'Toilet latest inspection fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletScoreTrends = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletScoreTrendsById(req);
+    return sendSuccess(res, { message: 'Toilet score trends fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletInspectionHistory = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletInspectionHistoryById(req);
+    return sendSuccess(res, {
+      message: 'Toilet inspection history fetched successfully',
+      data: data.items,
+      meta: data.meta,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletInspections = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletInspections(req);
+    return sendSuccess(res, {
+      message: 'Toilet inspections fetched successfully',
+      data: data.items,
+      meta: data.meta,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   getTenants,
   postTenant,
@@ -136,4 +190,9 @@ module.exports = {
   postToiletBlock,
   getToiletUnits,
   postToiletUnit,
+  getToiletInspections,
+  getToiletDetails,
+  getToiletLatestInspection,
+  getToiletScoreTrends,
+  getToiletInspectionHistory,
 };
