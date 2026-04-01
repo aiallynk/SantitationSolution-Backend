@@ -29,6 +29,34 @@ const resolveAllowedOrigins = () => {
 
 const allowedOrigins = resolveAllowedOrigins();
 
+const escapeRegex = (value) =>
+  String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const originMatchers = Array.isArray(allowedOrigins)
+  ? allowedOrigins.map((entry) => {
+      const raw = String(entry || '').trim();
+      if (!raw) return null;
+      if (raw === '*') {
+        return { type: 'any' };
+      }
+      if (raw.includes('*')) {
+        const pattern = `^${raw.split('*').map(escapeRegex).join('.*')}$`;
+        return { type: 'regex', value: new RegExp(pattern, 'i') };
+      }
+      return { type: 'exact', value: raw };
+    }).filter(Boolean)
+  : [];
+
+const isOriginAllowed = (origin) => {
+  if (!origin || originMatchers.length === 0) return true;
+  for (const matcher of originMatchers) {
+    if (matcher.type === 'any') return true;
+    if (matcher.type === 'exact' && matcher.value === origin) return true;
+    if (matcher.type === 'regex' && matcher.value.test(origin)) return true;
+  }
+  return false;
+};
+
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 
@@ -42,10 +70,10 @@ app.use(
 app.use(
   cors({
     origin(origin, callback) {
-      if (!allowedOrigins || allowedOrigins.length === 0 || !origin) {
+      if (!originMatchers.length || !origin) {
         return callback(null, true);
       }
-      if (allowedOrigins.includes(origin)) {
+      if (isOriginAllowed(origin)) {
         return callback(null, true);
       }
       return callback(null, false);

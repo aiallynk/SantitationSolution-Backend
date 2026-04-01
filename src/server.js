@@ -181,7 +181,7 @@ const bootstrap = async () => {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Server bootstrap failed:', error);
-    process.exitCode = 1;
+    process.exit(1);
   }
 };
 

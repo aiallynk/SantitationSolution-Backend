@@ -41,6 +41,19 @@ npm run db:seed:undo
 npm run seed:simulator
 ```
 
+## Render Deployment
+
+- Blueprint file is available in this backend root: [`render.yaml`](./render.yaml)
+- Health endpoint for Render checks: `/health`
+- `preDeployCommand` runs migrations (`npm run db:migrate`)
+
+Recommended production env values:
+
+- `NODE_ENV=production`
+- `DB_SSL=true`
+- `AUTO_RUN_MIGRATIONS=false` (migrate in pre-deploy)
+- `CORS_ORIGIN=https://*.vercel.app,https://<your-domain>`
+
 ## Domain Modules
 
 - Auth/session: login, refresh, logout, forgot/reset, `/me`
