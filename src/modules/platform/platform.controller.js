@@ -114,6 +114,15 @@ const getToiletUnits = async (req, res, next) => {
   }
 };
 
+const getToiletUnitByQr = async (req, res, next) => {
+  try {
+    const data = await platformService.resolveUnitByQr(req);
+    return sendSuccess(res, { message: 'Toilet unit resolved successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postToiletUnit = async (req, res, next) => {
   try {
     const row = await platformService.createUnit(req);
@@ -189,6 +198,7 @@ module.exports = {
   getToiletBlocks,
   postToiletBlock,
   getToiletUnits,
+  getToiletUnitByQr,
   postToiletUnit,
   getToiletInspections,
   getToiletDetails,

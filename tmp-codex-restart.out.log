@@ -1,0 +1,21 @@
+
+> sanitation-solution-backend@2.0.0 start
+> node src/server.js
+
+Checking and applying pending database migrations...
+
+[4mSequelize CLI [Node: 22.18.0, CLI: 6.6.2, ORM: 6.37.8][24m
+
+Loaded configuration file "src\config\sequelize-cli.js".
+Using environment "development".
+No migrations were executed, database schema was already up to date.
+Database migrations are up to date
+Database connection established
+Toilet QR bootstrap completed: total=10 generated=0 skipped=10 failed=0
+Server is running on port 5000
+[8d3fb8d4-c498-4fcf-b8e2-0846578c5f81] OPTIONS /auth/login -> 204 18ms tenant=platform user=anonymous
+[bfb99aa9-00fb-443e-b0e0-5cd9e9d37b21] OPTIONS /auth/login -> 204 2ms tenant=platform user=anonymous
+[25be6c3b-4660-421f-b53a-d2ca5c135090] OPTIONS /auth/login -> 204 1ms tenant=platform user=anonymous
+[2e0bc10b-9e17-400b-83f3-8fff83fbff95] OPTIONS /auth/login -> 204 1ms tenant=platform user=anonymous
+[60fe2dd4-7101-4496-9d83-807174310b78] OPTIONS /api/v1/auth/login -> 204 2ms tenant=platform user=anonymous
+[324556ae-9730-4850-835c-5780d654e03c] POST /auth/login -> 200 816ms tenant=platform user=anonymous

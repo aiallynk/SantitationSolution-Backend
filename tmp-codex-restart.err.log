@@ -1,0 +1,5 @@
+Redis disabled: analysis queue running in inline fallback mode
+[b29c7bca-7343-4b31-82ef-57314f492da2] POST /auth/login -> 400 360ms tenant=platform user=anonymous
+[d128783f-4138-4cff-948d-3237f46683eb] POST /auth/login -> 400 5ms tenant=platform user=anonymous
+[ee1b8ea8-d990-4ec4-81e1-a28fb49a8746] POST /auth/login -> 400 5ms tenant=platform user=anonymous
+^C
