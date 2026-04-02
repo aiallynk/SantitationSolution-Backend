@@ -16,6 +16,16 @@ const compatRouter = require('./api/compat');
 
 const app = express();
 
+const normalizeOriginValue = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  // Browser Origin header never includes trailing slash.
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw.replace(/\/+$/, '');
+  }
+  return raw;
+};
+
 const resolveAllowedOrigins = () => {
   const raw = String(process.env.CORS_ORIGIN || '').trim();
   if (!raw) {
@@ -23,7 +33,7 @@ const resolveAllowedOrigins = () => {
   }
   return raw
     .split(',')
-    .map((entry) => entry.trim())
+    .map((entry) => normalizeOriginValue(entry))
     .filter(Boolean);
 };
 
@@ -48,11 +58,12 @@ const originMatchers = Array.isArray(allowedOrigins)
   : [];
 
 const isOriginAllowed = (origin) => {
-  if (!origin || originMatchers.length === 0) return true;
+  const normalizedOrigin = normalizeOriginValue(origin);
+  if (!normalizedOrigin || originMatchers.length === 0) return true;
   for (const matcher of originMatchers) {
     if (matcher.type === 'any') return true;
-    if (matcher.type === 'exact' && matcher.value === origin) return true;
-    if (matcher.type === 'regex' && matcher.value.test(origin)) return true;
+    if (matcher.type === 'exact' && matcher.value === normalizedOrigin) return true;
+    if (matcher.type === 'regex' && matcher.value.test(normalizedOrigin)) return true;
   }
   return false;
 };
