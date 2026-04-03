@@ -1,0 +1,1753 @@
+const { Op, QueryTypes } = require('sequelize');
+const AppError = require('../../core/errors/AppError');
+const {
+  sequelize,
+  Inspection,
+  InspectionMedia,
+  InspectionEvent,
+  ToiletUnit,
+  ToiletBlock,
+  Facility,
+  PlatformUser,
+  WorkerAssignment,
+  AiProcessingJob,
+  AiAnalysisResult,
+  ToiletScoreDaily,
+} = require('../../models');
+const { getQrImageUrl, ensureQrImageForToilet } = require('../platform/toiletQr.service');
+
+const REVIEW_CONFIDENCE_THRESHOLD = Number(
+  process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7
+);
+const IMPROVEMENT_THRESHOLD = Number(
+  process.env.INSPECTION_IMPROVEMENT_THRESHOLD || 5
+);
+
+const toNumber = (value, fallback = null) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const round2 = (value) =>
+  value === null || value === undefined ? null : Number(Number(value).toFixed(2));
+
+const mean = (values) => {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const valid = values.map((item) => toNumber(item, null)).filter((item) => item !== null);
+  if (valid.length === 0) return null;
+  return valid.reduce((sum, item) => sum + item, 0) / valid.length;
+};
+
+const scoreLabel = (score) => {
+  const value = toNumber(score, null);
+  if (value === null) return 'Unknown';
+  if (value <= 30) return 'Very Dirty';
+  if (value <= 50) return 'Dirty';
+  if (value <= 70) return 'Moderate';
+  if (value <= 85) return 'Clean';
+  return 'Very Clean';
+};
+
+const normalizeIssueTag = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .slice(0, 80);
+
+const unionIssueTags = (rows = []) => {
+  const tags = new Set();
+  for (const row of rows) {
+    const list = Array.isArray(row.issue_tags) ? row.issue_tags : [];
+    for (const item of list) {
+      const normalized = normalizeIssueTag(item);
+      if (normalized) tags.add(normalized);
+    }
+  }
+  return Array.from(tags.values());
+};
+
+const normalizeMediaUrl = (url) => {
+  const value = String(url || '').trim();
+  if (!value) return null;
+  if (value.startsWith('/static/uploads/')) {
+    return value.replace('/static/uploads/', '/static/');
+  }
+  return value;
+};
+
+const stageOf = (row) => String(row.capture_stage || 'evidence').toLowerCase();
+
+const hasScored = (row) =>
+  String(row.ai_status || '').toUpperCase() === 'AI_COMPLETED' &&
+  toNumber(row.overall_score, null) !== null &&
+  !Boolean(row.scoring_rejected) &&
+  !String(row.validation_status || '')
+    .toUpperCase()
+    .startsWith('FAILED') &&
+  String(row.validation_status || '').toUpperCase() !== 'REJECTED_LOW_CONFIDENCE';
+
+const AI_STATUS_PRIORITY = {
+  AI_COMPLETED: 60,
+  AI_PROCESSING: 50,
+  AI_QUEUED: 40,
+  UPLOADED: 30,
+  PENDING_UPLOAD: 20,
+  AI_FAILED: 10,
+};
+
+const PLACEHOLDER_AI_STATUSES = new Set([
+  'PENDING_UPLOAD',
+  'UPLOADED',
+  'AI_QUEUED',
+  'AI_PROCESSING',
+]);
+const PLACEHOLDER_UPLOAD_STATUSES = new Set([
+  'upload_session_created',
+  'created',
+  'pending',
+  'uploading',
+]);
+
+const hasRenderableImage = (row) => {
+  const fileUrl = String(row?.file_url || '').trim();
+  const thumbnailUrl = String(row?.thumbnail_url || '').trim();
+  return fileUrl.length > 0 || thumbnailUrl.length > 0;
+};
+
+const toTimestamp = (value) => {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const mediaRowPriority = (row) => {
+  const aiStatus = String(row?.ai_status || '').trim().toUpperCase();
+  const uploadStatus = String(row?.upload_status || '').trim().toLowerCase();
+  const hasConfirmedUpload =
+    uploadStatus === 'confirmed' || uploadStatus === 'uploaded';
+
+  let score = 0;
+  if (hasRenderableImage(row)) score += 1000;
+  if (hasScored(row)) score += 500;
+  if (hasConfirmedUpload) score += 120;
+  score += AI_STATUS_PRIORITY[aiStatus] || 0;
+  if (row?.captured_at) score += 20;
+  return score;
+};
+
+const mediaDedupKey = (row, index = 0) => {
+  const stage = stageOf(row);
+  const clientImageId = String(row?.client_image_id || '').trim();
+  if (clientImageId) return `client:${stage}:${clientImageId}`;
+
+  const hash = String(row?.sha256 || '').trim().toLowerCase();
+  if (hash) return `sha:${stage}:${hash}`;
+
+  const fileUrl = String(row?.file_url || '').trim();
+  if (fileUrl) return `url:${stage}:${fileUrl}`;
+
+  return `id:${row?.id || index}`;
+};
+
+const pickPreferredMediaRow = (left, right) => {
+  if (!left) return right;
+  if (!right) return left;
+
+  const leftPriority = mediaRowPriority(left);
+  const rightPriority = mediaRowPriority(right);
+  if (leftPriority !== rightPriority) {
+    return rightPriority > leftPriority ? right : left;
+  }
+
+  const leftUpdated = toTimestamp(left.updated_at || left.created_at || left.captured_at);
+  const rightUpdated = toTimestamp(right.updated_at || right.created_at || right.captured_at);
+  return rightUpdated > leftUpdated ? right : left;
+};
+
+const removePlaceholderRows = (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return [];
+  }
+
+  const hasRenderableByStage = new Map();
+  for (const row of rows) {
+    const stage = stageOf(row);
+    if (hasRenderableImage(row)) {
+      hasRenderableByStage.set(stage, true);
+    } else if (!hasRenderableByStage.has(stage)) {
+      hasRenderableByStage.set(stage, false);
+    }
+  }
+
+  return rows.filter((row) => {
+    const stage = stageOf(row);
+    if (!hasRenderableByStage.get(stage)) {
+      return true;
+    }
+    if (hasRenderableImage(row)) {
+      return true;
+    }
+
+    const aiStatus = String(row.ai_status || '').trim().toUpperCase();
+    const uploadStatus = String(row.upload_status || '').trim().toLowerCase();
+    const isPlaceholder =
+      PLACEHOLDER_AI_STATUSES.has(aiStatus) ||
+      PLACEHOLDER_UPLOAD_STATUSES.has(uploadStatus);
+    return !isPlaceholder;
+  });
+};
+
+const sortMediaRowsForEvidence = (rows = []) => {
+  return [...rows].sort((left, right) => {
+    const stageComparison = stageOf(left).localeCompare(stageOf(right));
+    if (stageComparison !== 0) return stageComparison;
+
+    const leftOrdinal = toNumber(left.ordinal, Number.MAX_SAFE_INTEGER);
+    const rightOrdinal = toNumber(right.ordinal, Number.MAX_SAFE_INTEGER);
+    if (leftOrdinal !== rightOrdinal) return leftOrdinal - rightOrdinal;
+
+    const leftCaptured = toTimestamp(left.captured_at);
+    const rightCaptured = toTimestamp(right.captured_at);
+    if (leftCaptured !== rightCaptured) return leftCaptured - rightCaptured;
+
+    const leftCreated = toTimestamp(left.created_at);
+    const rightCreated = toTimestamp(right.created_at);
+    if (leftCreated !== rightCreated) return leftCreated - rightCreated;
+
+    return String(left.id || '').localeCompare(String(right.id || ''));
+  });
+};
+
+const dedupeInspectionMediaRows = (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return [];
+  }
+
+  const selected = new Map();
+  rows.forEach((row, index) => {
+    const key = mediaDedupKey(row, index);
+    const previous = selected.get(key);
+    selected.set(key, pickPreferredMediaRow(previous, row));
+  });
+
+  return sortMediaRowsForEvidence(removePlaceholderRows(Array.from(selected.values())));
+};
+
+const mapMediaEvidence = (row) => {
+  const overallScore = toNumber(row.overall_score, null);
+  const confidence = toNumber(row.confidence_score, null);
+  const garbageScore = toNumber(row.garbage_score, null);
+  const waterScore = toNumber(row.water_score, null);
+  const stainScore = toNumber(row.stain_score, null);
+  const issueTags = Array.isArray(row.issue_tags) ? row.issue_tags : [];
+  const similarityScore = toNumber(row.similarity_score, null);
+  const validationStatus = row.validation_status || null;
+  const suspiciousFlags = [];
+  if (similarityScore !== null && similarityScore >= Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92)) {
+    suspiciousFlags.push('possible_fake_cleaning_similar_images');
+  }
+  if (String(validationStatus || '').toUpperCase().startsWith('FAILED')) {
+    suspiciousFlags.push('validation_failed');
+  }
+  if (String(validationStatus || '').toUpperCase() === 'REJECTED_LOW_CONFIDENCE') {
+    suspiciousFlags.push('low_confidence_rejected');
+  }
+
+  return {
+    id: row.id,
+    clientImageId: row.client_image_id || null,
+    inspectionId: row.inspection_id,
+    toiletId: row.toilet_unit_id,
+    workerId: row.worker_id,
+    assignmentId: row.assignment_id,
+    stage: String(row.capture_stage || 'evidence').toUpperCase(),
+    imageUrl: normalizeMediaUrl(row.file_url),
+    thumbnailUrl: normalizeMediaUrl(row.thumbnail_url || row.file_url),
+    capturedAt: row.captured_at || null,
+    uploadedAt: row.uploaded_at || null,
+    confirmedAt: row.confirmed_at || null,
+    ordinal: row.ordinal || null,
+    gpsLat: toNumber(row.gps_lat, null),
+    gpsLng: toNumber(row.gps_lng, null),
+    deviceId: row.device_id || null,
+    uploadStatus: row.upload_status || null,
+    aiStatus: row.ai_status || null,
+    imageQualityStatus: row.image_quality_status || null,
+    imageQualityScore: toNumber(row.image_quality_score, null),
+    validationStatus,
+    validationReason: row.validation_reason || null,
+    toiletDetected:
+      row.toilet_detected !== null && row.toilet_detected !== undefined
+        ? Boolean(row.toilet_detected)
+        : null,
+    visibilityScore: toNumber(row.visibility_score, null),
+    score: overallScore,
+    scoreLabel: scoreLabel(overallScore),
+    confidence,
+    subscores: {
+      floor: toNumber(row.floor_score, null),
+      commodeUrinal: toNumber(row.commode_score, null),
+      stainPresence: stainScore,
+      garbagePresence: garbageScore,
+      waterStagnation: waterScore,
+    },
+    garbagePresence: garbageScore !== null ? garbageScore > 50 : null,
+    issueTags,
+    issueSummary: row.issue_summary || null,
+    severity: row.severity || null,
+    reviewRequired: Boolean(row.review_required),
+    modelVersion: row.model_version || null,
+    promptVersion: row.prompt_version || null,
+    scoringVersion: row.scoring_version || null,
+    aiProcessedAt: row.ai_processed_at || null,
+    aiError: row.ai_error || null,
+    scoringRejected: Boolean(row.scoring_rejected),
+    similarityScore,
+    suspiciousFlags,
+    explanationSummary: row.explanation_summary || null,
+    watermarkMeta: row.watermark_meta || null,
+    metadata: row.metadata || null,
+  };
+};
+
+const scopedInspectionWhere = (req, where = {}) => {
+  if (!req?.user || req.user.isSuperAdmin) return where;
+  return { ...where, tenant_id: req.user.tenantId };
+};
+
+const assertInspectionScope = async (inspectionId, req, options = {}) => {
+  const inspection = await Inspection.findOne({
+    where: scopedInspectionWhere(req, { id: inspectionId }),
+    ...options,
+  });
+  if (!inspection) {
+    throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
+  }
+  return inspection;
+};
+
+const assertToiletScope = async (toiletId, req) => {
+  const unit = await ToiletUnit.findByPk(toiletId, {
+    include: [{
+      model: Facility,
+      attributes: ['id', 'tenant_id', 'name', 'code', 'metadata', 'address_line', 'latitude', 'longitude'],
+    }],
+  });
+  if (!unit) {
+    throw new AppError('Toilet not found', 404, { code: 'TOILET_NOT_FOUND' });
+  }
+  if (!req?.user?.isSuperAdmin && req?.user?.tenantId !== unit.Facility?.tenant_id) {
+    throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  return unit;
+};
+
+const normalizeDateKey = (value) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+};
+
+const buildInspectionMediaMap = async (inspectionIds = []) => {
+  if (!Array.isArray(inspectionIds) || inspectionIds.length === 0) {
+    return new Map();
+  }
+  const rows = await InspectionMedia.findAll({
+    where: {
+      inspection_id: {
+        [Op.in]: inspectionIds,
+      },
+    },
+    attributes: [
+      'id',
+      'inspection_id',
+      'capture_stage',
+      'overall_score',
+      'confidence_score',
+      'issue_tags',
+      'review_required',
+      'ai_status',
+      'validation_status',
+      'scoring_rejected',
+      'similarity_score',
+    ],
+    order: [['inspection_id', 'ASC'], ['capture_stage', 'ASC'], ['created_at', 'ASC']],
+  });
+  const dedupedRows = dedupeInspectionMediaRows(rows);
+  const map = new Map();
+  for (const row of dedupedRows) {
+    const key = String(row.inspection_id);
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    map.get(key).push(row);
+  }
+  return map;
+};
+
+const buildLatestAiResultMap = async (inspectionIds = []) => {
+  if (!Array.isArray(inspectionIds) || inspectionIds.length === 0) {
+    return new Map();
+  }
+  const rows = await AiAnalysisResult.findAll({
+    where: {
+      inspection_id: {
+        [Op.in]: inspectionIds,
+      },
+    },
+    attributes: [
+      'inspection_id',
+      'cleanliness_score',
+      'confidence_score',
+      'issue_tags',
+      'processed_at',
+    ],
+    order: [['inspection_id', 'ASC'], ['processed_at', 'DESC']],
+  });
+  const map = new Map();
+  for (const row of rows) {
+    const key = String(row.inspection_id);
+    if (!map.has(key)) {
+      map.set(key, row);
+    }
+  }
+  return map;
+};
+
+const buildInspectionMetrics = ({
+  inspectionType = null,
+  persisted = {},
+  mediaRows = [],
+  aiResult = null,
+}) => {
+  const beforeRows = mediaRows.filter((row) => stageOf(row) === 'before');
+  const afterRows = mediaRows.filter((row) => stageOf(row) === 'after');
+  const evidenceRows = mediaRows.filter((row) => {
+    const stage = stageOf(row);
+    return stage !== 'before' && stage !== 'after';
+  });
+  const scoredRows = mediaRows.filter((row) => hasScored(row));
+  const scoredBeforeRows = beforeRows.filter((row) => hasScored(row));
+  const scoredAfterRows = afterRows.filter((row) => hasScored(row));
+  const scoredEvidenceRows = evidenceRows.filter((row) => hasScored(row));
+
+  let avgBeforeScore =
+    toNumber(persisted.avgBeforeScore, null) ??
+    round2(mean(scoredBeforeRows.map((row) => toNumber(row.overall_score, null))));
+  let avgAfterScore =
+    toNumber(persisted.avgAfterScore, null) ??
+    round2(mean(scoredAfterRows.map((row) => toNumber(row.overall_score, null))));
+  let confidenceAvg =
+    toNumber(persisted.confidenceAvg, null) ??
+    round2(mean(scoredRows.map((row) => toNumber(row.confidence_score, null))));
+
+  let beforeImageCount =
+    beforeRows.length > 0
+      ? beforeRows.length
+      : toNumber(persisted.beforeImageCount, null);
+  let afterImageCount =
+    afterRows.length > 0
+      ? afterRows.length
+      : toNumber(persisted.afterImageCount, null);
+
+  const beforeIssueTags = Array.isArray(persisted.beforeIssueTags)
+    ? persisted.beforeIssueTags
+    : unionIssueTags(beforeRows);
+  const afterIssueTags = Array.isArray(persisted.afterIssueTags)
+    ? persisted.afterIssueTags
+    : unionIssueTags(afterRows);
+
+  const normalizedInspectionType = String(inspectionType || '').toLowerCase();
+  const aiScore = toNumber(aiResult?.cleanliness_score, null);
+  const aiConfidence = toNumber(aiResult?.confidence_score, null);
+
+  if (
+    avgBeforeScore === null &&
+    avgAfterScore === null &&
+    scoredEvidenceRows.length > 0
+  ) {
+    const evidenceAvg = round2(
+      mean(scoredEvidenceRows.map((row) => toNumber(row.overall_score, null)))
+    );
+    if (normalizedInspectionType === 'before_cleaning') {
+      avgBeforeScore = evidenceAvg;
+      if (beforeImageCount === null) beforeImageCount = evidenceRows.length;
+    } else {
+      avgAfterScore = evidenceAvg;
+      if (afterImageCount === null) afterImageCount = evidenceRows.length;
+    }
+  }
+
+  if (avgBeforeScore === null && avgAfterScore === null && aiScore !== null) {
+    if (normalizedInspectionType === 'before_cleaning') {
+      avgBeforeScore = aiScore;
+    } else {
+      avgAfterScore = aiScore;
+    }
+  }
+
+  if (confidenceAvg === null && aiConfidence !== null) {
+    confidenceAvg = aiConfidence;
+  }
+
+  const improvementScore =
+    toNumber(persisted.improvementScore, null) ??
+    (avgBeforeScore !== null && avgAfterScore !== null
+      ? round2(avgAfterScore - avgBeforeScore)
+      : null);
+
+  const resolvedIssues =
+    Array.isArray(persisted.resolvedIssues) && persisted.resolvedIssues.length > 0
+      ? persisted.resolvedIssues
+      : beforeIssueTags.filter((tag) => !afterIssueTags.includes(tag));
+  const remainingIssues =
+    Array.isArray(persisted.remainingIssues) && persisted.remainingIssues.length > 0
+      ? persisted.remainingIssues
+      : afterIssueTags;
+
+  const reviewRequired =
+    Boolean(persisted.reviewRequired) ||
+    mediaRows.some((row) => Boolean(row.review_required)) ||
+    (confidenceAvg !== null && confidenceAvg < REVIEW_CONFIDENCE_THRESHOLD);
+
+  const validationFailedCount =
+    toNumber(persisted.validationFailedCount, null) ??
+    mediaRows.filter((row) =>
+      String(row.validation_status || '')
+        .trim()
+        .toUpperCase()
+        .startsWith('FAILED')
+    ).length;
+  const rejectedImageCount =
+    toNumber(persisted.rejectedImageCount, null) ??
+    mediaRows.filter((row) =>
+      Boolean(row.scoring_rejected) ||
+      String(row.validation_status || '')
+        .trim()
+        .toUpperCase() === 'REJECTED_LOW_CONFIDENCE'
+    ).length;
+  const suspiciousReasons = Array.isArray(persisted.suspiciousReasons)
+    ? persisted.suspiciousReasons
+    : [];
+  const suspiciousFlag = Boolean(
+    persisted.suspiciousFlag || suspiciousReasons.length > 0
+  );
+
+  const hasBefore = Number(beforeImageCount || 0) > 0;
+  const hasAfter = Number(afterImageCount || 0) > 0;
+
+  const inspectionResult =
+    persisted.inspectionResult ||
+    resolveInspectionResult({
+      hasBefore,
+      hasAfter,
+      improvementScore,
+    });
+
+  return {
+    avgBeforeScore,
+    avgAfterScore,
+    improvementScore,
+    confidenceAvg,
+    beforeImageCount: Number(beforeImageCount || 0),
+    afterImageCount: Number(afterImageCount || 0),
+    beforeIssueTags,
+    afterIssueTags,
+    resolvedIssues,
+    remainingIssues,
+    reviewRequired,
+    inspectionResult,
+    suspiciousFlag,
+    suspiciousReasons,
+    validationFailedCount: Number(validationFailedCount || 0),
+    rejectedImageCount: Number(rejectedImageCount || 0),
+  };
+};
+
+const resolveInspectionStatus = ({
+  inspection,
+  totalImages,
+  completedImages,
+  processingImages,
+  failedImages,
+  reviewRequired,
+}) => {
+  const submitted = Boolean(inspection.submitted_at);
+
+  if (!submitted && totalImages === 0) return 'DRAFT';
+  if (!submitted && totalImages > 0) return 'IN_PROGRESS';
+  if (failedImages > 0 && completedImages === 0) return 'REVIEW_REQUIRED';
+  if (completedImages === 0) return 'SUBMITTED';
+  if (completedImages < totalImages || processingImages > 0) return 'PARTIALLY_SCORED';
+  if (reviewRequired) return 'REVIEW_REQUIRED';
+  return 'FULLY_SCORED';
+};
+
+const resolveInspectionResult = ({
+  hasBefore,
+  hasAfter,
+  improvementScore,
+}) => {
+  if (!hasBefore || !hasAfter) return 'invalid';
+  if (improvementScore === null || improvementScore === undefined) return 'partial';
+  if (improvementScore >= IMPROVEMENT_THRESHOLD) return 'improved';
+  if (improvementScore > 0) return 'partial';
+  return 'not_improved';
+};
+
+const resolvePipelineStatus = (status) => {
+  const normalized = String(status || '').toUpperCase();
+  if (normalized === 'DRAFT') return 'draft_local';
+  if (normalized === 'IN_PROGRESS') return 'pending_upload';
+  if (normalized === 'SUBMITTED') return 'queued_for_ai';
+  if (normalized === 'PARTIALLY_SCORED') return 'processing';
+  if (normalized === 'FULLY_SCORED') return 'completed';
+  if (normalized === 'REVIEW_REQUIRED') return 'needs_review';
+  if (normalized === 'COMPLETED') return 'completed';
+  return 'processing';
+};
+
+const toMillis = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const isStaleTimestamp = (value, staleMs) => {
+  if (!value || !Number.isFinite(staleMs) || staleMs <= 0) return false;
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return false;
+  return Date.now() - time >= staleMs;
+};
+
+const requeueStaleImageAnalysis = async ({ inspection, rows = [], req }) => {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const staleMs =
+    toMillis(process.env.ANALYSIS_PROCESSING_STALE_MS) ??
+    toMillis(process.env.ANALYSIS_QUEUE_STALE_MS) ??
+    180000;
+  const candidates = rows.filter((row) => {
+    const status = String(row.ai_status || '').trim().toUpperCase();
+    if (status !== 'AI_PROCESSING' && status !== 'AI_QUEUED') return false;
+    return isStaleTimestamp(row.updated_at || row.created_at, staleMs);
+  });
+  if (candidates.length === 0) return rows;
+
+  const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
+  const requeueLimit = Math.min(candidates.length, 8);
+  const selected = candidates.slice(0, requeueLimit);
+
+  for (const row of selected) {
+    await row.update({
+      ai_status: 'AI_QUEUED',
+      ai_error: null,
+      validation_status: 'PENDING',
+      validation_reason: null,
+      updated_at: new Date(),
+    });
+
+    await InspectionEvent.create({
+      tenant_id: inspection.tenant_id,
+      inspection_id: inspection.id,
+      toilet_id: row.toilet_unit_id || inspection.toilet_unit_id || null,
+      image_id: row.id,
+      event_type: 'analysis.image.stale_requeued',
+      event_status: 'AI_QUEUED',
+      source: 'api',
+      actor_user_id: req?.user?.id || null,
+      payload: {
+        imageId: row.id,
+        previousStatus: row.ai_status || null,
+        staleMs,
+      },
+      occurred_at: new Date(),
+    });
+
+    await enqueueInspectionAnalysis({
+      inspectionId: inspection.id,
+      imageId: row.id,
+      tenantId: inspection.tenant_id,
+      jobType: 'AI_ANALYSIS',
+      requestContext: {
+        requestId: req?.requestId || null,
+        ip: req?.ip || null,
+        user: req?.user
+          ? {
+              id: req.user.id || null,
+              tenantId: req.user.tenantId || null,
+              isSuperAdmin: Boolean(req.user.isSuperAdmin),
+              roleCodes: Array.isArray(req.user.roleCodes) ? req.user.roleCodes.slice(0, 20) : [],
+            }
+          : null,
+        headers: null,
+      },
+    });
+  }
+
+  return InspectionMedia.findAll({
+    where: { inspection_id: inspection.id },
+    order: [
+      ['capture_stage', 'ASC'],
+      ['ordinal', 'ASC'],
+      ['captured_at', 'ASC'],
+      ['created_at', 'ASC'],
+    ],
+  });
+};
+
+const resolveProcessingStatus = (status) => {
+  const normalized = String(status || '').toUpperCase();
+  if (normalized === 'DRAFT' || normalized === 'IN_PROGRESS') return 'draft';
+  if (normalized === 'SUBMITTED') return 'queued';
+  if (normalized === 'PARTIALLY_SCORED') return 'processing';
+  if (normalized === 'FULLY_SCORED' || normalized === 'REVIEW_REQUIRED' || normalized === 'COMPLETED') {
+    return 'completed';
+  }
+  return 'processing';
+};
+
+const recomputeToiletDailyAggregates = async (toiletId, { transaction = null } = {}) => {
+  const dailyRows = await sequelize.query(
+    `
+      SELECT
+        DATE(COALESCE(i.submitted_at, i.captured_at)) AS date,
+        AVG(i.avg_before_score)::numeric AS avg_before_score,
+        AVG(i.avg_after_score)::numeric AS avg_after_score,
+        COUNT(i.id)::int AS inspection_count,
+        SUM(CASE WHEN COALESCE(i.avg_before_score, 0) < 51 THEN 1 ELSE 0 END)::int AS dirty_count,
+        SUM(CASE WHEN COALESCE(i.avg_after_score, 0) >= 71 THEN 1 ELSE 0 END)::int AS cleaned_count,
+        AVG(i.improvement_score)::numeric AS avg_improvement
+      FROM inspections i
+      WHERE i.toilet_unit_id = :toiletId
+        AND (i.avg_before_score IS NOT NULL OR i.avg_after_score IS NOT NULL)
+      GROUP BY DATE(COALESCE(i.submitted_at, i.captured_at))
+      ORDER BY DATE(COALESCE(i.submitted_at, i.captured_at)) DESC
+      LIMIT 120
+    `,
+    {
+      replacements: { toiletId },
+      type: QueryTypes.SELECT,
+      transaction,
+    }
+  );
+
+  for (const row of dailyRows) {
+    await ToiletScoreDaily.upsert(
+      {
+        toilet_id: toiletId,
+        date: row.date,
+        avg_before_score: round2(toNumber(row.avg_before_score, null)),
+        avg_after_score: round2(toNumber(row.avg_after_score, null)),
+        inspection_count: Number(row.inspection_count || 0),
+        dirty_count: Number(row.dirty_count || 0),
+        cleaned_count: Number(row.cleaned_count || 0),
+        avg_improvement: round2(toNumber(row.avg_improvement, null)),
+      },
+      { transaction }
+    );
+  }
+};
+
+const recomputeToiletAggregates = async (toiletId, { transaction = null } = {}) => {
+  const inspections = await Inspection.findAll({
+    where: {
+      toilet_unit_id: toiletId,
+      submitted_at: { [Op.ne]: null },
+    },
+    attributes: [
+      'id',
+      'captured_at',
+      'submitted_at',
+      'avg_before_score',
+      'avg_after_score',
+      'improvement_score',
+      'status',
+      'inspection_result',
+    ],
+    order: [['submitted_at', 'DESC'], ['captured_at', 'DESC']],
+    transaction,
+  });
+
+  const totalInspections = inspections.length;
+  const beforeScores = inspections
+    .map((item) => toNumber(item.avg_before_score, null))
+    .filter((item) => item !== null);
+  const afterScores = inspections
+    .map((item) => toNumber(item.avg_after_score, null))
+    .filter((item) => item !== null);
+  const improvements = inspections
+    .map((item) => toNumber(item.improvement_score, null))
+    .filter((item) => item !== null);
+
+  const latest = inspections[0] || null;
+  const latestBefore = latest ? toNumber(latest.avg_before_score, null) : null;
+  const latestAfter = latest ? toNumber(latest.avg_after_score, null) : null;
+  const latestScore = latestAfter ?? latestBefore;
+
+  const dirtyCount = inspections.filter((item) => {
+    const before = toNumber(item.avg_before_score, null);
+    return before !== null && before <= 50;
+  }).length;
+  const lowPerformanceCount = inspections.filter((item) => {
+    const delta = toNumber(item.improvement_score, null);
+    return delta !== null && delta < IMPROVEMENT_THRESHOLD;
+  }).length;
+
+  const dirtyFrequency =
+    totalInspections > 0 ? round2((dirtyCount / totalInspections) * 100) : 0;
+  const lowPerformanceFrequency =
+    totalInspections > 0 ? round2((lowPerformanceCount / totalInspections) * 100) : 0;
+
+  let nextStatus = 'moderate';
+  if (latestScore !== null) {
+    if (latestScore >= 71) nextStatus = 'clean';
+    else if (latestScore >= 51) nextStatus = 'moderate';
+    else if (latestScore >= 31) nextStatus = 'poor';
+    else nextStatus = 'critical';
+  }
+
+  const unit = await ToiletUnit.findByPk(toiletId, { transaction });
+  if (!unit) return null;
+
+  await unit.update(
+    {
+      latest_score: round2(latestScore),
+      latest_before_score: round2(latestBefore),
+      latest_after_score: round2(latestAfter),
+      avg_before_score: round2(mean(beforeScores)),
+      avg_after_score: round2(mean(afterScores)),
+      avg_improvement_score: round2(mean(improvements)),
+      last_inspection_at: latest?.submitted_at || latest?.captured_at || null,
+      last_cleaned_at:
+        inspections.find((item) => toNumber(item.avg_after_score, null) !== null)?.submitted_at ||
+        inspections.find((item) => toNumber(item.avg_after_score, null) !== null)?.captured_at ||
+        null,
+      total_inspections: totalInspections,
+      dirty_frequency: dirtyFrequency || 0,
+      low_performance_frequency: lowPerformanceFrequency || 0,
+      status: nextStatus,
+      updated_at: new Date(),
+    },
+    { transaction }
+  );
+
+  try {
+    await recomputeToiletDailyAggregates(toiletId, { transaction });
+  } catch (error) {
+    // Keep inspection/image scoring flow resilient even if daily aggregate table has legacy constraint issues.
+    // eslint-disable-next-line no-console
+    console.warn('Skipping toilet daily aggregate refresh:', error.message);
+  }
+  return unit;
+};
+
+const recomputeInspectionAggregates = async (
+  inspectionId,
+  { transaction = null, updateToilet = true } = {}
+) => {
+  const inspection = await Inspection.findByPk(inspectionId, { transaction });
+  if (!inspection) return null;
+
+  const mediaRows = await InspectionMedia.findAll({
+    where: { inspection_id: inspectionId },
+    order: [
+      ['capture_stage', 'ASC'],
+      ['ordinal', 'ASC'],
+      ['captured_at', 'ASC'],
+      ['created_at', 'ASC'],
+    ],
+    transaction,
+  });
+
+  const evidenceRows = dedupeInspectionMediaRows(mediaRows);
+  const beforeRows = evidenceRows.filter((row) => stageOf(row) === 'before');
+  const afterRows = evidenceRows.filter((row) => stageOf(row) === 'after');
+  const scoredRows = evidenceRows.filter((row) => hasScored(row));
+  const beforeScored = beforeRows.filter((row) => hasScored(row));
+  const afterScored = afterRows.filter((row) => hasScored(row));
+
+  const avgBeforeScore = round2(mean(beforeScored.map((row) => row.overall_score)));
+  const avgAfterScore = round2(mean(afterScored.map((row) => row.overall_score)));
+  const improvementScore =
+    avgBeforeScore !== null && avgAfterScore !== null
+      ? round2(avgAfterScore - avgBeforeScore)
+      : null;
+  const confidenceAvg = round2(mean(scoredRows.map((row) => row.confidence_score)));
+
+  const beforeIssueTags = unionIssueTags(beforeRows);
+  const afterIssueTags = unionIssueTags(afterRows);
+  const resolvedIssues = beforeIssueTags.filter((tag) => !afterIssueTags.includes(tag));
+  const remainingIssues = afterIssueTags;
+
+  const lowConfidence = scoredRows.some((row) => {
+    const confidence = toNumber(row.confidence_score, null);
+    return confidence !== null && confidence < REVIEW_CONFIDENCE_THRESHOLD;
+  });
+  const suspiciousReuseBySha = beforeRows.some((before) => {
+    const hash = String(before.sha256 || '').trim().toLowerCase();
+    if (!hash) return false;
+    return afterRows.some(
+      (after) => String(after.sha256 || '').trim().toLowerCase() === hash
+    );
+  });
+  const suspiciousReuseByPerceptualHash = afterRows.some((after) => {
+    const similarity = toNumber(after.similarity_score, null);
+    return similarity !== null && similarity >= Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92);
+  });
+  const qualityInvalid = evidenceRows.some(
+    (row) =>
+      String(row.image_quality_status || '')
+        .trim()
+        .toLowerCase() !== 'ok' &&
+      String(row.image_quality_status || '')
+        .trim()
+        .toLowerCase() !== 'unknown'
+  );
+  const validationFailedCount = evidenceRows.filter((row) =>
+    String(row.validation_status || '')
+      .trim()
+      .toUpperCase()
+      .startsWith('FAILED')
+  ).length;
+  const rejectedImageCount = evidenceRows.filter((row) =>
+    Boolean(row.scoring_rejected) ||
+    String(row.validation_status || '')
+      .trim()
+      .toUpperCase() === 'REJECTED_LOW_CONFIDENCE'
+  ).length;
+  const hasBefore = beforeRows.length > 0;
+  const hasAfter = afterRows.length > 0;
+  const noMeaningfulImprovement =
+    improvementScore !== null && improvementScore < IMPROVEMENT_THRESHOLD;
+  const noImprovementDetected =
+    improvementScore !== null &&
+    avgBeforeScore !== null &&
+    avgAfterScore !== null &&
+    avgAfterScore <= avgBeforeScore;
+
+  const suspiciousReasons = [];
+  if (suspiciousReuseBySha || suspiciousReuseByPerceptualHash) {
+    suspiciousReasons.push('possible_fake_cleaning_similar_images');
+  }
+  if (noImprovementDetected) {
+    suspiciousReasons.push('no_improvement_detected');
+  }
+  const suspiciousFlag = suspiciousReasons.length > 0;
+
+  const reviewRequired =
+    evidenceRows.some((row) => Boolean(row.review_required)) ||
+    lowConfidence ||
+    suspiciousReuseBySha ||
+    suspiciousReuseByPerceptualHash ||
+    qualityInvalid ||
+    validationFailedCount > 0 ||
+    rejectedImageCount > 0 ||
+    !hasBefore ||
+    !hasAfter ||
+    noMeaningfulImprovement;
+
+  const completedImages = evidenceRows.filter(
+    (row) => String(row.ai_status || '').toUpperCase() === 'AI_COMPLETED'
+  ).length;
+  const processingImages = evidenceRows.filter(
+    (row) => String(row.ai_status || '').toUpperCase() === 'AI_PROCESSING'
+  ).length;
+  const failedImages = evidenceRows.filter(
+    (row) => String(row.ai_status || '').toUpperCase() === 'AI_FAILED'
+  ).length;
+  const totalImages = evidenceRows.length;
+
+  const status = resolveInspectionStatus({
+    inspection,
+    totalImages,
+    completedImages,
+    processingImages,
+    failedImages,
+    reviewRequired,
+  });
+  const inspectionResult = resolveInspectionResult({
+    hasBefore,
+    hasAfter,
+    improvementScore,
+  });
+
+  await inspection.update(
+    {
+      status,
+      before_image_count: beforeRows.length,
+      after_image_count: afterRows.length,
+      avg_before_score: avgBeforeScore,
+      avg_after_score: avgAfterScore,
+      improvement_score: improvementScore,
+      confidence_avg: confidenceAvg,
+      before_issue_tags: beforeIssueTags,
+      after_issue_tags: afterIssueTags,
+      resolved_issues: resolvedIssues,
+      remaining_issues: remainingIssues,
+      inspection_result: inspectionResult,
+      review_required: reviewRequired,
+      suspicious_flag: suspiciousFlag,
+      suspicious_reasons: suspiciousReasons,
+      validation_failed_count: validationFailedCount,
+      rejected_image_count: rejectedImageCount,
+      last_scored_at: completedImages > 0 ? new Date() : inspection.last_scored_at,
+      pipeline_status: resolvePipelineStatus(status),
+      processing_status: resolveProcessingStatus(status),
+      updated_at: new Date(),
+    },
+    { transaction }
+  );
+
+  if (updateToilet && inspection.toilet_unit_id) {
+    await recomputeToiletAggregates(inspection.toilet_unit_id, { transaction });
+  }
+
+  return {
+    inspectionId: inspection.id,
+    status,
+    processingStatus: resolveProcessingStatus(status),
+    pipelineStatus: resolvePipelineStatus(status),
+    beforeImageCount: beforeRows.length,
+    afterImageCount: afterRows.length,
+    avgBeforeScore,
+    avgAfterScore,
+    improvementScore,
+    confidenceAvg,
+    reviewRequired,
+    inspectionResult,
+    beforeIssueTags,
+    afterIssueTags,
+    resolvedIssues,
+    remainingIssues,
+    suspiciousFlag,
+    suspiciousReasons,
+    validationFailedCount,
+    rejectedImageCount,
+  };
+};
+
+const listInspectionImages = async (inspectionId, req) => {
+  const inspection = await assertInspectionScope(inspectionId, req);
+  let rows = await InspectionMedia.findAll({
+    where: { inspection_id: inspectionId },
+    order: [
+      ['capture_stage', 'ASC'],
+      ['ordinal', 'ASC'],
+      ['captured_at', 'ASC'],
+      ['created_at', 'ASC'],
+    ],
+  });
+  rows = await requeueStaleImageAnalysis({
+    inspection,
+    rows,
+    req,
+  });
+  const mapped = dedupeInspectionMediaRows(rows).map(mapMediaEvidence);
+  return {
+    inspectionId,
+    beforeImages: mapped.filter((item) => item.stage === 'BEFORE'),
+    afterImages: mapped.filter((item) => item.stage === 'AFTER'),
+    images: mapped,
+  };
+};
+
+const getInspectionImage = async (imageId, req) => {
+  const row = await InspectionMedia.findByPk(imageId, {
+    include: [{ model: Inspection, attributes: ['id', 'tenant_id', 'toilet_unit_id'] }],
+  });
+  if (!row || !row.Inspection) {
+    throw new AppError('Inspection image not found', 404, { code: 'IMAGE_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && row.Inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection image out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  return mapMediaEvidence(row);
+};
+
+const triggerInspectionImageAi = async (imageId, req) => {
+  const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
+  const row = await InspectionMedia.findByPk(imageId, {
+    include: [{ model: Inspection, attributes: ['id', 'tenant_id', 'toilet_unit_id'] }],
+  });
+  if (!row || !row.Inspection) {
+    throw new AppError('Inspection image not found', 404, { code: 'IMAGE_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && row.Inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection image out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  await row.update({
+    ai_status: 'AI_QUEUED',
+    ai_error: null,
+    validation_status: 'PENDING',
+    validation_reason: null,
+    scoring_rejected: false,
+    updated_at: new Date(),
+  });
+
+  await InspectionEvent.create({
+    tenant_id: row.Inspection.tenant_id,
+    inspection_id: row.inspection_id,
+    toilet_id: row.toilet_unit_id || row.Inspection.toilet_unit_id || null,
+    image_id: row.id,
+    event_type: 'inspection.image.ai_queued',
+    event_status: 'AI_QUEUED',
+    source: 'api',
+    actor_user_id: req.user.id,
+    payload: {
+      imageId: row.id,
+    },
+    occurred_at: new Date(),
+  });
+
+  const queued = await enqueueInspectionAnalysis({
+    inspectionId: row.inspection_id,
+    imageId: row.id,
+    tenantId: row.Inspection.tenant_id,
+    jobType: 'AI_ANALYSIS',
+    requestContext: {
+      requestId: req.requestId,
+      ip: req.ip,
+      user: {
+        id: req.user.id,
+        tenantId: req.user.tenantId,
+        isSuperAdmin: Boolean(req.user.isSuperAdmin),
+      },
+    },
+  });
+
+  return {
+    imageId: row.id,
+    inspectionId: row.inspection_id,
+    aiStatus: 'AI_QUEUED',
+    queue: queued,
+  };
+};
+
+const listToiletInspections = async (toiletId, req, { page = 1, limit = 20 } = {}) => {
+  const unit = await assertToiletScope(toiletId, req);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const offset = (safePage - 1) * safeLimit;
+
+  const { rows, count } = await Inspection.findAndCountAll({
+    where: { toilet_unit_id: toiletId },
+    include: [
+      {
+        model: PlatformUser,
+        as: 'inspector',
+        attributes: ['id', 'full_name', 'employee_code'],
+        required: false,
+      },
+    ],
+    order: [['submitted_at', 'DESC'], ['captured_at', 'DESC']],
+    limit: safeLimit,
+    offset,
+  });
+
+  const inspectionIds = rows.map((row) => row.id);
+  const [mediaByInspection, aiByInspection] = await Promise.all([
+    buildInspectionMediaMap(inspectionIds),
+    buildLatestAiResultMap(inspectionIds),
+  ]);
+
+  return {
+    toiletId,
+    toiletCode: unit.code,
+    items: rows.map((row) => {
+      const derived = buildInspectionMetrics({
+        inspectionType: row.inspection_type,
+        persisted: {
+          beforeImageCount: row.before_image_count,
+          afterImageCount: row.after_image_count,
+          avgBeforeScore: row.avg_before_score,
+          avgAfterScore: row.avg_after_score,
+          improvementScore: row.improvement_score,
+          confidenceAvg: row.confidence_avg,
+          reviewRequired: row.review_required,
+          inspectionResult: row.inspection_result,
+          beforeIssueTags: row.before_issue_tags,
+          afterIssueTags: row.after_issue_tags,
+          resolvedIssues: row.resolved_issues,
+          remainingIssues: row.remaining_issues,
+          suspiciousFlag: row.suspicious_flag,
+          suspiciousReasons: row.suspicious_reasons,
+          validationFailedCount: row.validation_failed_count,
+          rejectedImageCount: row.rejected_image_count,
+        },
+        mediaRows: mediaByInspection.get(String(row.id)) || [],
+        aiResult: aiByInspection.get(String(row.id)) || null,
+      });
+
+      return {
+        id: row.id,
+        submittedAt: row.submitted_at,
+        capturedAt: row.captured_at,
+        worker: row.inspector
+          ? {
+              id: row.inspector.id,
+              name: row.inspector.full_name,
+              employeeCode: row.inspector.employee_code || null,
+            }
+          : null,
+        beforeImageCount: derived.beforeImageCount,
+        afterImageCount: derived.afterImageCount,
+        avgBeforeScore: derived.avgBeforeScore,
+        avgAfterScore: derived.avgAfterScore,
+        improvementScore: derived.improvementScore,
+        confidenceAvg: derived.confidenceAvg,
+        reviewRequired: derived.reviewRequired,
+        inspectionResult: derived.inspectionResult,
+        beforeIssueTags: derived.beforeIssueTags,
+        afterIssueTags: derived.afterIssueTags,
+        resolvedIssues: derived.resolvedIssues,
+        remainingIssues: derived.remainingIssues,
+        suspiciousFlag: derived.suspiciousFlag,
+        suspiciousReasons: derived.suspiciousReasons,
+        validationFailedCount: derived.validationFailedCount,
+        rejectedImageCount: derived.rejectedImageCount,
+        status: row.status || (row.submitted_at ? 'SUBMITTED' : 'IN_PROGRESS'),
+        scoreLabel: scoreLabel(derived.avgAfterScore ?? derived.avgBeforeScore),
+      };
+    }),
+    meta: {
+      page: safePage,
+      limit: safeLimit,
+      total: count,
+      totalPages: Math.max(1, Math.ceil(count / safeLimit)),
+    },
+  };
+};
+
+const getInspectionComparison = async (inspectionId, req) => {
+  const inspection = await assertInspectionScope(inspectionId, req, {
+    include: [{ model: InspectionMedia }],
+  });
+
+  const refreshedRows = await requeueStaleImageAnalysis({
+    inspection,
+    rows: Array.isArray(inspection.InspectionMedia) ? inspection.InspectionMedia : [],
+    req,
+  });
+  const evidenceRows = dedupeInspectionMediaRows(refreshedRows);
+  const beforeRows = evidenceRows.filter((item) => stageOf(item) === 'before');
+  const afterRows = evidenceRows.filter((item) => stageOf(item) === 'after');
+  const beforeImages = beforeRows.map(mapMediaEvidence);
+  const afterImages = afterRows.map(mapMediaEvidence);
+
+  const beforeByOrdinal = new Map();
+  for (const image of beforeImages) {
+    if (image.ordinal !== null && image.ordinal !== undefined) {
+      beforeByOrdinal.set(Number(image.ordinal), image);
+    }
+  }
+
+  const pairs = [];
+  for (const image of afterImages) {
+    const ordinal = image.ordinal !== null && image.ordinal !== undefined ? Number(image.ordinal) : null;
+    if (ordinal !== null && beforeByOrdinal.has(ordinal)) {
+      const before = beforeByOrdinal.get(ordinal);
+      pairs.push({
+        ordinal,
+        before,
+        after: image,
+        delta:
+          toNumber(image?.score, null) !== null && toNumber(before?.score, null) !== null
+            ? round2(toNumber(image.score, 0) - toNumber(before.score, 0))
+            : null,
+      });
+    }
+  }
+
+  const beforeAvg =
+    toNumber(inspection.avg_before_score, null) ??
+    round2(mean(beforeRows.map((item) => toNumber(item.overall_score, null))));
+  const afterAvg =
+    toNumber(inspection.avg_after_score, null) ??
+    round2(mean(afterRows.map((item) => toNumber(item.overall_score, null))));
+  const improvement =
+    toNumber(inspection.improvement_score, null) ??
+    (beforeAvg !== null && afterAvg !== null ? round2(afterAvg - beforeAvg) : null);
+
+  return {
+    inspectionId: inspection.id,
+    summary: {
+      avgBeforeScore: beforeAvg,
+      avgAfterScore: afterAvg,
+      improvementScore: improvement,
+      scoreLabelBefore: scoreLabel(beforeAvg),
+      scoreLabelAfter: scoreLabel(afterAvg),
+      inspectionResult: inspection.inspection_result || null,
+      confidenceAvg: toNumber(inspection.confidence_avg, null),
+      reviewRequired: Boolean(inspection.review_required),
+      suspiciousFlag: Boolean(inspection.suspicious_flag),
+      suspiciousReasons: Array.isArray(inspection.suspicious_reasons)
+        ? inspection.suspicious_reasons
+        : [],
+      validationFailedCount: Number(inspection.validation_failed_count || 0),
+      rejectedImageCount: Number(inspection.rejected_image_count || 0),
+    },
+    grouped: {
+      beforeImages,
+      afterImages,
+    },
+    pairs,
+    issues: {
+      before: Array.isArray(inspection.before_issue_tags) ? inspection.before_issue_tags : [],
+      after: Array.isArray(inspection.after_issue_tags) ? inspection.after_issue_tags : [],
+      resolved: Array.isArray(inspection.resolved_issues) ? inspection.resolved_issues : [],
+      remaining: Array.isArray(inspection.remaining_issues) ? inspection.remaining_issues : [],
+    },
+  };
+};
+
+const getToiletLatestInspection = async (toiletId, req) => {
+  await assertToiletScope(toiletId, req);
+  const latest = await Inspection.findOne({
+    where: { toilet_unit_id: toiletId },
+    include: [
+      {
+        model: PlatformUser,
+        as: 'inspector',
+        attributes: ['id', 'full_name', 'employee_code'],
+        required: false,
+      },
+      {
+        model: InspectionMedia,
+      },
+    ],
+    order: [['submitted_at', 'DESC'], ['captured_at', 'DESC']],
+  });
+  if (!latest) return null;
+
+  const refreshedRows = await requeueStaleImageAnalysis({
+    inspection: latest,
+    rows: Array.isArray(latest.InspectionMedia) ? latest.InspectionMedia : [],
+    req,
+  });
+  const media = dedupeInspectionMediaRows(refreshedRows);
+  const aiByInspection = await buildLatestAiResultMap([latest.id]);
+  const derived = buildInspectionMetrics({
+    inspectionType: latest.inspection_type,
+    persisted: {
+      beforeImageCount: latest.before_image_count,
+      afterImageCount: latest.after_image_count,
+      avgBeforeScore: latest.avg_before_score,
+      avgAfterScore: latest.avg_after_score,
+      improvementScore: latest.improvement_score,
+      confidenceAvg: latest.confidence_avg,
+      reviewRequired: latest.review_required,
+      inspectionResult: latest.inspection_result,
+      beforeIssueTags: latest.before_issue_tags,
+      afterIssueTags: latest.after_issue_tags,
+      resolvedIssues: latest.resolved_issues,
+      remainingIssues: latest.remaining_issues,
+      suspiciousFlag: latest.suspicious_flag,
+      suspiciousReasons: latest.suspicious_reasons,
+      validationFailedCount: latest.validation_failed_count,
+      rejectedImageCount: latest.rejected_image_count,
+    },
+    mediaRows: media,
+    aiResult: aiByInspection.get(String(latest.id)) || null,
+  });
+  const beforeImages = media.filter((item) => stageOf(item) === 'before').map(mapMediaEvidence);
+  const afterImages = media.filter((item) => stageOf(item) === 'after').map(mapMediaEvidence);
+
+  return {
+    id: latest.id,
+    submittedAt: latest.submitted_at,
+    capturedAt: latest.captured_at,
+    worker: latest.inspector
+      ? {
+          id: latest.inspector.id,
+          name: latest.inspector.full_name,
+          employeeCode: latest.inspector.employee_code || null,
+        }
+      : null,
+    avgBeforeScore: derived.avgBeforeScore,
+    avgAfterScore: derived.avgAfterScore,
+    improvementScore: derived.improvementScore,
+    scoreLabelBefore: scoreLabel(derived.avgBeforeScore),
+    scoreLabelAfter: scoreLabel(derived.avgAfterScore),
+    confidenceAvg: derived.confidenceAvg,
+    status: latest.status || null,
+    inspectionResult: derived.inspectionResult,
+    reviewRequired: derived.reviewRequired,
+    beforeIssueTags: derived.beforeIssueTags,
+    afterIssueTags: derived.afterIssueTags,
+    imageCount: beforeImages.length + afterImages.length,
+    suspiciousFlag: derived.suspiciousFlag,
+    suspiciousReasons: derived.suspiciousReasons,
+    validationFailedCount: derived.validationFailedCount,
+    rejectedImageCount: derived.rejectedImageCount,
+    beforeImages,
+    afterImages,
+    resolvedIssues: derived.resolvedIssues,
+    remainingIssues: derived.remainingIssues,
+  };
+};
+
+const getToiletInspectionHistory = async (toiletId, req, { page = 1, limit = 30 } = {}) => {
+  return listToiletInspections(toiletId, req, { page, limit });
+};
+
+const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
+  await assertToiletScope(toiletId, req);
+  const safeDays = Math.min(Math.max(Number(days) || 30, 1), 180);
+
+  const rows = await ToiletScoreDaily.findAll({
+    where: { toilet_id: toiletId },
+    order: [['date', 'DESC']],
+    limit: safeDays,
+  });
+
+  const points = rows
+    .map((row) => ({
+      date: row.date,
+      avgBeforeScore: toNumber(row.avg_before_score, null),
+      avgAfterScore: toNumber(row.avg_after_score, null),
+      avgImprovement: toNumber(row.avg_improvement, null),
+      inspectionCount: Number(row.inspection_count || 0),
+      dirtyCount: Number(row.dirty_count || 0),
+      cleanedCount: Number(row.cleaned_count || 0),
+    }))
+    .reverse();
+
+  const hasInformativePoints = points.some(
+    (point) =>
+      point.avgBeforeScore !== null ||
+      point.avgAfterScore !== null ||
+      point.avgImprovement !== null
+  );
+
+  if (hasInformativePoints) {
+    return {
+      toiletId,
+      points,
+    };
+  }
+
+  const fallbackInspections = await Inspection.findAll({
+    where: { toilet_unit_id: toiletId },
+    attributes: [
+      'id',
+      'inspection_type',
+      'captured_at',
+      'submitted_at',
+      'before_image_count',
+      'after_image_count',
+      'avg_before_score',
+      'avg_after_score',
+      'improvement_score',
+      'confidence_avg',
+      'inspection_result',
+      'review_required',
+      'before_issue_tags',
+      'after_issue_tags',
+      'resolved_issues',
+      'remaining_issues',
+    ],
+    order: [['submitted_at', 'DESC'], ['captured_at', 'DESC']],
+    limit: safeDays * 8,
+  });
+
+  const inspectionIds = fallbackInspections.map((row) => row.id);
+  const [mediaByInspection, aiByInspection] = await Promise.all([
+    buildInspectionMediaMap(inspectionIds),
+    buildLatestAiResultMap(inspectionIds),
+  ]);
+
+  const grouped = new Map();
+  for (const row of fallbackInspections) {
+    const derived = buildInspectionMetrics({
+      inspectionType: row.inspection_type,
+      persisted: {
+        beforeImageCount: row.before_image_count,
+        afterImageCount: row.after_image_count,
+        avgBeforeScore: row.avg_before_score,
+        avgAfterScore: row.avg_after_score,
+        improvementScore: row.improvement_score,
+        confidenceAvg: row.confidence_avg,
+        reviewRequired: row.review_required,
+        inspectionResult: row.inspection_result,
+        beforeIssueTags: row.before_issue_tags,
+        afterIssueTags: row.after_issue_tags,
+        resolvedIssues: row.resolved_issues,
+        remainingIssues: row.remaining_issues,
+      },
+      mediaRows: mediaByInspection.get(String(row.id)) || [],
+      aiResult: aiByInspection.get(String(row.id)) || null,
+    });
+
+    const dateKey = normalizeDateKey(row.submitted_at || row.captured_at);
+    if (!dateKey) continue;
+    if (!grouped.has(dateKey)) {
+      grouped.set(dateKey, {
+        date: dateKey,
+        beforeScores: [],
+        afterScores: [],
+        improvementScores: [],
+        inspectionCount: 0,
+        dirtyCount: 0,
+        cleanedCount: 0,
+      });
+    }
+    const entry = grouped.get(dateKey);
+    entry.inspectionCount += 1;
+    if (derived.avgBeforeScore !== null) {
+      entry.beforeScores.push(derived.avgBeforeScore);
+      if (derived.avgBeforeScore <= 50) entry.dirtyCount += 1;
+    }
+    if (derived.avgAfterScore !== null) {
+      entry.afterScores.push(derived.avgAfterScore);
+      if (derived.avgAfterScore >= 71) entry.cleanedCount += 1;
+    }
+    if (derived.improvementScore !== null) {
+      entry.improvementScores.push(derived.improvementScore);
+    }
+  }
+
+  const fallbackPoints = Array.from(grouped.values())
+    .sort((left, right) => String(left.date).localeCompare(String(right.date)))
+    .slice(-safeDays)
+    .map((entry) => ({
+      date: entry.date,
+      avgBeforeScore: round2(mean(entry.beforeScores)),
+      avgAfterScore: round2(mean(entry.afterScores)),
+      avgImprovement: round2(mean(entry.improvementScores)),
+      inspectionCount: entry.inspectionCount,
+      dirtyCount: entry.dirtyCount,
+      cleanedCount: entry.cleanedCount,
+    }));
+
+  return {
+    toiletId,
+    points: fallbackPoints,
+  };
+};
+
+const getToiletDetails = async (toiletId, req) => {
+  const unit = await assertToiletScope(toiletId, req);
+  await ensureQrImageForToilet({
+    toiletUnitId: unit.id,
+    qrCodeValue: unit.qr_code || unit.code,
+  }).catch(() => null);
+  const latestInspection = await getToiletLatestInspection(toiletId, req);
+  const history = await getToiletInspectionHistory(toiletId, req, { page: 1, limit: 50 });
+  const trends = await getToiletScoreTrends(toiletId, req, { days: 30 });
+
+  const historyItems = Array.isArray(history.items) ? history.items : [];
+  const beforeScores = historyItems
+    .map((item) => toNumber(item.avgBeforeScore, null))
+    .filter((item) => item !== null);
+  const afterScores = historyItems
+    .map((item) => toNumber(item.avgAfterScore, null))
+    .filter((item) => item !== null);
+  const improvementScores = historyItems
+    .map((item) => toNumber(item.improvementScore, null))
+    .filter((item) => item !== null);
+
+  const historyBeforeAvg = round2(mean(beforeScores));
+  const historyAfterAvg = round2(mean(afterScores));
+  const historyImprovementAvg = round2(mean(improvementScores));
+
+  const persistedTotalInspections = Number(unit.total_inspections || 0);
+  const derivedTotalInspections = historyItems.length;
+  const totalInspections =
+    persistedTotalInspections > 0 ? persistedTotalInspections : derivedTotalInspections;
+
+  const historyLatest = historyItems[0] || null;
+  const latestBeforeFromHistory = toNumber(historyLatest?.avgBeforeScore, null);
+  const latestAfterFromHistory = toNumber(historyLatest?.avgAfterScore, null);
+
+  const latestBeforeScore =
+    toNumber(unit.latest_before_score, null) ?? latestBeforeFromHistory;
+  const latestAfterScore =
+    toNumber(unit.latest_after_score, null) ?? latestAfterFromHistory;
+  const latestScore =
+    toNumber(unit.latest_score, null) ??
+    latestAfterScore ??
+    latestBeforeScore ??
+    toNumber(latestInspection?.avgAfterScore, null) ??
+    toNumber(latestInspection?.avgBeforeScore, null);
+
+  const avgBeforeScore =
+    (toNumber(unit.avg_before_score, null) === 0 &&
+    persistedTotalInspections === 0 &&
+    historyBeforeAvg !== null
+      ? null
+      : toNumber(unit.avg_before_score, null)) ?? historyBeforeAvg;
+  const avgAfterScore =
+    (toNumber(unit.avg_after_score, null) === 0 &&
+    persistedTotalInspections === 0 &&
+    historyAfterAvg !== null
+      ? null
+      : toNumber(unit.avg_after_score, null)) ?? historyAfterAvg;
+  const avgImprovementScore =
+    (toNumber(unit.avg_improvement_score, null) === 0 &&
+    persistedTotalInspections === 0 &&
+    historyImprovementAvg !== null
+      ? null
+      : toNumber(unit.avg_improvement_score, null)) ?? historyImprovementAvg;
+
+  const historyDirtyCount = historyItems.filter((item) => {
+    const value = toNumber(item.avgBeforeScore, null);
+    return value !== null && value <= 50;
+  }).length;
+  const historyLowPerformanceCount = historyItems.filter((item) => {
+    const value = toNumber(item.improvementScore, null);
+    return value !== null && value < IMPROVEMENT_THRESHOLD;
+  }).length;
+
+  const derivedDirtyFrequency =
+    totalInspections > 0 ? round2((historyDirtyCount / totalInspections) * 100) : 0;
+  const derivedLowPerformanceFrequency =
+    totalInspections > 0 ? round2((historyLowPerformanceCount / totalInspections) * 100) : 0;
+
+  const dirtyFrequency =
+    (toNumber(unit.dirty_frequency, null) === 0 &&
+    persistedTotalInspections === 0 &&
+    derivedDirtyFrequency !== null
+      ? null
+      : toNumber(unit.dirty_frequency, null)) ?? derivedDirtyFrequency;
+  const lowPerformanceFrequency =
+    (toNumber(unit.low_performance_frequency, null) === 0 &&
+    persistedTotalInspections === 0 &&
+    derivedLowPerformanceFrequency !== null
+      ? null
+      : toNumber(unit.low_performance_frequency, null)) ??
+    derivedLowPerformanceFrequency;
+
+  const suspiciousInspectionCount = historyItems.filter((item) =>
+    Boolean(item.suspiciousFlag)
+  ).length;
+  const rejectedImageCount = historyItems.reduce(
+    (sum, item) => sum + Number(item.rejectedImageCount || 0),
+    0
+  );
+  const validationFailedCount = historyItems.reduce(
+    (sum, item) => sum + Number(item.validationFailedCount || 0),
+    0
+  );
+
+  const lastInspectionAt =
+    unit.last_inspection_at ||
+    latestInspection?.submittedAt ||
+    latestInspection?.capturedAt ||
+    historyLatest?.submittedAt ||
+    historyLatest?.capturedAt ||
+    null;
+
+  const lastCleanedAt =
+    unit.last_cleaned_at ||
+    historyItems.find((item) => toNumber(item.avgAfterScore, null) !== null)?.submittedAt ||
+    historyItems.find((item) => toNumber(item.avgAfterScore, null) !== null)?.capturedAt ||
+    null;
+
+  const events = await InspectionEvent.findAll({
+    where: {
+      [Op.or]: [{ toilet_id: toiletId }, { inspection_id: { [Op.in]: history.items.map((item) => item.id) } }],
+    },
+    include: [
+      {
+        model: PlatformUser,
+        as: 'actor',
+        attributes: ['id', 'full_name'],
+        required: false,
+      },
+    ],
+    order: [['occurred_at', 'DESC']],
+    limit: 300,
+  });
+
+  const auditTrail = events.map((event) => ({
+    id: event.id,
+    inspectionId: event.inspection_id,
+    imageId: event.image_id || null,
+    eventType: event.event_type,
+    eventStatus: event.event_status || null,
+    occurredAt: event.occurred_at,
+    source: event.source,
+    actor: event.actor
+      ? {
+          id: event.actor.id,
+          name: event.actor.full_name,
+        }
+      : null,
+    payload: event.payload || null,
+  }));
+
+  return {
+    toilet: {
+      id: unit.id,
+      code: unit.code,
+      name: unit.code,
+      qrCode: unit.qr_code || unit.code,
+      qrImageUrl: getQrImageUrl(unit.id),
+      sector:
+        unit.sector_code ||
+        unit.Facility?.metadata?.sector ||
+        unit.Facility?.metadata?.zone ||
+        null,
+      location:
+        unit.location_label ||
+        unit.Facility?.address_line ||
+        unit.Facility?.name ||
+        unit.Facility?.code ||
+        null,
+      latitude:
+        unit.latitude !== null && unit.latitude !== undefined
+          ? Number(unit.latitude)
+          : unit.Facility?.latitude !== null && unit.Facility?.latitude !== undefined
+            ? Number(unit.Facility.latitude)
+            : null,
+      longitude:
+        unit.longitude !== null && unit.longitude !== undefined
+          ? Number(unit.longitude)
+          : unit.Facility?.longitude !== null && unit.Facility?.longitude !== undefined
+            ? Number(unit.Facility.longitude)
+            : null,
+      contractor: unit.Facility?.metadata?.contractor || null,
+      status: unit.status,
+      latestScore,
+      latestScoreLabel: scoreLabel(latestScore),
+      latestBeforeScore,
+      latestAfterScore,
+      avgBeforeScore,
+      avgAfterScore,
+      avgImprovementScore,
+      latestImprovementScore: toNumber(latestInspection?.improvementScore, null),
+      lastInspectionAt,
+      lastCleanedAt,
+      totalInspections,
+      dirtyFrequency,
+      lowPerformanceFrequency,
+      suspiciousInspectionCount,
+      rejectedImageCount,
+      validationFailedCount,
+      currentCleanlinessStatus: scoreLabel(latestScore),
+      lastWorker: latestInspection?.worker || null,
+    },
+    latestInspection,
+    history: history.items,
+    trends,
+    auditTrail,
+  };
+};
+
+module.exports = {
+  mapMediaEvidence,
+  scoreLabel,
+  recomputeInspectionAggregates,
+  recomputeToiletAggregates,
+  listInspectionImages,
+  getInspectionImage,
+  triggerInspectionImageAi,
+  listToiletInspections,
+  getInspectionComparison,
+  getToiletLatestInspection,
+  getToiletInspectionHistory,
+  getToiletScoreTrends,
+  getToiletDetails,
+};

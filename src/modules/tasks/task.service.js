@@ -11,6 +11,9 @@ const scopedWhere = (req, extra = {}) => {
   return where;
 };
 
+const hasPermission = (req, code) =>
+  Boolean((req.user?.permissionCodes || []).includes(code));
+
 const mapTask = (task) => ({
   id: task.id,
   tenantId: task.tenant_id,
@@ -57,6 +60,11 @@ const listTasks = async (req) => {
     where.facility_id = req.query.facilityId;
   }
 
+  const canManageTasks = hasPermission(req, 'task.manage');
+  if (!req.user.isSuperAdmin && !canManageTasks) {
+    where.assigned_to_user_id = req.user.id;
+  }
+
   const { rows, count } = await InspectionTask.findAndCountAll({
     where,
     include: [{ model: Facility }, { model: ToiletUnit }],
@@ -74,6 +82,25 @@ const listTasks = async (req) => {
       totalPages: Math.max(1, Math.ceil(count / limit)),
     },
   };
+};
+
+const getTaskById = async (req) => {
+  const task = await InspectionTask.findByPk(req.params.id, {
+    include: [{ model: Facility }, { model: ToiletUnit }],
+  });
+  if (!task) {
+    throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && task.tenant_id !== req.user.tenantId) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  const canManageTasks = hasPermission(req, 'task.manage');
+  if (!req.user.isSuperAdmin && !canManageTasks && task.assigned_to_user_id !== req.user.id) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  return mapTask(task);
 };
 
 const getMyTasks = async (req) => {
@@ -213,6 +240,7 @@ const completeTask = async (req) => {
 
 module.exports = {
   listTasks,
+  getTaskById,
   getMyTasks,
   createTask,
   startTask,

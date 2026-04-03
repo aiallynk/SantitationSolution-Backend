@@ -9,6 +9,11 @@ const {
 } = require('../../models');
 const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const {
+  getQrImageUrl,
+  ensureQrImageForToilet,
+  ensureQrImagesForToilets,
+} = require('./toiletQr.service');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -30,6 +35,21 @@ const normalizeIdentifierPart = (value, fallback) => {
     .replace(/[^A-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return normalized || fallback;
+};
+
+const normalizeSectorCode = (value) => {
+  const text = sanitizeText(value, 40)
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return text || null;
+};
+
+const toOptionalCoordinate = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric;
 };
 
 const buildAutoToiletId = async ({ facility, toiletBlock }) => {
@@ -63,6 +83,259 @@ const buildAutoToiletId = async ({ facility, toiletBlock }) => {
   throw new AppError('Unable to auto-generate toilet id. Capacity reached for block.', 409, {
     code: 'TOILET_ID_CAPACITY_REACHED',
   });
+};
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuidLike = (value) => UUID_PATTERN.test(String(value || '').trim());
+
+const extractQrCandidates = (rawValue) => {
+  const raw = sanitizeText(rawValue, 600);
+  if (!raw) return [];
+
+  const candidateSet = new Set();
+  const pushCandidate = (value) => {
+    const text = sanitizeText(value, 240);
+    if (!text) return;
+    candidateSet.add(text);
+  };
+
+  pushCandidate(raw);
+
+  try {
+    const decoded = decodeURIComponent(raw);
+    if (decoded && decoded !== raw) {
+      pushCandidate(decoded);
+    }
+  } catch (_) {
+    // ignore malformed URI components
+  }
+
+  try {
+    const asJson = JSON.parse(raw);
+    if (asJson && typeof asJson === 'object' && !Array.isArray(asJson)) {
+      const keys = [
+        'qr',
+        'qrCode',
+        'qr_code',
+        'code',
+        'toilet',
+        'toiletCode',
+        'toilet_code',
+        'toiletUnitId',
+        'toilet_unit_id',
+        'id',
+      ];
+      for (const key of keys) {
+        pushCandidate(asJson[key]);
+      }
+    }
+  } catch (_) {
+    // ignore non-JSON QR payloads
+  }
+
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      const parsed = new URL(raw);
+      const segments = parsed.pathname
+        .split('/')
+        .map((segment) => sanitizeText(segment, 180))
+        .filter(Boolean);
+      if (segments.length > 0) {
+        pushCandidate(segments[segments.length - 1]);
+      }
+      const paramKeys = [
+        'qr',
+        'qrCode',
+        'qr_code',
+        'code',
+        'toilet',
+        'toiletCode',
+        'toilet_code',
+        'toiletUnitId',
+        'toilet_unit_id',
+        'id',
+      ];
+      for (const key of paramKeys) {
+        pushCandidate(parsed.searchParams.get(key));
+      }
+    }
+  } catch (_) {
+    // ignore malformed URLs
+  }
+
+  if (raw.includes('/')) {
+    const segments = raw
+      .split('/')
+      .map((item) => sanitizeText(item, 180))
+      .filter(Boolean);
+    if (segments.length > 0) {
+      pushCandidate(segments[segments.length - 1]);
+    }
+  }
+
+  if (raw.includes(':')) {
+    const suffix = sanitizeText(raw.split(':').slice(1).join(':'), 180);
+    pushCandidate(suffix);
+  }
+
+  const normalized = new Set();
+  for (const item of candidateSet.values()) {
+    const upper = normalizePermanentQrCode(item);
+    if (!upper) continue;
+    normalized.add(upper);
+  }
+  return Array.from(normalized.values());
+};
+
+const mapUnitRow = (row) => ({
+  id: row.id,
+  facilityId: row.facility_id,
+  facilityCode: row.Facility?.code || null,
+  facilityName: row.Facility?.name || null,
+  toiletBlockId: row.toilet_block_id,
+  code: row.code,
+  qrCode: row.qr_code || row.code,
+  qrImageUrl: getQrImageUrl(row.id),
+  unitType: row.unit_type,
+  status: row.status,
+  sectorCode:
+    row.sector_code ||
+    row.Facility?.metadata?.sector ||
+    row.Facility?.metadata?.zone ||
+    null,
+  locationLabel:
+    row.location_label ||
+    row.Facility?.address_line ||
+    row.Facility?.name ||
+    null,
+  latitude:
+    row.latitude !== null && row.latitude !== undefined
+      ? Number(row.latitude)
+      : row.Facility?.latitude !== null && row.Facility?.latitude !== undefined
+        ? Number(row.Facility.latitude)
+        : null,
+  longitude:
+    row.longitude !== null && row.longitude !== undefined
+      ? Number(row.longitude)
+      : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
+        ? Number(row.Facility.longitude)
+        : null,
+  latestScore:
+    row.latest_score !== null && row.latest_score !== undefined
+      ? Number(row.latest_score)
+      : null,
+  latestBeforeScore:
+    row.latest_before_score !== null && row.latest_before_score !== undefined
+      ? Number(row.latest_before_score)
+      : null,
+  latestAfterScore:
+    row.latest_after_score !== null && row.latest_after_score !== undefined
+      ? Number(row.latest_after_score)
+      : null,
+  avgBeforeScore:
+    row.avg_before_score !== null && row.avg_before_score !== undefined
+      ? Number(row.avg_before_score)
+      : null,
+  avgAfterScore:
+    row.avg_after_score !== null && row.avg_after_score !== undefined
+      ? Number(row.avg_after_score)
+      : null,
+  avgImprovementScore:
+    row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
+      ? Number(row.avg_improvement_score)
+      : null,
+  totalInspections: Number(row.total_inspections || 0),
+  lastInspectionAt: row.last_inspection_at || null,
+  dirtyFrequency:
+    row.dirty_frequency !== null && row.dirty_frequency !== undefined
+      ? Number(row.dirty_frequency)
+      : 0,
+  lowPerformanceFrequency:
+    row.low_performance_frequency !== null && row.low_performance_frequency !== undefined
+      ? Number(row.low_performance_frequency)
+      : 0,
+});
+
+const scoreCandidateMatch = (row, candidates = []) => {
+  const qr = normalizePermanentQrCode(row.qr_code || '');
+  const code = normalizePermanentQrCode(row.code || '');
+  const id = String(row.id || '').trim().toLowerCase();
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = normalizePermanentQrCode(candidates[index]);
+    if (!candidate) continue;
+    if (qr && qr === candidate) return 1000 - index;
+    if (code && code === candidate) return 900 - index;
+    if (isUuidLike(candidate) && id === candidate.toLowerCase()) return 1100 - index;
+    if (qr && qr.includes(candidate)) return 500 - index;
+    if (code && code.includes(candidate)) return 450 - index;
+  }
+  return 0;
+};
+
+const resolveUnitByQr = async (req) => {
+  const rawInput = req.query.qr || req.query.qrCode || req.query.code || '';
+  const candidates = extractQrCandidates(rawInput);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const facilityInclude = {
+    model: Facility,
+    attributes: [
+      'id',
+      'tenant_id',
+      'code',
+      'name',
+      'address_line',
+      'latitude',
+      'longitude',
+      'metadata',
+    ],
+    required: true,
+  };
+  if (!req.user.isSuperAdmin && req.user?.tenantId) {
+    facilityInclude.where = { tenant_id: req.user.tenantId };
+  } else if (req.query.tenantId) {
+    facilityInclude.where = { tenant_id: req.query.tenantId };
+  }
+
+  const exactOr = [];
+  const fuzzyOr = [];
+  for (const candidate of candidates.slice(0, 12)) {
+    exactOr.push({ qr_code: { [Op.iLike]: candidate } });
+    exactOr.push({ code: { [Op.iLike]: candidate } });
+    if (isUuidLike(candidate)) {
+      exactOr.push({ id: candidate.toLowerCase() });
+    } else if (candidate.length >= 4) {
+      fuzzyOr.push({ qr_code: { [Op.iLike]: `%${candidate}%` } });
+      fuzzyOr.push({ code: { [Op.iLike]: `%${candidate}%` } });
+    }
+  }
+
+  const where = {
+    [Op.or]: [...exactOr, ...fuzzyOr.slice(0, 12)],
+  };
+
+  const rows = await ToiletUnit.findAll({
+    where,
+    include: [facilityInclude],
+    limit: 25,
+    order: [['code', 'ASC']],
+  });
+  if (!rows.length) {
+    return null;
+  }
+
+  const best = [...rows].sort(
+    (left, right) => scoreCandidateMatch(right, candidates) - scoreCandidateMatch(left, candidates)
+  )[0];
+  await ensureQrImageForToilet({
+    toiletUnitId: best.id,
+    qrCodeValue: best.qr_code || best.code,
+  }).catch(() => null);
+  return mapUnitRow(best);
 };
 
 const listTenants = async (req) => {
@@ -298,6 +571,7 @@ const getFacilityById = async (req) => {
     ToiletBlock.findAll({ where: { facility_id: facility.id }, order: [['name', 'ASC']] }),
     ToiletUnit.findAll({ where: { facility_id: facility.id }, order: [['code', 'ASC']] }),
   ]);
+  await ensureQrImagesForToilets(units).catch(() => null);
 
   return {
     id: facility.id,
@@ -322,9 +596,20 @@ const getFacilityById = async (req) => {
       id: unit.id,
       code: unit.code,
       qrCode: unit.qr_code || unit.code,
+      qrImageUrl: getQrImageUrl(unit.id),
       unitType: unit.unit_type,
       status: unit.status,
       toiletBlockId: unit.toilet_block_id,
+      sectorCode: unit.sector_code || null,
+      locationLabel: unit.location_label || null,
+      latitude:
+        unit.latitude !== null && unit.latitude !== undefined
+          ? Number(unit.latitude)
+          : null,
+      longitude:
+        unit.longitude !== null && unit.longitude !== undefined
+          ? Number(unit.longitude)
+          : null,
     })),
   };
 };
@@ -388,7 +673,16 @@ const listUnits = async (req) => {
   const where = {};
   const facilityInclude = {
     model: Facility,
-    attributes: ['id', 'tenant_id', 'code', 'name'],
+    attributes: [
+      'id',
+      'tenant_id',
+      'code',
+      'name',
+      'address_line',
+      'latitude',
+      'longitude',
+      'metadata',
+    ],
     required: true,
   };
   if (!req.user.isSuperAdmin) {
@@ -402,6 +696,12 @@ const listUnits = async (req) => {
   if (req.query.toiletBlockId) {
     where.toilet_block_id = req.query.toiletBlockId;
   }
+  if (req.query.sector) {
+    const normalizedSector = normalizeSectorCode(req.query.sector);
+    if (normalizedSector) {
+      where.sector_code = normalizedSector;
+    }
+  }
   if (req.query.qrCode) {
     const qrCode = normalizePermanentQrCode(req.query.qrCode);
     where[Op.or] = [
@@ -414,17 +714,8 @@ const listUnits = async (req) => {
     include: [facilityInclude],
     order: [['code', 'ASC']],
   });
-  return rows.map((row) => ({
-    id: row.id,
-    facilityId: row.facility_id,
-    facilityCode: row.Facility?.code || null,
-    facilityName: row.Facility?.name || null,
-    toiletBlockId: row.toilet_block_id,
-    code: row.code,
-    qrCode: row.qr_code || row.code,
-    unitType: row.unit_type,
-    status: row.status,
-  }));
+  await ensureQrImagesForToilets(rows).catch(() => null);
+  return rows.map(mapUnitRow);
 };
 
 const createUnit = async (req) => {
@@ -487,6 +778,14 @@ const createUnit = async (req) => {
     qr_code: qrCode,
     unit_type: unitType,
     status: req.body.status || 'moderate',
+    sector_code: normalizeSectorCode(
+      req.body.sectorCode || req.body.sector || facility.metadata?.sector || null
+    ),
+    location_label: req.body.locationLabel
+      ? sanitizeText(req.body.locationLabel, 300)
+      : facility.address_line || facility.name,
+    latitude: toOptionalCoordinate(req.body.latitude ?? facility.latitude),
+    longitude: toOptionalCoordinate(req.body.longitude ?? facility.longitude),
   });
   await createAuditLog({
     req,
@@ -495,14 +794,29 @@ const createUnit = async (req) => {
     entityId: row.id,
     tenantId: facility.tenant_id,
   });
+
+  await ensureQrImageForToilet({
+    toiletUnitId: row.id,
+    qrCodeValue: row.qr_code || row.code,
+  });
+
   return {
     id: row.id,
     facilityId: row.facility_id,
     toiletBlockId: row.toilet_block_id,
     code: row.code,
     qrCode: row.qr_code || row.code,
+    qrImageUrl: getQrImageUrl(row.id),
     unitType: row.unit_type,
     status: row.status,
+    sectorCode: row.sector_code || null,
+    locationLabel: row.location_label || null,
+    latitude:
+      row.latitude !== null && row.latitude !== undefined ? Number(row.latitude) : null,
+    longitude:
+      row.longitude !== null && row.longitude !== undefined
+        ? Number(row.longitude)
+        : null,
   };
 };
 
@@ -519,5 +833,6 @@ module.exports = {
   listBlocks,
   createBlock,
   listUnits,
+  resolveUnitByQr,
   createUnit,
 };

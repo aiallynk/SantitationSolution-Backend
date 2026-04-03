@@ -1,32 +1,48 @@
 const { Op } = require('sequelize');
+const AppError = require('../../core/errors/AppError');
 const {
   Inspection,
   InspectionMedia,
+  InspectionSubmission,
   AiAnalysisResult,
+  AiProcessingJob,
+  InspectionEvent,
   Alert,
   Facility,
 } = require('../../models');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { createAuditLog } = require('../audit/audit.service');
-const { isOpenAiAnalysisEnabled, analyzeInspectionWithOpenAI } = require('./openaiAnalysis.service');
+const {
+  analyzeInspectionWithOpenAI,
+  getOpenAiAnalysisConfigState,
+  PROMPT_VERSION,
+  SCORING_VERSION,
+} = require('./openaiAnalysis.service');
+const { validateInspectionMediaQuality } = require('./qualityValidation.service');
+const {
+  computePerceptualHash,
+  perceptualSimilarity,
+} = require('./perceptualHash.service');
+const { normalizeIssueTags } = require('./issueNormalization.service');
+const { computeConfidence } = require('./confidenceEngine.service');
+const {
+  recomputeInspectionAggregates,
+  scoreLabel,
+} = require('../inspections/inspectionEvidence.service');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
-
-const hashString = (input) => {
-  const text = String(input || '');
-  let hash = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    hash = (hash << 5) - hash + text.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash);
+const round2 = (value) =>
+  value === null || value === undefined ? null : Number(Number(value).toFixed(2));
+const mean = (values = []) => {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const valid = values
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item));
+  if (valid.length === 0) return null;
+  return valid.reduce((sum, item) => sum + item, 0) / valid.length;
 };
-
-const seeded = (seed, offset, min, max) => {
-  const value = Math.sin(seed + offset * 11939) * 10000;
-  const fraction = value - Math.floor(value);
-  return Math.round(min + fraction * (max - min));
-};
+const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
+const FRAUD_SIMILARITY_THRESHOLD = Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92);
 
 const deriveStatus = (score) => {
   if (score >= 80) return 'clean';
@@ -35,46 +51,168 @@ const deriveStatus = (score) => {
   return 'critical';
 };
 
-const buildResult = (inspection, mediaCount) => {
-  const seed = hashString(`${inspection.id}:${inspection.facility_id}:${inspection.captured_at}:${mediaCount}`);
-  const cleanliness = clamp(seeded(seed, 1, 32, 95), 0, 100);
-  const hygiene = clamp(seeded(seed, 2, 30, 94), 0, 100);
-  const wetness = clamp(seeded(seed, 3, 25, 95), 0, 100);
-  const stain = clamp(seeded(seed, 4, 20, 90), 0, 100);
-  const litter = clamp(seeded(seed, 5, 24, 92), 0, 100);
-  const odorRisk = clamp(seeded(seed, 6, 15, 95), 0, 100);
+const deriveSeverityLabel = ({ overallCleanlinessScore, issueCount }) => {
+  if (overallCleanlinessScore < 35 || issueCount >= 4) return 'critical';
+  if (overallCleanlinessScore < 50 || issueCount >= 3) return 'high';
+  if (overallCleanlinessScore < 70 || issueCount >= 2) return 'medium';
+  return 'low';
+};
 
-  const composite = Math.round(
-    cleanliness * 0.35 +
-      hygiene * 0.2 +
-      wetness * 0.15 +
-      stain * 0.1 +
-      litter * 0.1 +
-      (100 - odorRisk) * 0.1
+const toHighMediumLowSeverity = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'critical') return 'high';
+  if (normalized === 'high' || normalized === 'medium' || normalized === 'low') {
+    return normalized;
+  }
+  return null;
+};
+
+const buildStrictToiletJsonFromNormalizedResult = ({
+  overallCleanlinessScore,
+  cleanlinessScore,
+  hygieneScore,
+  stainScore,
+  wetnessScore,
+  litterScore,
+  confidenceScore,
+  issueTags,
+  severityLabel,
+  reviewRequired,
+}) => {
+  const floorCleanliness = clamp(Number(cleanlinessScore || 0), 0, 100);
+  const commodeCleanliness = clamp(Number(hygieneScore || 0), 0, 100);
+  const stainPresence = clamp(100 - Number(stainScore || 0), 0, 100);
+  const waterStagnation = clamp(100 - Number(wetnessScore || 0), 0, 100);
+  const garbagePresence = Number(litterScore || 0) < 50;
+  const normalizedIssues = Array.isArray(issueTags)
+    ? [...new Set(issueTags.map((item) => String(item || '').trim()).filter(Boolean))]
+    : [];
+
+  const resolvedOverallScore = clamp(
+    Number.isFinite(Number(overallCleanlinessScore)) ? Number(overallCleanlinessScore) : floorCleanliness,
+    0,
+    100
   );
+  const confidence =
+    confidenceScore !== null && confidenceScore !== undefined
+      ? clamp(Number(confidenceScore), 0, 1)
+      : null;
+
+  const mappedSeverity = toHighMediumLowSeverity(severityLabel);
+  const resolvedSeverity =
+    mappedSeverity ||
+    (resolvedOverallScore < 45 || stainPresence > 65 || waterStagnation > 65 || garbagePresence
+      ? 'high'
+      : resolvedOverallScore < 70 || stainPresence > 45 || waterStagnation > 45
+        ? 'medium'
+        : 'low');
+
+  const threshold = Number(process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7);
+  const humanReviewRequired =
+    reviewRequired !== undefined && reviewRequired !== null
+      ? Boolean(reviewRequired)
+      : (confidence ?? 0.65) < threshold || resolvedSeverity === 'high';
 
   return {
-    modelName: process.env.ANALYSIS_MODEL_NAME || 'deterministic-rule-analyzer',
-    modelVersion: process.env.ANALYSIS_MODEL_VERSION || 'v1',
-    cleanlinessScore: cleanliness,
-    hygieneScore: hygiene,
-    odorRiskScore: odorRisk,
-    wetnessScore: wetness,
-    stainScore: stain,
-    litterScore: litter,
-    overallStatus: deriveStatus(composite),
-    anomalyFlags: {
-      low_cleanliness: cleanliness < 45,
-      high_odor_risk: odorRisk > 70,
-      wetness_concern: wetness < 45,
-      stain_concern: stain < 45,
-      litter_concern: litter < 45,
-    },
+    floor_cleanliness: Math.round(floorCleanliness),
+    commode_urinal_cleanliness: Math.round(commodeCleanliness),
+    stain_presence: Math.round(stainPresence),
+    water_stagnation: Math.round(waterStagnation),
+    garbage_presence: garbagePresence,
+    overall_cleanliness_score: Math.round(resolvedOverallScore),
+    confidence_score: confidence !== null ? Number(confidence.toFixed(3)) : null,
+    detected_issues: normalizedIssues,
+    severity_level: resolvedSeverity,
+    human_review_required: humanReviewRequired,
+  };
+};
+
+const normalizeResultFromProvider = ({ providerResult, processingMs }) => {
+  if (!providerResult || typeof providerResult !== 'object') {
+    throw new AppError('AI scoring provider response is missing', 500, {
+      code: 'AI_PROVIDER_RESPONSE_MISSING',
+    });
+  }
+
+  const source = providerResult;
+  const overallCleanlinessScore = clamp(
+    Number(source.overallCleanlinessScore ?? source.cleanlinessScore ?? 0),
+    0,
+    100
+  );
+
+  const subScores =
+    source.subScores && typeof source.subScores === 'object' ? source.subScores : {};
+  const issueTags = Array.isArray(source.issueTags)
+    ? [...new Set(source.issueTags.map((item) => String(item).trim()).filter(Boolean))]
+    : [];
+  const confidenceScore = Number.isFinite(Number(source.confidenceScore))
+    ? clamp(Number(source.confidenceScore), 0, 1)
+    : null;
+
+  const reviewRequired =
+    source.reviewRequired !== undefined
+      ? Boolean(source.reviewRequired)
+      : (confidenceScore ?? 0.65) < Number(process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7);
+
+  const severityLabel =
+    source.severityLabel ||
+    deriveSeverityLabel({
+      overallCleanlinessScore,
+      issueCount: issueTags.length,
+    });
+
+  const overallStatus = source.overallStatus || deriveStatus(overallCleanlinessScore);
+
+  const normalizedBase = {
+    modelName: source.modelName || process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+    modelVersion: source.modelVersion || 'openai-chat-completions-v4',
+    provider: source.provider || 'openai',
+    schemaVersion: source.schemaVersion || ANALYSIS_SCHEMA_VERSION,
+    promptVersion: source.promptVersion || PROMPT_VERSION,
+    scoringVersion: source.scoringVersion || SCORING_VERSION,
+    overallStatus,
+    overallCleanlinessScore,
+    cleanlinessScore: clamp(Number(source.cleanlinessScore ?? 0), 0, 100),
+    hygieneScore: clamp(Number(source.hygieneScore ?? 0), 0, 100),
+    odorRiskScore: clamp(Number(source.odorRiskScore ?? 0), 0, 100),
+    wetnessScore: clamp(Number(source.wetnessScore ?? 0), 0, 100),
+    stainScore: clamp(Number(source.stainScore ?? 0), 0, 100),
+    litterScore: clamp(Number(source.litterScore ?? 0), 0, 100),
+    subScores,
+    issueTags,
+    severityLabel,
+    confidenceScore,
+    reviewRequired,
+    explanationText: String(source.explanationText || source.summary || '').slice(0, 1900) || null,
+    anomalyFlags:
+      source.anomalyFlags && typeof source.anomalyFlags === 'object'
+        ? source.anomalyFlags
+        : {},
+    processingMs,
+  };
+
+  const strictJsonFromSource =
+    source?.rawResult &&
+    typeof source.rawResult === 'object' &&
+    source.rawResult.strictJson &&
+    typeof source.rawResult.strictJson === 'object'
+      ? source.rawResult.strictJson
+      : null;
+  if (!strictJsonFromSource) {
+    throw new AppError('AI scoring provider response missing strict JSON payload', 500, {
+      code: 'AI_PROVIDER_STRICT_JSON_MISSING',
+    });
+  }
+  const strictJson = strictJsonFromSource;
+
+  return {
+    ...normalizedBase,
     rawResult: {
-      seed,
-      mediaCount,
-      algorithm: 'deterministic-rule-analyzer',
-      generatedAt: new Date().toISOString(),
+      ...(source.rawResult || {}),
+      strictJson,
+      provider: normalizedBase.provider,
+      processingMs,
     },
   };
 };
@@ -90,9 +228,7 @@ const maybeCreateAlert = async ({ inspection, result }) => {
   }
 
   const severity =
-    result.overallStatus === 'critical' || result.odorRiskScore > 85
-      ? 'critical'
-      : 'high';
+    result.overallStatus === 'critical' || result.odorRiskScore > 85 ? 'critical' : 'high';
 
   const openAlert = await Alert.findOne({
     where: {
@@ -114,7 +250,7 @@ const maybeCreateAlert = async ({ inspection, result }) => {
     source_type: 'ai_analysis',
     source_id: inspection.id,
     facility_id: inspection.facility_id,
-    message: `Inspection ${inspection.id} flagged as ${result.overallStatus} (cleanliness ${result.cleanlinessScore}, odor risk ${result.odorRiskScore})`,
+    message: `Inspection ${inspection.id} flagged ${result.severityLabel} (score ${result.overallCleanlinessScore})`,
     status: 'open',
     created_at: new Date(),
     updated_at: new Date(),
@@ -133,60 +269,725 @@ const maybeCreateAlert = async ({ inspection, result }) => {
   return alert;
 };
 
-const runInspectionAnalysis = async ({ inspectionId, req = null }) => {
+const toGarbageScore = (strictJson, result) => {
+  if (strictJson && strictJson.garbage_presence !== undefined) {
+    return strictJson.garbage_presence ? 100 : 0;
+  }
+  if (Number(result.litterScore || 0) < 50) {
+    return 100;
+  }
+  return 0;
+};
+
+const weightedOverallScore = (strictJson) => {
+  const floor = clamp(Number(strictJson?.floor_cleanliness || 0), 0, 100);
+  const commode = clamp(Number(strictJson?.commode_urinal_cleanliness || 0), 0, 100);
+  const stainSeverity = clamp(Number(strictJson?.stain_presence || 0), 0, 100);
+  const waterSeverity = clamp(Number(strictJson?.water_stagnation || 0), 0, 100);
+  const garbagePresence = Boolean(strictJson?.garbage_presence);
+
+  const stainCleanliness = 100 - stainSeverity;
+  const waterCleanliness = 100 - waterSeverity;
+  const garbageCleanliness = garbagePresence ? 0 : 100;
+
+  return Math.round(
+    clamp(
+      floor * 0.3 +
+        commode * 0.3 +
+        stainCleanliness * 0.2 +
+        waterCleanliness * 0.1 +
+        garbageCleanliness * 0.1,
+      0,
+      100
+    )
+  );
+};
+
+const compareAgainstBeforeHashes = async ({ inspectionId, captureStage, perceptualHash, imageId }) => {
+  const stage = String(captureStage || '').toLowerCase();
+  if (!perceptualHash || stage !== 'after') {
+    return {
+      maxSimilarity: null,
+      suspicious: false,
+      similarImageId: null,
+    };
+  }
+
+  const beforeRows = await InspectionMedia.findAll({
+    where: {
+      inspection_id: inspectionId,
+      capture_stage: { [Op.iLike]: 'before' },
+      perceptual_hash: { [Op.ne]: null },
+      id: { [Op.ne]: imageId || null },
+    },
+    attributes: ['id', 'perceptual_hash'],
+  });
+
+  let maxSimilarity = null;
+  let similarImageId = null;
+  for (const beforeRow of beforeRows) {
+    const similarity = perceptualSimilarity(perceptualHash, beforeRow.perceptual_hash);
+    if (similarity === null) continue;
+    if (maxSimilarity === null || similarity > maxSimilarity) {
+      maxSimilarity = similarity;
+      similarImageId = beforeRow.id;
+    }
+  }
+
+  return {
+    maxSimilarity: maxSimilarity !== null ? Number(maxSimilarity.toFixed(4)) : null,
+    suspicious: maxSimilarity !== null && maxSimilarity >= FRAUD_SIMILARITY_THRESHOLD,
+    similarImageId: similarImageId || null,
+  };
+};
+
+const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
+  const effective = Array.isArray(imageResults)
+    ? imageResults.filter(
+        (item) =>
+          item &&
+          item.result &&
+          !Boolean(item.scoringRejected) &&
+          Number.isFinite(Number(item.result?.overallCleanlinessScore))
+      )
+    : [];
+  const base = effective[effective.length - 1]?.result || null;
+
+  const avgCleanliness = mean(
+    effective.map((item) => item.strictJson?.floor_cleanliness ?? item.result?.cleanlinessScore)
+  );
+  const avgHygiene = mean(
+    effective.map(
+      (item) =>
+        item.strictJson?.commode_urinal_cleanliness ?? item.result?.hygieneScore
+    )
+  );
+  const avgStain = mean(
+    effective.map((item) => item.strictJson?.stain_presence ?? 100 - Number(item.result?.stainScore || 0))
+  );
+  const avgWater = mean(
+    effective.map((item) => item.strictJson?.water_stagnation ?? 100 - Number(item.result?.wetnessScore || 0))
+  );
+  const avgGarbage = mean(
+    effective.map((item) => toGarbageScore(item.strictJson, item.result || {}))
+  );
+  const avgConfidence = mean(
+    effective.map((item) => item.strictJson?.confidence_score ?? item.result?.confidenceScore)
+  );
+
+  const overviewScore =
+    aggregate?.avgAfterScore ??
+    aggregate?.avgBeforeScore ??
+    base?.overallCleanlinessScore ??
+    0;
+
+  const issueTags = Array.from(
+    new Set([
+      ...(aggregate?.beforeIssueTags || []),
+      ...(aggregate?.afterIssueTags || []),
+      ...effective.flatMap((item) =>
+        Array.isArray(item.strictJson?.detected_issues)
+          ? item.strictJson.detected_issues
+          : item.result?.issueTags || []
+      ),
+    ])
+  );
+
+  return {
+    overallStatus: deriveStatus(overviewScore),
+    overallCleanlinessScore: round2(overviewScore) || 0,
+    cleanlinessScore: round2(avgCleanliness ?? base?.cleanlinessScore ?? overviewScore) || 0,
+    hygieneScore: round2(avgHygiene ?? base?.hygieneScore ?? overviewScore) || 0,
+    odorRiskScore: round2(base?.odorRiskScore ?? 60) || 0,
+    wetnessScore: round2(100 - (avgWater ?? 0)) || 0,
+    stainScore: round2(100 - (avgStain ?? 0)) || 0,
+    litterScore: round2(100 - (avgGarbage ?? 0)) || 0,
+    confidenceScore: round2(avgConfidence ?? aggregate?.confidenceAvg ?? base?.confidenceScore ?? 0.6),
+    issueTags,
+    severityLabel:
+      base?.severityLabel ||
+      (aggregate?.reviewRequired ? 'high' : 'medium'),
+    reviewRequired: Boolean(aggregate?.reviewRequired || base?.reviewRequired),
+    explanationText:
+      base?.explanationText ||
+      (issueTags.length > 0 ? `Detected issues: ${issueTags.slice(0, 6).join(', ')}` : 'No major issues detected'),
+    modelName: base?.modelName || process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+    modelVersion: base?.modelVersion || 'openai-chat-completions-v4',
+    provider: base?.provider || 'openai',
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    subScores: {
+      floorCleanliness: round2(avgCleanliness),
+      commodeCondition: round2(avgHygiene),
+      stainSeverity: round2(avgStain),
+      wastePresence: round2(avgGarbage !== null ? 100 - avgGarbage : null),
+      waterStagnation: round2(avgWater !== null ? 100 - avgWater : null),
+    },
+    anomalyFlags: {
+      low_cleanliness: overviewScore < 45,
+      wetness_concern: (avgWater ?? 0) > 55,
+      stain_concern: (avgStain ?? 0) > 55,
+      litter_concern: (avgGarbage ?? 0) > 55,
+    },
+    rawResult: {
+      strictJson: {
+        floor_cleanliness: Math.round(avgCleanliness ?? base?.cleanlinessScore ?? 0),
+        commode_urinal_cleanliness: Math.round(avgHygiene ?? base?.hygieneScore ?? 0),
+        stain_presence: Math.round(avgStain ?? 0),
+        water_stagnation: Math.round(avgWater ?? 0),
+        garbage_presence: (avgGarbage ?? 0) > 50,
+        overall_cleanliness_score: Math.round(overviewScore),
+        confidence_score:
+          avgConfidence !== null ? Number(Number(avgConfidence).toFixed(3)) : null,
+        detected_issues: issueTags,
+        severity_level: aggregate?.reviewRequired ? 'high' : 'medium',
+        human_review_required: Boolean(aggregate?.reviewRequired || base?.reviewRequired),
+      },
+      imageCount: effective.length,
+      aggregate: aggregate || null,
+    },
+  };
+};
+
+const runInspectionAnalysis = async ({
+  inspectionId,
+  submissionId = null,
+  imageId = null,
+  jobType = 'AI_ANALYSIS',
+  queueJobId = null,
+  req = null,
+}) => {
+  const startedAt = Date.now();
   const inspection = await Inspection.findByPk(inspectionId);
   if (!inspection) {
     return null;
   }
 
-  await inspection.update({
-    processing_status: 'processing',
-    updated_at: new Date(),
-  });
+  const processingJob = queueJobId
+    ? await AiProcessingJob.findOne({
+        where: {
+          queue_name: 'inspection-analysis',
+          queue_job_id: queueJobId,
+        },
+        order: [['created_at', 'DESC']],
+      })
+    : null;
 
-  const mediaRows = await InspectionMedia.findAll({
-    where: { inspection_id: inspection.id },
-  });
+  if (processingJob) {
+    await processingJob.update({
+      status: 'running',
+      attempts: Number(processingJob.attempts || 0) + 1,
+      image_id: imageId || processingJob.image_id || null,
+      job_type: String(jobType || 'AI_ANALYSIS'),
+      started_at: new Date(),
+      updated_at: new Date(),
+    });
+  }
 
-  let result = null;
-  if (isOpenAiAnalysisEnabled()) {
-    try {
-      result = await analyzeInspectionWithOpenAI({
-        inspection,
-        mediaRows,
+  if (submissionId) {
+    const submission = await InspectionSubmission.findByPk(submissionId);
+    if (submission) {
+      await submission.update({
+        status: 'processing',
+        updated_at: new Date(),
       });
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error(`OpenAI analysis failed for inspection ${inspection.id}:`, error.message);
     }
   }
 
-  if (!result) {
-    result = buildResult(inspection, mediaRows.length);
+  await inspection.update({
+    processing_status: 'processing',
+    pipeline_status: 'processing',
+    status: inspection.submitted_at ? 'SUBMITTED' : inspection.status || 'IN_PROGRESS',
+    last_processing_error: null,
+    updated_at: new Date(),
+  });
+
+  await InspectionEvent.create({
+    tenant_id: inspection.tenant_id,
+    inspection_id: inspection.id,
+    toilet_id: inspection.toilet_unit_id || null,
+    image_id: imageId || null,
+    event_type: 'analysis.processing_started',
+    event_status: 'processing',
+    source: 'worker',
+    payload: {
+      type: String(jobType || 'AI_ANALYSIS'),
+      imageId: imageId || null,
+      queueJobId: queueJobId || null,
+      submissionId: submissionId || null,
+    },
+    occurred_at: new Date(),
+  });
+
+  let mediaRows = await InspectionMedia.findAll({
+    where: {
+      inspection_id: inspection.id,
+      ...(imageId ? { id: imageId } : {}),
+    },
+  });
+  if (imageId && mediaRows.length === 0) {
+    throw new AppError('Inspection image not found for AI analysis', 404, {
+      code: 'IMAGE_NOT_FOUND',
+    });
+  }
+  if (!imageId) {
+    mediaRows = mediaRows.filter((row) =>
+      ['before', 'after'].includes(String(row.capture_stage || '').toLowerCase())
+    );
+  }
+  if (mediaRows.length === 0) {
+    throw new AppError('No inspection evidence images found for analysis', 400, {
+      code: 'NO_EVIDENCE_IMAGES',
+    });
   }
 
+  const analyzedImageIds = [];
+  const imageResults = [];
+  const imageFailures = [];
+  const configState = getOpenAiAnalysisConfigState();
+
+  for (const mediaRow of mediaRows) {
+    const forceReprocess = Boolean(req?.reprocess);
+    if (
+      !forceReprocess &&
+      String(mediaRow.ai_status || '').toUpperCase() === 'AI_COMPLETED' &&
+      mediaRow.overall_score !== null &&
+      mediaRow.overall_score !== undefined &&
+      !Boolean(mediaRow.scoring_rejected)
+    ) {
+      imageResults.push({
+        imageId: mediaRow.id,
+        strictJson: {
+          floor_cleanliness: Math.round(Number(mediaRow.floor_score || 0)),
+          commode_urinal_cleanliness: Math.round(Number(mediaRow.commode_score || 0)),
+          stain_presence: Math.round(Number(mediaRow.stain_score || 0)),
+          water_stagnation: Math.round(Number(mediaRow.water_score || 0)),
+          garbage_presence: Number(mediaRow.garbage_score || 0) > 50,
+          overall_cleanliness_score: Math.round(Number(mediaRow.overall_score || 0)),
+          confidence_score:
+            mediaRow.confidence_score !== null && mediaRow.confidence_score !== undefined
+              ? Number(mediaRow.confidence_score)
+              : null,
+          detected_issues: Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [],
+          severity_level: mediaRow.severity || 'medium',
+          human_review_required: Boolean(mediaRow.review_required),
+          explanation_summary: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+        },
+        result: {
+          overallCleanlinessScore: Number(mediaRow.overall_score || 0),
+          cleanlinessScore: Number(mediaRow.floor_score || 0),
+          hygieneScore: Number(mediaRow.commode_score || 0),
+          stainScore: 100 - Number(mediaRow.stain_score || 0),
+          wetnessScore: 100 - Number(mediaRow.water_score || 0),
+          litterScore: 100 - Number(mediaRow.garbage_score || 0),
+          confidenceScore:
+            mediaRow.confidence_score !== null && mediaRow.confidence_score !== undefined
+              ? Number(mediaRow.confidence_score)
+              : null,
+          issueTags: Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [],
+          reviewRequired: Boolean(mediaRow.review_required),
+          severityLabel: mediaRow.severity || 'medium',
+          modelName: process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+          modelVersion: mediaRow.model_version || 'openai-chat-completions-v4',
+          provider: 'cached',
+          explanationText: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+        },
+      });
+      continue;
+    }
+
+    const mediaStartedAt = Date.now();
+    analyzedImageIds.push(mediaRow.id);
+    let qualityResult = null;
+    let similarityResult = null;
+    let perceptualHash = null;
+    let visibilityScore = null;
+    let toiletDetected = false;
+
+    await mediaRow.update({
+      ai_status: 'AI_PROCESSING',
+      ai_error: null,
+      validation_status: 'PENDING',
+      validation_reason: null,
+      updated_at: new Date(),
+    });
+
+    await InspectionEvent.create({
+      tenant_id: inspection.tenant_id,
+      inspection_id: inspection.id,
+      toilet_id: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+      image_id: mediaRow.id,
+      event_type: 'analysis.image.processing_started',
+      event_status: 'AI_PROCESSING',
+      source: 'worker',
+      payload: {
+        imageId: mediaRow.id,
+        stage: mediaRow.capture_stage,
+      },
+      occurred_at: new Date(),
+    });
+
+    try {
+      if (!configState.ok) {
+        const configError = new Error(configState.reason || 'AI provider not configured');
+        configError.code = 'AI_PROVIDER_NOT_CONFIGURED';
+        throw configError;
+      }
+
+      qualityResult = await validateInspectionMediaQuality(mediaRow);
+      perceptualHash = await computePerceptualHash(mediaRow);
+      const qualityValidationStatus = String(qualityResult.validationStatus || '').toUpperCase();
+      if (qualityValidationStatus !== 'VALID') {
+        const validationError = new Error(
+          qualityResult.validationReason || 'Image validation failed'
+        );
+        validationError.code = 'IMAGE_VALIDATION_FAILED';
+        validationError.validationStatus = qualityValidationStatus;
+        throw validationError;
+      }
+
+      const providerResult = await analyzeInspectionWithOpenAI({
+        inspection,
+        mediaRows: [mediaRow],
+      });
+      const processingMs = Date.now() - mediaStartedAt;
+      const result = normalizeResultFromProvider({
+        providerResult,
+        processingMs,
+      });
+      const strictJson = result.rawResult?.strictJson || null;
+      if (!strictJson || typeof strictJson !== 'object') {
+        const parsingError = new Error('Scoring response is missing strict JSON payload');
+        parsingError.code = 'SCORING_PARSE_FAILED';
+        throw parsingError;
+      }
+      const detection = result.rawResult?.detection || {};
+      toiletDetected = Boolean(detection.toilet_detected);
+      visibilityScore =
+        detection.visibility_score !== null && detection.visibility_score !== undefined
+          ? Number(detection.visibility_score)
+          : null;
+      if (!toiletDetected) {
+        const detectionError = new Error('No toilet detected');
+        detectionError.code = 'NO_TOILET_DETECTED';
+        throw detectionError;
+      }
+      if (visibilityScore !== null && visibilityScore < 0.4) {
+        const visibilityError = new Error('Toilet visibility is too low');
+        visibilityError.code = 'LOW_VISIBILITY';
+        throw visibilityError;
+      }
+
+      const normalizedIssues = normalizeIssueTags({
+        aiIssues: Array.isArray(strictJson?.detected_issues) ? strictJson.detected_issues : [],
+        floorCleanliness: strictJson.floor_cleanliness,
+        commodeCleanliness: strictJson.commode_urinal_cleanliness,
+        stainPresence: strictJson.stain_presence,
+        waterStagnation: strictJson.water_stagnation,
+        garbagePresence: strictJson.garbage_presence,
+        confidenceScore: strictJson.confidence_score,
+      });
+      const confidenceEngine = computeConfidence({
+        aiConfidence: strictJson.confidence_score,
+        blurPenalty: qualityResult?.blurPenalty || 0,
+        lightingPenalty: qualityResult?.lightingPenalty || 0,
+        visibilityScore,
+      });
+      const scoringRejected = Boolean(confidenceEngine.rejected);
+      const overallScore = weightedOverallScore(strictJson);
+      const issues = Array.isArray(strictJson?.detected_issues)
+        ? normalizedIssues
+        : Array.isArray(result.issueTags)
+          ? normalizeIssueTags({ aiIssues: result.issueTags })
+          : [];
+      const confidence = Number(confidenceEngine.finalConfidence || 0);
+      const floorScore =
+        strictJson && strictJson.floor_cleanliness !== undefined
+          ? Number(strictJson.floor_cleanliness)
+          : Number(result.cleanlinessScore || 0);
+      const commodeScore =
+        strictJson && strictJson.commode_urinal_cleanliness !== undefined
+          ? Number(strictJson.commode_urinal_cleanliness)
+          : Number(result.hygieneScore || 0);
+      const stainScore =
+        strictJson && strictJson.stain_presence !== undefined
+          ? Number(strictJson.stain_presence)
+          : 100 - Number(result.stainScore || 0);
+      const waterScore =
+        strictJson && strictJson.water_stagnation !== undefined
+          ? Number(strictJson.water_stagnation)
+          : 100 - Number(result.wetnessScore || 0);
+      const garbageScore = toGarbageScore(strictJson, result);
+      const reviewRequired =
+        (strictJson && strictJson.human_review_required !== undefined
+          ? Boolean(strictJson.human_review_required)
+          : Boolean(result.reviewRequired)) || confidenceEngine.reviewRequired;
+      similarityResult = await compareAgainstBeforeHashes({
+        inspectionId: inspection.id,
+        captureStage: mediaRow.capture_stage,
+        perceptualHash,
+        imageId: mediaRow.id,
+      });
+      const severity =
+        strictJson?.severity_level ||
+        (String(result.severityLabel || '').toLowerCase() === 'critical'
+          ? 'high'
+          : String(result.severityLabel || '').toLowerCase() || null) ||
+        'medium';
+      const quality = qualityResult?.imageQualityStatus || 'ok';
+      const suspiciousFlags = [];
+      if (similarityResult?.suspicious) {
+        suspiciousFlags.push('possible_fake_cleaning_similar_images');
+      }
+      if (confidenceEngine.reviewRequired) {
+        suspiciousFlags.push('low_confidence');
+      }
+      const resolvedValidationStatus = scoringRejected ? 'REJECTED_LOW_CONFIDENCE' : 'VALID';
+
+      await mediaRow.update({
+        ai_status: 'AI_COMPLETED',
+        image_quality_status: quality,
+        overall_score: scoringRejected ? null : round2(overallScore),
+        confidence_score: round2(confidence),
+        floor_score: scoringRejected ? null : round2(floorScore),
+        commode_score: scoringRejected ? null : round2(commodeScore),
+        stain_score: scoringRejected ? null : round2(stainScore),
+        garbage_score: scoringRejected ? null : round2(garbageScore),
+        water_score: scoringRejected ? null : round2(waterScore),
+        issue_tags: issues,
+        issue_summary: issues.length > 0 ? issues.slice(0, 6).join(', ') : null,
+        severity,
+        review_required:
+          reviewRequired ||
+          quality !== 'ok' ||
+          Boolean(similarityResult?.suspicious) ||
+          scoringRejected,
+        model_version: result.modelVersion || null,
+        prompt_version: result.promptVersion || PROMPT_VERSION,
+        scoring_version: result.scoringVersion || SCORING_VERSION,
+        ai_processed_at: new Date(),
+        ai_error: null,
+        image_quality_score: qualityResult?.imageQualityScore || null,
+        toilet_detected: toiletDetected,
+        validation_status: resolvedValidationStatus,
+        validation_reason:
+          scoringRejected
+            ? 'Confidence below rejection threshold'
+            : qualityResult?.validationReason || null,
+        visibility_score: visibilityScore,
+        perceptual_hash: perceptualHash || null,
+        similarity_score: similarityResult?.maxSimilarity || null,
+        scoring_rejected: scoringRejected,
+        explanation_summary:
+          strictJson?.explanation_summary ||
+          result.explanationText ||
+          (issues.length > 0 ? issues.join(', ') : null),
+        updated_at: new Date(),
+      });
+
+      imageResults.push({
+        imageId: mediaRow.id,
+        strictJson,
+        result,
+        scoringRejected,
+      });
+
+      await InspectionEvent.create({
+        tenant_id: inspection.tenant_id,
+        inspection_id: inspection.id,
+        toilet_id: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+        image_id: mediaRow.id,
+        event_type: 'analysis.image.completed',
+        event_status: 'AI_COMPLETED',
+        source: 'worker',
+        payload: {
+          imageId: mediaRow.id,
+          stage: mediaRow.capture_stage,
+          score: scoringRejected ? null : round2(overallScore),
+          confidence: round2(confidence),
+          severity,
+          reviewRequired:
+            reviewRequired ||
+            quality !== 'ok' ||
+            Boolean(similarityResult?.suspicious) ||
+            scoringRejected,
+          suspiciousFlags,
+          validationStatus: resolvedValidationStatus,
+          scoringRejected,
+          similarityScore: similarityResult?.maxSimilarity || null,
+          processingMs,
+        },
+        occurred_at: new Date(),
+      });
+    } catch (imageError) {
+      const code = String(imageError?.code || '').trim();
+      const validationStatus = code === 'NO_TOILET_DETECTED'
+        ? 'FAILED_NO_TOILET'
+        : code === 'LOW_VISIBILITY'
+          ? 'FAILED_VISIBILITY'
+          : code === 'OPENAI_DETECTION_PARSE_FAILED' || code === 'OPENAI_SCORING_PARSE_FAILED'
+            ? 'FAILED_SOURCE'
+            : String(imageError?.validationStatus || '').trim() || 'FAILED_SOURCE';
+
+      imageFailures.push({
+        imageId: mediaRow.id,
+        error: String(imageError.message || imageError).slice(0, 500),
+      });
+      await mediaRow.update({
+        ai_status: 'AI_FAILED',
+        validation_status: validationStatus,
+        validation_reason: String(imageError.message || imageError).slice(0, 500),
+        image_quality_status: qualityResult?.imageQualityStatus || 'invalid',
+        image_quality_score: qualityResult?.imageQualityScore || null,
+        toilet_detected: Boolean(toiletDetected),
+        visibility_score: visibilityScore,
+        perceptual_hash: perceptualHash || null,
+        similarity_score: similarityResult?.maxSimilarity || null,
+        review_required: true,
+        ai_error: String(imageError.message || imageError).slice(0, 2000),
+        updated_at: new Date(),
+      });
+      await InspectionEvent.create({
+        tenant_id: inspection.tenant_id,
+        inspection_id: inspection.id,
+        toilet_id: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+        image_id: mediaRow.id,
+        event_type: 'analysis.image.failed',
+        event_status: 'AI_FAILED',
+        source: 'worker',
+        payload: {
+          imageId: mediaRow.id,
+          error: String(imageError.message || imageError).slice(0, 1000),
+          validationStatus,
+        },
+        occurred_at: new Date(),
+      });
+    }
+  }
+
+  if (imageResults.length === 0) {
+    throw new AppError('AI analysis failed for all inspection images', 500, {
+      code: 'AI_ANALYSIS_ALL_IMAGES_FAILED',
+      details: {
+        inspectionId: inspection.id,
+        imageFailures,
+      },
+    });
+  }
+
+  const aggregate = await recomputeInspectionAggregates(inspection.id, {
+    updateToilet: true,
+  });
+  const refreshedInspection = await Inspection.findByPk(inspection.id);
+
+  const result = buildResultSummaryFromImages({
+    imageResults,
+    aggregate,
+  });
+  const processingMs = Date.now() - startedAt;
   const processedAt = new Date();
+  result.processingMs = processingMs;
 
   const analysis = await AiAnalysisResult.create({
     inspection_id: inspection.id,
     model_name: result.modelName,
     model_version: result.modelVersion,
+    provider: result.provider,
+    schema_version: result.schemaVersion,
     cleanliness_score: result.cleanlinessScore,
     hygiene_score: result.hygieneScore,
     odor_risk_score: result.odorRiskScore,
     wetness_score: result.wetnessScore,
     stain_score: result.stainScore,
     litter_score: result.litterScore,
+    confidence_score: result.confidenceScore,
+    review_required: Boolean(result.reviewRequired),
+    sub_scores: result.subScores,
+    issue_tags: result.issueTags,
+    severity_label: result.severityLabel,
+    explanation_text: result.explanationText,
+    processing_ms: processingMs,
     anomaly_flags: result.anomalyFlags,
     raw_result: result.rawResult,
     processed_at: processedAt,
   });
 
   await inspection.update({
-    processing_status: 'completed',
+    processing_status: refreshedInspection?.processing_status || 'completed',
+    pipeline_status: refreshedInspection?.pipeline_status || 'completed',
     submitted_at: inspection.submitted_at || processedAt,
     overall_status: result.overallStatus,
+    review_required: Boolean(refreshedInspection?.review_required || result.reviewRequired),
+    last_processing_error:
+      imageFailures.length > 0
+        ? imageFailures
+            .map((item) => `${item.imageId}: ${item.error}`)
+            .join(' | ')
+            .slice(0, 2000)
+        : null,
     updated_at: processedAt,
+  });
+
+  const pipelineStatus = refreshedInspection?.pipeline_status || inspection.pipeline_status || 'completed';
+
+  if (submissionId) {
+    const submission = await InspectionSubmission.findByPk(submissionId);
+    if (submission) {
+      await submission.update({
+        status: refreshedInspection?.status || pipelineStatus,
+        updated_at: new Date(),
+      });
+    }
+  }
+
+  if (processingJob) {
+    await processingJob.update({
+      status: imageResults.length > 0 ? 'succeeded' : 'failed',
+      completed_at: processedAt,
+      duration_ms: processingMs,
+      image_id: imageId || processingJob.image_id || null,
+      job_type: String(jobType || 'AI_ANALYSIS'),
+      last_error:
+        imageFailures.length > 0
+          ? imageFailures.map((item) => `${item.imageId}: ${item.error}`).join(' | ').slice(0, 2000)
+          : null,
+      result: {
+        analysisId: analysis.id,
+        type: String(jobType || 'AI_ANALYSIS'),
+        imageId: imageId || null,
+        analyzedImageIds,
+        failedImageIds: imageFailures.map((item) => item.imageId),
+        pipelineStatus,
+        overallStatus: result.overallStatus,
+        confidenceScore: result.confidenceScore,
+        inspectionStatus: aggregate?.status || refreshedInspection?.status || null,
+      },
+      updated_at: new Date(),
+    });
+  }
+
+  await InspectionEvent.create({
+    tenant_id: inspection.tenant_id,
+    inspection_id: inspection.id,
+    toilet_id: inspection.toilet_unit_id || null,
+    image_id: imageId || null,
+    event_type: 'analysis.completed',
+    event_status: pipelineStatus,
+    source: 'worker',
+    payload: {
+      analysisId: analysis.id,
+      type: String(jobType || 'AI_ANALYSIS'),
+      imageId: imageId || null,
+      analyzedImageIds,
+      failedImageIds: imageFailures.map((item) => item.imageId),
+      queueJobId: queueJobId || null,
+      submissionId: submissionId || null,
+      confidenceScore: result.confidenceScore,
+      reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
+      severityLabel: result.severityLabel,
+      processingMs,
+      aggregate,
+    },
+    occurred_at: new Date(),
   });
 
   await maybeCreateAlert({ inspection, result });
@@ -197,22 +998,33 @@ const runInspectionAnalysis = async ({ inspectionId, req = null }) => {
     facilityId: inspection.facility_id,
     result: {
       id: analysis.id,
+      overallCleanlinessScore: result.overallCleanlinessScore,
       cleanlinessScore: result.cleanlinessScore,
       hygieneScore: result.hygieneScore,
       odorRiskScore: result.odorRiskScore,
       wetnessScore: result.wetnessScore,
       stainScore: result.stainScore,
       litterScore: result.litterScore,
+      issueTags: result.issueTags,
+      severityLabel: result.severityLabel,
+      confidenceScore: result.confidenceScore,
+      reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
       overallStatus: result.overallStatus,
+      strictJson: result.rawResult?.strictJson || null,
       processedAt,
+      scoreLabel: scoreLabel(result.overallCleanlinessScore),
+      imageResultsCount: imageResults.length,
     },
   });
 
   eventBus.emit(EVENTS.INSPECTION_UPDATED, {
     inspectionId: inspection.id,
     tenantId: inspection.tenant_id,
-    processingStatus: 'completed',
+    processingStatus: refreshedInspection?.processing_status || 'completed',
+    pipelineStatus: refreshedInspection?.pipeline_status || pipelineStatus,
     overallStatus: result.overallStatus,
+    reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
+    inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
   });
 
   try {
@@ -240,7 +1052,15 @@ const runInspectionAnalysis = async ({ inspectionId, req = null }) => {
     entityId: inspection.id,
     details: {
       analysisId: analysis.id,
+      type: String(jobType || 'AI_ANALYSIS'),
+      imageId: imageId || null,
+      analyzedImageIds,
+      failedImageIds: imageFailures.map((item) => item.imageId),
       overallStatus: result.overallStatus,
+      confidenceScore: result.confidenceScore,
+      reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
+      inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
+      processingMs,
     },
   });
 
@@ -265,25 +1085,62 @@ const getAnalysisResult = async (inspectionId, req) => {
     return {
       inspectionId,
       processingStatus: inspection.processing_status,
+      pipelineStatus: inspection.pipeline_status || inspection.processing_status,
+      reviewRequired: Boolean(inspection.review_required),
       result: null,
     };
   }
 
+  const rawResult =
+    analysis.raw_result && typeof analysis.raw_result === 'object' ? analysis.raw_result : {};
+  const strictJsonFromRaw =
+    rawResult.strictJson && typeof rawResult.strictJson === 'object' ? rawResult.strictJson : null;
+  const computedStrictJson =
+    strictJsonFromRaw ||
+    buildStrictToiletJsonFromNormalizedResult({
+      overallCleanlinessScore: rawResult.overallCleanlinessScore ?? analysis.cleanliness_score,
+      cleanlinessScore: analysis.cleanliness_score,
+      hygieneScore: analysis.hygiene_score,
+      stainScore: analysis.stain_score,
+      wetnessScore: analysis.wetness_score,
+      litterScore: analysis.litter_score,
+      confidenceScore: analysis.confidence_score,
+      issueTags: Array.isArray(analysis.issue_tags) ? analysis.issue_tags : [],
+      severityLabel: analysis.severity_label || null,
+      reviewRequired: analysis.review_required,
+    });
+
   return {
     inspectionId,
     processingStatus: inspection.processing_status,
+    pipelineStatus: inspection.pipeline_status || inspection.processing_status,
+    reviewRequired: Boolean(inspection.review_required),
     result: {
       id: analysis.id,
       modelName: analysis.model_name,
       modelVersion: analysis.model_version,
+      provider: analysis.provider || null,
+      schemaVersion: analysis.schema_version || null,
+      overallCleanlinessScore: Number(computedStrictJson.overall_cleanliness_score || 0),
       cleanlinessScore: Number(analysis.cleanliness_score),
       hygieneScore: Number(analysis.hygiene_score),
       odorRiskScore: Number(analysis.odor_risk_score),
       wetnessScore: Number(analysis.wetness_score),
       stainScore: Number(analysis.stain_score),
       litterScore: Number(analysis.litter_score),
+      confidenceScore:
+        analysis.confidence_score !== null && analysis.confidence_score !== undefined
+          ? Number(analysis.confidence_score)
+          : null,
+      reviewRequired: Boolean(analysis.review_required),
+      subScores: analysis.sub_scores || null,
+      issueTags: Array.isArray(analysis.issue_tags) ? analysis.issue_tags : [],
+      severityLabel: analysis.severity_label || null,
+      explanationText: analysis.explanation_text || null,
+      processingMs: Number(analysis.processing_ms || 0) || null,
       anomalyFlags: analysis.anomaly_flags || {},
-      rawResult: analysis.raw_result || {},
+      strictJson: computedStrictJson,
+      rawResult,
       processedAt: analysis.processed_at,
       overallStatus: inspection.overall_status,
     },
@@ -310,7 +1167,9 @@ const getInspectionAnalysisTrend = async (inspectionId, req, options = {}) => {
     const stainScore = Number(row.stain_score || 0);
     const litterScore = Number(row.litter_score || 0);
     const wetnessScore = Number(row.wetness_score || 0);
-    const concernScore = Number((((100 - stainScore) + (100 - litterScore) + (100 - wetnessScore)) / 3).toFixed(2));
+    const concernScore = Number(
+      (((100 - stainScore) + (100 - litterScore) + (100 - wetnessScore)) / 3).toFixed(2)
+    );
 
     return {
       index: index + 1,
@@ -322,6 +1181,11 @@ const getInspectionAnalysisTrend = async (inspectionId, req, options = {}) => {
       concernScore,
       cleanlinessScore: Number(row.cleanliness_score || 0),
       hygieneScore: Number(row.hygiene_score || 0),
+      confidenceScore:
+        row.confidence_score !== null && row.confidence_score !== undefined
+          ? Number(row.confidence_score)
+          : null,
+      severityLabel: row.severity_label || null,
     };
   });
 

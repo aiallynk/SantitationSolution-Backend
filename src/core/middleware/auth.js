@@ -180,6 +180,23 @@ const requirePermissions = (...permissionCodes) => {
   };
 };
 
+const requireAnyPermissions = (...permissionCodes) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
+    const userPermissions = new Set(req.user.permissionCodes || []);
+    const hasAny = permissionCodes.some((code) => userPermissions.has(code));
+    if (!hasAny) {
+      return next(new AppError('Insufficient permission scope', 403, { code: 'PERMISSION_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
 const requireTenantContext = () => {
   return (req, res, next) => {
     if (!req.user) {
@@ -223,6 +240,7 @@ module.exports = {
   protect,
   requireRoles,
   requirePermissions,
+  requireAnyPermissions,
   requireTenantContext,
   applyTenantFilter,
   tenantScoped,

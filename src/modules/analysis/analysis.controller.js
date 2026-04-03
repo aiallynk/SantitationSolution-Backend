@@ -22,6 +22,27 @@ const postRunAnalysis = async (req, res, next) => {
   }
 };
 
+const postReprocessAnalysis = async (req, res, next) => {
+  try {
+    const inspectionId = req.params.inspectionId;
+    const enqueueResult = await enqueueInspectionAnalysis({
+      inspectionId,
+      requestContext: {
+        user: req.user,
+        requestId: req.requestId,
+        reprocess: true,
+      },
+    });
+    return sendSuccess(res, {
+      statusCode: 202,
+      message: 'Inspection analysis reprocess scheduled',
+      data: { inspectionId, reprocess: true, ...enqueueResult },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getInspectionAnalysisResult = async (req, res, next) => {
   try {
     const data = await getAnalysisResult(req.params.inspectionId, req);
@@ -69,6 +90,7 @@ const postAnalysisWebhook = async (req, res, next) => {
 
 module.exports = {
   postRunAnalysis,
+  postReprocessAnalysis,
   getInspectionAnalysisResult,
   getInspectionAnalysisTrendData,
   postAnalysisWebhook,

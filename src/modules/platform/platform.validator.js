@@ -39,6 +39,18 @@ const validateUnitCreate = (req) => {
   if (isBlank(req.body.facilityId)) errors.push('facilityId is required');
   if (isBlank(req.body.toiletBlockId)) errors.push('toiletBlockId is required');
   if (isBlank(req.body.unitType)) errors.push('unitType is required');
+  if (req.body.latitude !== undefined && Number.isNaN(Number(req.body.latitude))) {
+    errors.push('latitude must be a valid number');
+  }
+  if (req.body.longitude !== undefined && Number.isNaN(Number(req.body.longitude))) {
+    errors.push('longitude must be a valid number');
+  }
+  if (req.body.sectorCode && String(req.body.sectorCode).length > 40) {
+    errors.push('sectorCode must be 40 characters or fewer');
+  }
+  if (req.body.locationLabel && String(req.body.locationLabel).length > 300) {
+    errors.push('locationLabel must be 300 characters or fewer');
+  }
   return errors;
 };
 

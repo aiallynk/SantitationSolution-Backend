@@ -8,10 +8,17 @@ const { validate } = require('../../core/middleware/validate');
 const {
   validateCreateInspection,
   validateInspectionListQuery,
+  validateCreateMediaUploadSession,
+  validateConfirmMediaUpload,
+  validateRetryMediaUpload,
+  validateInspectionImageUploadSession,
+  validateInspectionImageConfirmUpload,
   validateSubmitInspection,
   validateReviewInspection,
 } = require('./inspection.validator');
 const { protect, requirePermissions } = require('../../core/middleware/auth');
+const { withIdempotency } = require('../../core/idempotency/idempotency.middleware');
+const { ingestionRateLimit } = require('../../core/security/rateLimit');
 
 const router = express.Router();
 
@@ -69,17 +76,91 @@ const upload = multer({
 router.use(protect);
 
 router.post('/inspections', requirePermissions('inspection.create'), validate(validateCreateInspection), inspectionController.postInspection);
+router.post(
+  '/inspections/start',
+  requirePermissions('inspection.create'),
+  validate(validateCreateInspection),
+  inspectionController.postInspectionStart
+);
 router.get('/inspections', requirePermissions('inspection.review'), validate(validateInspectionListQuery), inspectionController.getAllInspections);
 router.get('/inspections/my', requirePermissions('inspection.create'), validate(validateInspectionListQuery), inspectionController.getMyInspections);
+router.get('/toilets/:toiletId/inspections', requirePermissions('dashboard.read'), inspectionController.getToiletInspections);
+router.get('/toilets/:id/details', requirePermissions('dashboard.read'), inspectionController.getToiletDetails);
+router.get('/toilets/:id/latest-inspection', requirePermissions('dashboard.read'), inspectionController.getToiletLatestInspection);
+router.get('/toilets/:id/score-trends', requirePermissions('dashboard.read'), inspectionController.getToiletScoreTrends);
+router.get('/toilets/:id/inspection-history', requirePermissions('dashboard.read'), inspectionController.getToiletInspectionHistory);
+router.get('/inspections/:id/images', requirePermissions('inspection.create'), inspectionController.getInspectionImages);
+router.get('/inspections/:id/comparison', requirePermissions('dashboard.read'), inspectionController.getInspectionComparison);
 router.get('/inspections/:id/trend', requirePermissions('dashboard.read'), inspectionController.getInspectionTrend);
+router.get('/inspection-images/:imageId', requirePermissions('inspection.create'), inspectionController.getInspectionImageById);
+router.post('/inspection-images/:imageId/trigger-ai', requirePermissions('inspection.create'), inspectionController.postInspectionImageTriggerAi);
+router.post(
+  '/inspection-images/upload-session',
+  requirePermissions('inspection.create'),
+  ingestionRateLimit,
+  withIdempotency('inspection.image.upload_session.create', {
+    ttlMs: Number(process.env.S3_PRESIGNED_URL_TTL_SEC || 900) * 1000,
+  }),
+  validate(validateInspectionImageUploadSession),
+  inspectionController.postInspectionImageUploadSession
+);
+router.post(
+  '/inspection-images/confirm-upload',
+  requirePermissions('inspection.create'),
+  ingestionRateLimit,
+  withIdempotency('inspection.image.confirm_upload', {
+    ttlMs: 30 * 60 * 1000,
+  }),
+  validate(validateInspectionImageConfirmUpload),
+  inspectionController.postInspectionImageConfirmUpload
+);
 router.get('/inspections/:id', requirePermissions('dashboard.read'), inspectionController.getInspectionById);
+router.post(
+  '/inspections/:id/media/sessions',
+  requirePermissions('inspection.create'),
+  ingestionRateLimit,
+  withIdempotency('inspection.media.session.create', {
+    ttlMs: Number(process.env.S3_PRESIGNED_URL_TTL_SEC || 900) * 1000,
+  }),
+  validate(validateCreateMediaUploadSession),
+  inspectionController.postInspectionMediaUploadSessions
+);
+router.post(
+  '/inspections/:id/media/:mediaId/confirm',
+  requirePermissions('inspection.create'),
+  ingestionRateLimit,
+  withIdempotency('inspection.media.confirm', {
+    ttlMs: 30 * 60 * 1000,
+  }),
+  validate(validateConfirmMediaUpload),
+  inspectionController.postInspectionMediaConfirm
+);
+router.post(
+  '/inspections/:id/media/:mediaId/retry',
+  requirePermissions('inspection.create'),
+  ingestionRateLimit,
+  withIdempotency('inspection.media.retry', {
+    ttlMs: 15 * 60 * 1000,
+  }),
+  validate(validateRetryMediaUpload),
+  inspectionController.postInspectionMediaRetry
+);
 router.post(
   '/inspections/:id/media',
   requirePermissions('inspection.create'),
+  ingestionRateLimit,
   upload.single('file'),
   inspectionController.postInspectionMedia
 );
-router.post('/inspections/:id/submit', requirePermissions('inspection.create'), validate(validateSubmitInspection), inspectionController.postSubmitInspection);
+router.post(
+  '/inspections/:id/submit',
+  requirePermissions('inspection.create'),
+  withIdempotency('inspection.submit', {
+    ttlMs: 24 * 60 * 60 * 1000,
+  }),
+  validate(validateSubmitInspection),
+  inspectionController.postSubmitInspection
+);
 router.patch(
   '/inspections/:id/review',
   requirePermissions('inspection.review'),

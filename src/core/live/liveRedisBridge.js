@@ -10,12 +10,23 @@ let publisher = null;
 let subscriber = null;
 let started = false;
 let eventHandler = null;
+let redisLiveErrorLogged = false;
 
 const buildRedisClient = () =>
   new IORedis(process.env.REDIS_URL, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
+    retryStrategy: (times) => Math.min(times * 200, 2000),
   });
+
+const logRedisLiveError = (prefix, error) => {
+  if (redisLiveErrorLogged) {
+    return;
+  }
+  redisLiveErrorLogged = true;
+  // eslint-disable-next-line no-console
+  console.error(`${prefix}:`, error.message);
+};
 
 const safeParse = (value) => {
   try {
@@ -33,8 +44,20 @@ const startLiveRedisBridge = async ({ onEvent } = {}) => {
 
   publisher = buildRedisClient();
   subscriber = buildRedisClient();
+  subscriber.on('error', (error) => {
+    logRedisLiveError('Redis live subscriber error', error);
+  });
+  publisher.on('error', (error) => {
+    logRedisLiveError('Redis live publisher error', error);
+  });
 
-  await subscriber.subscribe(CHANNEL);
+  try {
+    await subscriber.subscribe(CHANNEL);
+  } catch (error) {
+    logRedisLiveError('Redis live subscribe failed', error);
+    await closeLiveRedisBridge();
+    return false;
+  }
   subscriber.on('message', (channel, rawMessage) => {
     if (channel !== CHANNEL || !eventHandler) return;
     const message = safeParse(rawMessage);
@@ -43,15 +66,6 @@ const startLiveRedisBridge = async ({ onEvent } = {}) => {
     }
     eventHandler(message.event, message.payload, message.payloadScope || null);
   });
-  subscriber.on('error', (error) => {
-    // eslint-disable-next-line no-console
-    console.error('Redis live subscriber error:', error.message);
-  });
-  publisher.on('error', (error) => {
-    // eslint-disable-next-line no-console
-    console.error('Redis live publisher error:', error.message);
-  });
-
   started = true;
   return true;
 };
@@ -93,6 +107,7 @@ const closeLiveRedisBridge = async () => {
   publisher = null;
   started = false;
   eventHandler = null;
+  redisLiveErrorLogged = false;
 };
 
 module.exports = {

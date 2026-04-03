@@ -3,6 +3,7 @@ const {
   sequelize,
   Facility,
   Inspection,
+  InspectionMedia,
   AiAnalysisResult,
   Alert,
   SensorDevice,
@@ -168,7 +169,7 @@ const getFacilityDashboard = async (req) => {
   const [inspections, alerts, tasks, complaints] = await Promise.all([
     Inspection.findAll({
       where: { facility_id: facilityId },
-      include: [{ model: AiAnalysisResult }],
+      include: [{ model: AiAnalysisResult }, { model: InspectionMedia }],
       order: [['captured_at', 'DESC']],
       limit: 20,
     }),
@@ -187,15 +188,23 @@ const getFacilityDashboard = async (req) => {
       longitude: toNumber(facility.longitude, null),
       status: facility.status,
     },
-    inspections: inspections.map((item) => ({
-      id: item.id,
-      capturedAt: item.captured_at,
-      processingStatus: item.processing_status,
-      overallStatus: item.overall_status,
-      cleanlinessScore: toNumber(item.AiAnalysisResults?.[0]?.cleanliness_score, null),
-      beforeMediaCount: 0,
-      afterMediaCount: 0,
-    })),
+    inspections: inspections.map((item) => {
+      const media = Array.isArray(item.InspectionMedia) ? item.InspectionMedia : [];
+      const beforeMediaCount = media.filter((m) => m.capture_stage === 'before').length;
+      const afterMediaCount = media.filter((m) => m.capture_stage === 'after').length;
+      return {
+        id: item.id,
+        capturedAt: item.captured_at,
+        processingStatus: item.processing_status,
+        pipelineStatus: item.pipeline_status || item.processing_status,
+        overallStatus: item.overall_status,
+        cleanlinessScore: toNumber(item.AiAnalysisResults?.[0]?.cleanliness_score, null),
+        beforeMediaCount,
+        afterMediaCount,
+        totalMediaCount: media.length,
+        reviewRequired: Boolean(item.review_required),
+      };
+    }),
     alerts: alerts.map((alert) => ({
       id: alert.id,
       message: alert.message,

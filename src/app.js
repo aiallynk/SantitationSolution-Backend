@@ -8,12 +8,23 @@ require('./config/env');
 
 const { apiRateLimit } = require('./core/security/rateLimit');
 const { attachRequestId } = require('./core/middleware/requestId');
+const { requestLogger } = require('./core/middleware/requestLogger');
 const { notFound } = require('./core/middleware/notFound');
 const { handleError } = require('./core/errors/handleError');
 const apiV1Router = require('./api/v1');
 const compatRouter = require('./api/compat');
 
 const app = express();
+
+const normalizeOriginValue = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  // Browser Origin header never includes trailing slash.
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw.replace(/\/+$/, '');
+  }
+  return raw;
+};
 
 const resolveAllowedOrigins = () => {
   const raw = String(process.env.CORS_ORIGIN || '').trim();
@@ -22,16 +33,46 @@ const resolveAllowedOrigins = () => {
   }
   return raw
     .split(',')
-    .map((entry) => entry.trim())
+    .map((entry) => normalizeOriginValue(entry))
     .filter(Boolean);
 };
 
 const allowedOrigins = resolveAllowedOrigins();
 
+const escapeRegex = (value) =>
+  String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const originMatchers = Array.isArray(allowedOrigins)
+  ? allowedOrigins.map((entry) => {
+      const raw = String(entry || '').trim();
+      if (!raw) return null;
+      if (raw === '*') {
+        return { type: 'any' };
+      }
+      if (raw.includes('*')) {
+        const pattern = `^${raw.split('*').map(escapeRegex).join('.*')}$`;
+        return { type: 'regex', value: new RegExp(pattern, 'i') };
+      }
+      return { type: 'exact', value: raw };
+    }).filter(Boolean)
+  : [];
+
+const isOriginAllowed = (origin) => {
+  const normalizedOrigin = normalizeOriginValue(origin);
+  if (!normalizedOrigin || originMatchers.length === 0) return true;
+  for (const matcher of originMatchers) {
+    if (matcher.type === 'any') return true;
+    if (matcher.type === 'exact' && matcher.value === normalizedOrigin) return true;
+    if (matcher.type === 'regex' && matcher.value.test(normalizedOrigin)) return true;
+  }
+  return false;
+};
+
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
 
 app.use(attachRequestId);
+app.use(requestLogger);
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -40,10 +81,10 @@ app.use(
 app.use(
   cors({
     origin(origin, callback) {
-      if (!allowedOrigins || allowedOrigins.length === 0 || !origin) {
+      if (!originMatchers.length || !origin) {
         return callback(null, true);
       }
-      if (allowedOrigins.includes(origin)) {
+      if (isOriginAllowed(origin)) {
         return callback(null, true);
       }
       return callback(null, false);

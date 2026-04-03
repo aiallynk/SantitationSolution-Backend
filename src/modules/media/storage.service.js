@@ -7,6 +7,8 @@ const uploadRoot = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadRoot)) {
   fs.mkdirSync(uploadRoot, { recursive: true });
 }
+let s3BackoffUntilTs = 0;
+let s3BackoffLogged = false;
 
 const useCloudinary = () =>
   Boolean(
@@ -88,10 +90,28 @@ const uploadToS3 = async (filePath, targetFolder) => {
 };
 
 const uploadImage = async (filePath, targetFolder) => {
-  if (isS3Enabled()) {
+  const nowTs = Date.now();
+  const s3BackoffActive = nowTs < s3BackoffUntilTs;
+  if (isS3Enabled() && !s3BackoffActive) {
     try {
       return await uploadToS3(filePath, targetFolder);
     } catch (error) {
+      const message = String(error?.message || '');
+      const lower = message.toLowerCase();
+      const isAccessDenied =
+        lower.includes('not authorized to perform') ||
+        lower.includes('accessdenied') ||
+        lower.includes('permission');
+      if (isAccessDenied) {
+        s3BackoffUntilTs = Date.now() + 10 * 60 * 1000;
+        if (!s3BackoffLogged) {
+          s3BackoffLogged = true;
+          // eslint-disable-next-line no-console
+          console.error(
+            'S3 access denied. Temporarily falling back to local media storage for 10 minutes.'
+          );
+        }
+      }
       // eslint-disable-next-line no-console
       console.error('S3 upload failed, falling back to local storage:', error.message);
     }

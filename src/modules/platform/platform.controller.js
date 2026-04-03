@@ -1,5 +1,6 @@
 const { sendSuccess } = require('../../core/http/response');
 const platformService = require('./platform.service');
+const inspectionService = require('../inspections/inspection.service');
 
 const getTenants = async (req, res, next) => {
   try {
@@ -113,10 +114,72 @@ const getToiletUnits = async (req, res, next) => {
   }
 };
 
+const getToiletUnitByQr = async (req, res, next) => {
+  try {
+    const data = await platformService.resolveUnitByQr(req);
+    return sendSuccess(res, { message: 'Toilet unit resolved successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postToiletUnit = async (req, res, next) => {
   try {
     const row = await platformService.createUnit(req);
     return sendSuccess(res, { statusCode: 201, message: 'Toilet unit created successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletDetails = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletDetailsById(req);
+    return sendSuccess(res, { message: 'Toilet details fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletLatestInspection = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletLatestInspectionById(req);
+    return sendSuccess(res, { message: 'Toilet latest inspection fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletScoreTrends = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletScoreTrendsById(req);
+    return sendSuccess(res, { message: 'Toilet score trends fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletInspectionHistory = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletInspectionHistoryById(req);
+    return sendSuccess(res, {
+      message: 'Toilet inspection history fetched successfully',
+      data: data.items,
+      meta: data.meta,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletInspections = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getToiletInspections(req);
+    return sendSuccess(res, {
+      message: 'Toilet inspections fetched successfully',
+      data: data.items,
+      meta: data.meta,
+    });
   } catch (error) {
     return next(error);
   }
@@ -135,5 +198,11 @@ module.exports = {
   getToiletBlocks,
   postToiletBlock,
   getToiletUnits,
+  getToiletUnitByQr,
   postToiletUnit,
+  getToiletInspections,
+  getToiletDetails,
+  getToiletLatestInspection,
+  getToiletScoreTrends,
+  getToiletInspectionHistory,
 };

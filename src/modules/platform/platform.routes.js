@@ -30,6 +30,12 @@ router.get('/toilet-blocks', requirePermissions('dashboard.read'), platformContr
 router.post('/toilet-blocks', requirePermissions('task.manage'), validate(validateBlockCreate), platformController.postToiletBlock);
 
 router.get('/toilet-units', requirePermissions('dashboard.read'), platformController.getToiletUnits);
+router.get('/toilet-units/resolve', requirePermissions('inspection.create'), platformController.getToiletUnitByQr);
 router.post('/toilet-units', requirePermissions('task.manage'), validate(validateUnitCreate), platformController.postToiletUnit);
+router.get('/toilets/:toiletId/inspections', requirePermissions('dashboard.read'), platformController.getToiletInspections);
+router.get('/toilets/:id/details', requirePermissions('dashboard.read'), platformController.getToiletDetails);
+router.get('/toilets/:id/latest-inspection', requirePermissions('dashboard.read'), platformController.getToiletLatestInspection);
+router.get('/toilets/:id/score-trends', requirePermissions('dashboard.read'), platformController.getToiletScoreTrends);
+router.get('/toilets/:id/inspection-history', requirePermissions('dashboard.read'), platformController.getToiletInspectionHistory);
 
 module.exports = router;

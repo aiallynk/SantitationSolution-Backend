@@ -27,6 +27,18 @@ const getTasks = async (req, res, next) => {
   }
 };
 
+const getTaskById = async (req, res, next) => {
+  try {
+    const task = await taskService.getTaskById(req);
+    return sendSuccess(res, {
+      message: 'Task fetched successfully',
+      data: task,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postTask = async (req, res, next) => {
   try {
     const task = await taskService.createTask(req);
@@ -65,6 +77,7 @@ const patchTaskComplete = async (req, res, next) => {
 
 module.exports = {
   getTasks,
+  getTaskById,
   getMyTasks,
   postTask,
   patchTaskStart,
