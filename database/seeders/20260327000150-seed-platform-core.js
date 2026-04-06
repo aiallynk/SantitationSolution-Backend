@@ -1,6 +1,7 @@
 'use strict';
 
 const bcrypt = require('bcrypt');
+const { ROLE_PERMISSION_BUNDLES } = require('../../src/core/rbac/defaultRoleBundles');
 
 const ids = {
   tenant: '11111111-1111-4111-8111-111111111111',
@@ -230,13 +231,7 @@ module.exports = {
     const roleByCode = Object.fromEntries(roleRows.map((role) => [role.code, role.id]));
     const permissionByCode = Object.fromEntries(permissionRows.map((permission) => [permission.code, permission.id]));
 
-    const rolePermissions = [
-      ['super_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'super_admin.read', 'super_admin.write', 'users.manage', 'reports.read', 'reports.export', 'tenants.manage', 'audit.read']],
-      ['tenant_admin', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'users.manage', 'reports.read', 'reports.export', 'audit.read']],
-      ['supervisor', ['auth.read', 'dashboard.read', 'inspection.review', 'task.manage', 'alerts.manage', 'sensor.read', 'reports.read']],
-      ['field_worker', ['auth.read', 'inspection.create', 'dashboard.read']],
-      ['viewer', ['auth.read', 'dashboard.read', 'reports.read']],
-    ];
+    const rolePermissions = Object.entries(ROLE_PERMISSION_BUNDLES);
 
     const rolePermissionRows = [];
     for (const [roleCode, permissionCodes] of rolePermissions) {

@@ -12,6 +12,7 @@ const {
   headObjectFromS3,
   buildObjectUrl,
 } = require('../media/s3.service');
+const { resolveMediaPairUrls } = require('../media/mediaUrl.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
@@ -658,12 +659,18 @@ const confirmUpload = async (req) => {
 
   await recomputeInspectionAggregates(inspection.id, { updateToilet: false });
 
+  const urls = await resolveMediaPairUrls({
+    fileUrl: media.file_url,
+    thumbnailUrl: media.thumbnail_url || media.file_url,
+    storageKey: media.storage_key || null,
+  });
+
   return {
     mediaId: media.id,
     uploadStatus: 'confirmed',
     aiStatus: isAutoAnalysisOnUploadEnabled() ? 'AI_QUEUED' : 'UPLOADED',
-    fileUrl: media.file_url,
-    thumbnailUrl: media.thumbnail_url || media.file_url,
+    fileUrl: urls.fileUrl,
+    thumbnailUrl: urls.thumbnailUrl,
     analysisQueue,
   };
 };

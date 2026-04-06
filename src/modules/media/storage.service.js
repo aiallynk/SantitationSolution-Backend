@@ -17,6 +17,15 @@ const useCloudinary = () =>
       process.env.CLOUDINARY_API_SECRET
   );
 
+const allowS3FallbackToLocal = () => {
+  const configured = String(process.env.S3_FALLBACK_TO_LOCAL || '')
+    .trim()
+    .toLowerCase();
+  if (configured === 'true') return true;
+  if (configured === 'false') return false;
+  return String(process.env.NODE_ENV || 'development').toLowerCase() === 'development';
+};
+
 const resolveMimeType = (filePath) => {
   const ext = path.extname(filePath || '').toLowerCase();
   if (ext === '.png') return 'image/png';
@@ -90,30 +99,41 @@ const uploadToS3 = async (filePath, targetFolder) => {
 };
 
 const uploadImage = async (filePath, targetFolder) => {
+  const allowLocalFallback = allowS3FallbackToLocal();
   const nowTs = Date.now();
   const s3BackoffActive = nowTs < s3BackoffUntilTs;
-  if (isS3Enabled() && !s3BackoffActive) {
-    try {
-      return await uploadToS3(filePath, targetFolder);
-    } catch (error) {
-      const message = String(error?.message || '');
-      const lower = message.toLowerCase();
-      const isAccessDenied =
-        lower.includes('not authorized to perform') ||
-        lower.includes('accessdenied') ||
-        lower.includes('permission');
-      if (isAccessDenied) {
-        s3BackoffUntilTs = Date.now() + 10 * 60 * 1000;
-        if (!s3BackoffLogged) {
-          s3BackoffLogged = true;
-          // eslint-disable-next-line no-console
-          console.error(
-            'S3 access denied. Temporarily falling back to local media storage for 10 minutes.'
-          );
+  if (isS3Enabled()) {
+    const shouldSkipS3Attempt = s3BackoffActive && allowLocalFallback;
+    if (!shouldSkipS3Attempt) {
+      try {
+        return await uploadToS3(filePath, targetFolder);
+      } catch (error) {
+        const message = String(error?.message || '');
+        const lower = message.toLowerCase();
+        const isAccessDenied =
+          lower.includes('not authorized to perform') ||
+          lower.includes('accessdenied') ||
+          lower.includes('permission');
+        if (isAccessDenied) {
+          s3BackoffUntilTs = Date.now() + 10 * 60 * 1000;
+          if (!s3BackoffLogged) {
+            s3BackoffLogged = true;
+            // eslint-disable-next-line no-console
+            console.error(
+              'S3 access denied. Temporarily falling back to local media storage for 10 minutes.'
+            );
+          }
         }
+        if (!allowLocalFallback) {
+          throw new Error(`S3 upload failed and local fallback is disabled: ${error.message}`);
+        }
+        // eslint-disable-next-line no-console
+        console.error('S3 upload failed, falling back to local storage:', error.message);
       }
-      // eslint-disable-next-line no-console
-      console.error('S3 upload failed, falling back to local storage:', error.message);
+    } else if (!allowLocalFallback) {
+      throw new Error(
+        'S3 upload was skipped due active backoff while local fallback is disabled'
+      );
     }
   }
   if (useCloudinary()) {

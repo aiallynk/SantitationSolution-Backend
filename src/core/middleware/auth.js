@@ -3,6 +3,9 @@ const AppError = require('../errors/AppError');
 const { PlatformUser, Role, Permission } = require('../../models');
 
 const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET || 'change-me-access-secret';
+// Legacy compatibility note:
+// `platform_ops` remains global-scoped here for backward compatibility only.
+// Do not elevate or auto-migrate it to `super_admin` without an explicit migration plan.
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
 const parseBearer = (req) => {

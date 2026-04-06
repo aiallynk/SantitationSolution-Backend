@@ -593,11 +593,17 @@ const Complaint = sequelize.define(
     facility_id: { type: DataTypes.UUID, allowNull: true },
     toilet_unit_id: { type: DataTypes.UUID, allowNull: true },
     reporter_user_id: { type: DataTypes.UUID, allowNull: true },
+    source_channel: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'field_app' },
+    reporter_name: { type: DataTypes.STRING(180), allowNull: true },
+    reporter_contact: { type: DataTypes.STRING(120), allowNull: true },
     complaint_type: { type: DataTypes.STRING(120), allowNull: false },
     description: { type: DataTypes.STRING(1000), allowNull: false },
+    evidence_image_url: { type: DataTypes.STRING(500), allowNull: true },
     status: { type: DataTypes.ENUM('open', 'assigned', 'resolved', 'rejected'), allowNull: false, defaultValue: 'open' },
     assigned_to_user_id: { type: DataTypes.UUID, allowNull: true },
     priority: { type: DataTypes.ENUM('low', 'medium', 'high', 'critical'), allowNull: false, defaultValue: 'medium' },
+    dispatch_requested_at: { type: DataTypes.DATE, allowNull: true },
+    dispatch_requested_by_user_id: { type: DataTypes.UUID, allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'complaints', timestamps: false }
@@ -964,6 +970,10 @@ Complaint.belongsTo(Facility, { foreignKey: 'facility_id' });
 Complaint.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id' });
 Complaint.belongsTo(PlatformUser, { foreignKey: 'reporter_user_id', as: 'reporter' });
 Complaint.belongsTo(PlatformUser, { foreignKey: 'assigned_to_user_id', as: 'assignedTo' });
+Complaint.belongsTo(PlatformUser, {
+  foreignKey: 'dispatch_requested_by_user_id',
+  as: 'dispatchRequestedBy',
+});
 AuditLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.hasMany(AuditLog, { foreignKey: 'tenant_id', as: 'auditLogs' });
 AuditLog.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
