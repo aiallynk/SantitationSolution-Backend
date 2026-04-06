@@ -1,6 +1,7 @@
 const AppError = require('../../core/errors/AppError');
 const { Inspection, InspectionMedia } = require('../../models');
 const { uploadImage, removeTempFile } = require('./storage.service');
+const { resolveMediaUrl, resolveMediaPairUrls } = require('./mediaUrl.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { recomputeInspectionAggregates } = require('../inspections/inspectionEvidence.service');
@@ -147,9 +148,14 @@ const uploadComplete = async (req) => {
     await recomputeInspectionAggregates(media.inspection_id, { updateToilet: false });
   }
 
+  const fileUrl = await resolveMediaUrl({
+    fileUrl: media.file_url,
+    storageKey: media.storage_key || null,
+  });
+
   return {
     id: media.id,
-    fileUrl: media.file_url,
+    fileUrl,
     storageKey: media.storage_key,
     uploadedAt: media.uploaded_at,
     metadata: media.metadata,
@@ -163,15 +169,20 @@ const getMediaById = async (req) => {
   if (!media) {
     throw new AppError('Media not found', 404, { code: 'MEDIA_NOT_FOUND' });
   }
+  const urls = await resolveMediaPairUrls({
+    fileUrl: media.file_url,
+    thumbnailUrl: media.thumbnail_url || media.file_url,
+    storageKey: media.storage_key || null,
+  });
   return {
     id: media.id,
     inspectionId: media.inspection_id,
     toiletId: media.toilet_unit_id,
     mediaType: media.media_type,
     captureStage: media.capture_stage,
-    fileUrl: media.file_url,
+    fileUrl: urls.fileUrl,
     storageKey: media.storage_key,
-    thumbnailUrl: media.thumbnail_url,
+    thumbnailUrl: urls.thumbnailUrl,
     uploadStatus: media.upload_status,
     aiStatus: media.ai_status,
     imageQualityStatus: media.image_quality_status,

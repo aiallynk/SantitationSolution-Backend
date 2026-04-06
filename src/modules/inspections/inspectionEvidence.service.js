@@ -14,7 +14,16 @@ const {
   AiAnalysisResult,
   ToiletScoreDaily,
 } = require('../../models');
-const { getQrImageUrl, ensureQrImageForToilet } = require('../platform/toiletQr.service');
+const {
+  getQrImageUrl,
+  getFeedbackQrImageUrl,
+  getPublicFeedbackUrl,
+  ensureAllQrImagesForToilet,
+} = require('../platform/toiletQr.service');
+const {
+  normalizeMediaUrl,
+  resolveMediaPairUrls,
+} = require('../media/mediaUrl.service');
 
 const REVIEW_CONFIDENCE_THRESHOLD = Number(
   process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7
@@ -65,15 +74,6 @@ const unionIssueTags = (rows = []) => {
     }
   }
   return Array.from(tags.values());
-};
-
-const normalizeMediaUrl = (url) => {
-  const value = String(url || '').trim();
-  if (!value) return null;
-  if (value.startsWith('/static/uploads/')) {
-    return value.replace('/static/uploads/', '/static/');
-  }
-  return value;
 };
 
 const stageOf = (row) => String(row.capture_stage || 'evidence').toLowerCase();
@@ -234,7 +234,8 @@ const dedupeInspectionMediaRows = (rows = []) => {
   return sortMediaRowsForEvidence(removePlaceholderRows(Array.from(selected.values())));
 };
 
-const mapMediaEvidence = (row) => {
+const mapMediaEvidence = async (row, options = {}) => {
+  const mediaUrlCache = options.mediaUrlCache || null;
   const overallScore = toNumber(row.overall_score, null);
   const confidence = toNumber(row.confidence_score, null);
   const garbageScore = toNumber(row.garbage_score, null);
@@ -254,6 +255,15 @@ const mapMediaEvidence = (row) => {
     suspiciousFlags.push('low_confidence_rejected');
   }
 
+  const urls = await resolveMediaPairUrls(
+    {
+      fileUrl: row.file_url,
+      thumbnailUrl: row.thumbnail_url || row.file_url,
+      storageKey: row.storage_key || row.metadata?.storageKey || null,
+    },
+    { cache: mediaUrlCache }
+  );
+
   return {
     id: row.id,
     clientImageId: row.client_image_id || null,
@@ -262,8 +272,9 @@ const mapMediaEvidence = (row) => {
     workerId: row.worker_id,
     assignmentId: row.assignment_id,
     stage: String(row.capture_stage || 'evidence').toUpperCase(),
-    imageUrl: normalizeMediaUrl(row.file_url),
-    thumbnailUrl: normalizeMediaUrl(row.thumbnail_url || row.file_url),
+    imageUrl: urls.fileUrl || normalizeMediaUrl(row.file_url),
+    thumbnailUrl:
+      urls.thumbnailUrl || normalizeMediaUrl(row.thumbnail_url || row.file_url),
     capturedAt: row.captured_at || null,
     uploadedAt: row.uploaded_at || null,
     confirmedAt: row.confirmed_at || null,
@@ -1043,7 +1054,12 @@ const listInspectionImages = async (inspectionId, req) => {
     rows,
     req,
   });
-  const mapped = dedupeInspectionMediaRows(rows).map(mapMediaEvidence);
+  const mediaUrlCache = new Map();
+  const mapped = await Promise.all(
+    dedupeInspectionMediaRows(rows).map((row) =>
+      mapMediaEvidence(row, { mediaUrlCache })
+    )
+  );
   return {
     inspectionId,
     beforeImages: mapped.filter((item) => item.stage === 'BEFORE'),
@@ -1233,8 +1249,15 @@ const getInspectionComparison = async (inspectionId, req) => {
   const evidenceRows = dedupeInspectionMediaRows(refreshedRows);
   const beforeRows = evidenceRows.filter((item) => stageOf(item) === 'before');
   const afterRows = evidenceRows.filter((item) => stageOf(item) === 'after');
-  const beforeImages = beforeRows.map(mapMediaEvidence);
-  const afterImages = afterRows.map(mapMediaEvidence);
+  const mediaUrlCache = new Map();
+  const [beforeImages, afterImages] = await Promise.all([
+    Promise.all(
+      beforeRows.map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+    ),
+    Promise.all(
+      afterRows.map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+    ),
+  ]);
 
   const beforeByOrdinal = new Map();
   for (const image of beforeImages) {
@@ -1351,8 +1374,19 @@ const getToiletLatestInspection = async (toiletId, req) => {
     mediaRows: media,
     aiResult: aiByInspection.get(String(latest.id)) || null,
   });
-  const beforeImages = media.filter((item) => stageOf(item) === 'before').map(mapMediaEvidence);
-  const afterImages = media.filter((item) => stageOf(item) === 'after').map(mapMediaEvidence);
+  const mediaUrlCache = new Map();
+  const [beforeImages, afterImages] = await Promise.all([
+    Promise.all(
+      media
+        .filter((item) => stageOf(item) === 'before')
+        .map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+    ),
+    Promise.all(
+      media
+        .filter((item) => stageOf(item) === 'after')
+        .map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+    ),
+  ]);
 
   return {
     id: latest.id,
@@ -1529,9 +1563,10 @@ const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
 
 const getToiletDetails = async (toiletId, req) => {
   const unit = await assertToiletScope(toiletId, req);
-  await ensureQrImageForToilet({
+  await ensureAllQrImagesForToilet({
     toiletUnitId: unit.id,
-    qrCodeValue: unit.qr_code || unit.code,
+    appQrCodeValue: unit.qr_code || unit.code,
+    feedbackQrValue: getPublicFeedbackUrl({ toiletUnitId: unit.id }),
   }).catch(() => null);
   const latestInspection = await getToiletLatestInspection(toiletId, req);
   const history = await getToiletInspectionHistory(toiletId, req, { page: 1, limit: 50 });
@@ -1684,7 +1719,11 @@ const getToiletDetails = async (toiletId, req) => {
       code: unit.code,
       name: unit.code,
       qrCode: unit.qr_code || unit.code,
+      appQrCode: unit.qr_code || unit.code,
       qrImageUrl: getQrImageUrl(unit.id),
+      appQrImageUrl: getQrImageUrl(unit.id),
+      feedbackQrImageUrl: getFeedbackQrImageUrl(unit.id),
+      publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: unit.id }),
       sector:
         unit.sector_code ||
         unit.Facility?.metadata?.sector ||

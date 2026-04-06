@@ -26,6 +26,8 @@ const router = express.Router();
 router.use('/auth', authRoutes);
 router.get('/me', protect, authController.getMe);
 router.patch('/me', protect, validate(validateUpdateMe), authController.patchMe);
+// Keep public complaint feedback endpoints reachable without auth.
+router.use(complaintRoutes);
 router.use(userRoutes);
 router.use(platformRoutes);
 router.use(taskRoutes);
@@ -37,7 +39,6 @@ router.use(alertRoutes);
 router.use(dashboardRoutes);
 router.use('/super-admin', superAdminRoutes);
 router.use(reportRoutes);
-router.use(complaintRoutes);
 router.use(notificationRoutes);
 router.use(liveRoutes);
 router.use(auditRoutes);

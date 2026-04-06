@@ -15,6 +15,7 @@ const {
 } = require('../../models');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
+const { assertRoleScopeRequirements } = require('../../core/rbac/roleScopeRules');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
@@ -507,6 +508,11 @@ const createUser = async (req) => {
       bodyAssignments: req.body.assignments,
       geographyId: req.body.geographyId || null,
     });
+    assertRoleScopeRequirements({
+      roleCodes,
+      geographyId: req.body.geographyId || null,
+      assignments,
+    });
 
     await replaceAssignments({
       user,
@@ -616,6 +622,9 @@ const patchUser = async (req) => {
       updates.updated_at = new Date();
       await user.update(updates, { transaction });
     }
+    const nextGeographyId = Object.prototype.hasOwnProperty.call(updates, 'geography_id')
+      ? updates.geography_id
+      : user.geography_id;
 
     let roleCodes = unique((user.Roles || []).map((role) => role.code));
     if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
@@ -645,7 +654,7 @@ const patchUser = async (req) => {
               user_id: user.id,
               role_id: role.id,
               tenant_id: nextTenantId,
-              geography_id: updates.geography_id ?? user.geography_id,
+              geography_id: nextGeographyId,
             },
             { transaction }
           )
@@ -658,6 +667,7 @@ const patchUser = async (req) => {
       req.body.geographyId !== undefined ||
       req.body.clearAssignments === true;
 
+    let nextAssignmentsForScopeValidation = null;
     if (shouldReplaceAssignments) {
       const assignments = req.body.clearAssignments
         ? []
@@ -666,8 +676,9 @@ const patchUser = async (req) => {
             roleCodes,
             tenantId: nextTenantId,
             bodyAssignments: req.body.assignments,
-            geographyId: updates.geography_id ?? user.geography_id,
+            geographyId: nextGeographyId,
           });
+      nextAssignmentsForScopeValidation = assignments;
 
       await replaceAssignments({
         user,
@@ -676,6 +687,35 @@ const patchUser = async (req) => {
         assignments,
         actorUserId: req.user.id,
         transaction,
+      });
+    }
+
+    const shouldValidateRoleScope =
+      Array.isArray(req.body.roleCodes) ||
+      req.body.geographyId !== undefined ||
+      req.body.assignments !== undefined ||
+      req.body.clearAssignments === true;
+
+    if (shouldValidateRoleScope) {
+      if (!nextAssignmentsForScopeValidation) {
+        const existingAssignments = await WorkerAssignment.findAll({
+          where: {
+            user_id: user.id,
+            status: 'active',
+          },
+          attributes: ['geography_id', 'facility_id', 'toilet_unit_id'],
+          transaction,
+        });
+        nextAssignmentsForScopeValidation = existingAssignments.map((assignment) => ({
+          geographyId: assignment.geography_id || null,
+          facilityId: assignment.facility_id || null,
+          toiletUnitId: assignment.toilet_unit_id || null,
+        }));
+      }
+      assertRoleScopeRequirements({
+        roleCodes,
+        geographyId: nextGeographyId || null,
+        assignments: nextAssignmentsForScopeValidation,
       });
     }
 

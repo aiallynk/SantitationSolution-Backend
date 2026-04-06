@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
+const { ROLE_PERMISSION_BUNDLES } = require('../../src/core/rbac/defaultRoleBundles');
 
 const ROLE_DEFINITIONS = [
   ['super_admin', 'Super Admin'],
@@ -37,47 +38,6 @@ const PERMISSION_DEFINITIONS = [
   ['tenants.manage', 'Manage tenants'],
   ['audit.read', 'Read audit logs'],
 ];
-
-const ROLE_PERMISSION_MATRIX = {
-  super_admin: [
-    'auth.read',
-    'dashboard.read',
-    'inspection.review',
-    'task.manage',
-    'alerts.manage',
-    'sensor.read',
-    'super_admin.read',
-    'super_admin.write',
-    'users.manage',
-    'reports.read',
-    'reports.export',
-    'tenants.manage',
-    'audit.read',
-  ],
-  tenant_admin: [
-    'auth.read',
-    'dashboard.read',
-    'inspection.review',
-    'task.manage',
-    'alerts.manage',
-    'sensor.read',
-    'users.manage',
-    'reports.read',
-    'reports.export',
-    'audit.read',
-  ],
-  supervisor: [
-    'auth.read',
-    'dashboard.read',
-    'inspection.review',
-    'task.manage',
-    'alerts.manage',
-    'sensor.read',
-    'reports.read',
-  ],
-  field_worker: ['auth.read', 'inspection.create', 'dashboard.read'],
-  viewer: ['auth.read', 'dashboard.read', 'reports.read'],
-};
 
 const NEW_USER_EMAILS = [
   'tenantadmin@nmc.gov.in',
@@ -157,7 +117,7 @@ module.exports = {
     );
 
     const rolePermissionInserts = [];
-    for (const [roleCode, permissionCodes] of Object.entries(ROLE_PERMISSION_MATRIX)) {
+    for (const [roleCode, permissionCodes] of Object.entries(ROLE_PERMISSION_BUNDLES)) {
       const roleId = roleByCode[roleCode];
       if (!roleId) continue;
       for (const permissionCode of permissionCodes) {

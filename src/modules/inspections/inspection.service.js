@@ -14,6 +14,11 @@ const {
 } = require('../../models');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { uploadImage, removeTempFile } = require('../media/storage.service');
+const {
+  normalizeMediaUrl,
+  resolveMediaUrl,
+  resolveMediaPairUrls,
+} = require('../media/mediaUrl.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
@@ -191,15 +196,6 @@ const normalizeReviewAction = (value) => {
   return action;
 };
 
-const normalizeMediaUrl = (url) => {
-  const value = String(url || '').trim();
-  if (!value) return null;
-  if (value.startsWith('/static/uploads/')) {
-    return value.replace('/static/uploads/', '/static/');
-  }
-  return value;
-};
-
 const MEDIA_AI_STATUS_PRIORITY = {
   AI_COMPLETED: 60,
   AI_PROCESSING: 50,
@@ -341,20 +337,26 @@ const dedupeInspectionMedia = (rows = []) => {
   return sortMediaRows(removePlaceholderRows(Array.from(selected.values())));
 };
 
-const hydrateInspectionMediaForDisplay = async (inspection) => {
+const hydrateInspectionMediaForDisplay = async (
+  inspection,
+  { mediaUrlCache = null } = {}
+) => {
   const mediaRows = dedupeInspectionMedia(inspection?.InspectionMedia || []);
   if (inspection) {
     inspection.InspectionMedia = mediaRows;
   }
   for (const media of mediaRows) {
-    const normalizedUrl = normalizeMediaUrl(media.file_url);
-    if (normalizedUrl && normalizedUrl !== media.file_url) {
-      media.file_url = normalizedUrl;
-    }
-    const normalizedThumbnail = normalizeMediaUrl(media.thumbnail_url || media.file_url);
-    if (normalizedThumbnail && normalizedThumbnail !== media.thumbnail_url) {
-      media.thumbnail_url = normalizedThumbnail;
-    }
+    const urls = await resolveMediaPairUrls(
+      {
+        fileUrl: media.file_url,
+        thumbnailUrl: media.thumbnail_url || media.file_url,
+        storageKey: media.storage_key || null,
+      },
+      { cache: mediaUrlCache }
+    );
+    media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
+    media.thumbnail_url =
+      urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
   }
 };
 
@@ -1103,11 +1105,16 @@ const uploadInspectionMedia = async (req) => {
 
   await recomputeInspectionAggregates(inspection.id, { updateToilet: false });
 
+  const mediaFileUrl = await resolveMediaUrl({
+    fileUrl: media.file_url,
+    storageKey: media.storage_key || null,
+  });
+
   return {
     id: media.id,
     inspectionId: inspection.id,
     captureStage: media.capture_stage,
-    fileUrl: media.file_url,
+    fileUrl: mediaFileUrl || normalizeMediaUrl(media.file_url),
     uploadedAt: media.uploaded_at,
     aiStatus: media.ai_status,
     analysisQueue,
@@ -1357,6 +1364,13 @@ const listInspections = async (req, myOnly = false) => {
     limit,
     offset,
   });
+
+  const mediaUrlCache = new Map();
+  await Promise.all(
+    rows.map((inspection) =>
+      hydrateInspectionMediaForDisplay(inspection, { mediaUrlCache })
+    )
+  );
 
   const reviewMap = await loadLatestReviewByInspectionIds(rows.map((row) => row.id));
 

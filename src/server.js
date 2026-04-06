@@ -13,8 +13,129 @@ const { execSync } = require('child_process');
 const net = require('net');
 
 const PORT = Number(process.env.PORT || 5000);
+const DB_STARTUP_MAX_ATTEMPTS = Number(process.env.DB_STARTUP_MAX_ATTEMPTS || 4);
+const DB_STARTUP_RETRY_DELAY_MS = Number(process.env.DB_STARTUP_RETRY_DELAY_MS || 2000);
 
 let server = null;
+
+const TRANSIENT_DB_ERROR_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
+
+const TRANSIENT_DB_ERROR_PATTERNS = [
+  /getaddrinfo (ENOTFOUND|EAI_AGAIN)/i,
+  /SequelizeConnection(?:Error|RefusedError|TimedOutError|AcquireTimeoutError)/i,
+  /could not connect to server/i,
+  /Connection terminated unexpectedly/i,
+  /ECONNREFUSED/i,
+  /ECONNRESET/i,
+  /ETIMEDOUT/i,
+];
+
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const collectErrorDetails = (error) => {
+  if (!error || typeof error !== 'object') {
+    return [];
+  }
+
+  const fields = ['message', 'name', 'code', 'stack'];
+  const details = fields
+    .map((field) => error[field])
+    .filter((value) => typeof value === 'string' && value.trim().length > 0);
+
+  ['stdout', 'stderr'].forEach((field) => {
+    if (error[field]) {
+      details.push(String(error[field]));
+    }
+  });
+
+  ['parent', 'original'].forEach((nestedField) => {
+    const nested = error[nestedField];
+    if (!nested || typeof nested !== 'object') {
+      return;
+    }
+
+    fields.forEach((field) => {
+      const value = nested[field];
+      if (typeof value === 'string' && value.trim().length > 0) {
+        details.push(value);
+      }
+    });
+  });
+
+  return details;
+};
+
+const isTransientDatabaseError = (error) => {
+  if (!error) {
+    return false;
+  }
+
+  const allCodes = [
+    error.code,
+    error.parent?.code,
+    error.original?.code,
+    error.errno,
+    error.parent?.errno,
+    error.original?.errno,
+  ]
+    .filter((value) => value !== undefined && value !== null)
+    .map((value) => String(value).toUpperCase());
+
+  if (allCodes.some((code) => TRANSIENT_DB_ERROR_CODES.has(code))) {
+    return true;
+  }
+
+  const detailText = collectErrorDetails(error).join('\n');
+  return TRANSIENT_DB_ERROR_PATTERNS.some((pattern) => pattern.test(detailText));
+};
+
+const getRetryConfig = () => {
+  const attempts = Number.isFinite(DB_STARTUP_MAX_ATTEMPTS) && DB_STARTUP_MAX_ATTEMPTS > 0
+    ? DB_STARTUP_MAX_ATTEMPTS
+    : 4;
+  const delayMs = Number.isFinite(DB_STARTUP_RETRY_DELAY_MS) && DB_STARTUP_RETRY_DELAY_MS > 0
+    ? DB_STARTUP_RETRY_DELAY_MS
+    : 2000;
+
+  return { attempts, delayMs };
+};
+
+const runWithTransientDbRetry = async (label, operation) => {
+  const { attempts, delayMs } = getRetryConfig();
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const shouldRetry = isTransientDatabaseError(error) && attempt < attempts;
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      // eslint-disable-next-line no-console
+      console.warn(
+        `${label} failed with a transient DB/network error (attempt ${attempt}/${attempts}): ${error.message}`
+      );
+      // eslint-disable-next-line no-console
+      console.warn(`Retrying ${label.toLowerCase()} in ${delayMs}ms...`);
+      await sleep(delayMs);
+    }
+  }
+
+  return null;
+};
 
 const shouldProbeRedis = () =>
   Boolean(
@@ -91,10 +212,26 @@ const runPendingMigrations = async () => {
   try {
     // eslint-disable-next-line no-console
     console.log('Checking and applying pending database migrations...');
-    execSync('npx sequelize-cli db:migrate', {
-      cwd: process.cwd(),
-      stdio: 'inherit',
-      env: process.env,
+    await runWithTransientDbRetry('Database migration check', async () => {
+      try {
+        const output = execSync('npx sequelize-cli db:migrate', {
+          cwd: process.cwd(),
+          stdio: 'pipe',
+          env: process.env,
+          encoding: 'utf8',
+        });
+        if (output) {
+          process.stdout.write(output);
+        }
+      } catch (error) {
+        if (error.stdout) {
+          process.stdout.write(String(error.stdout));
+        }
+        if (error.stderr) {
+          process.stderr.write(String(error.stderr));
+        }
+        throw error;
+      }
     });
     // eslint-disable-next-line no-console
     console.log('Database migrations are up to date');
@@ -140,7 +277,9 @@ const bootstrap = async () => {
   try {
     assertOpenAiAnalysisConfigured();
     await runPendingMigrations();
-    await sequelize.authenticate();
+    await runWithTransientDbRetry('Database connection', async () => {
+      await sequelize.authenticate();
+    });
     // eslint-disable-next-line no-console
     console.log('Database connection established');
     await backfillToiletQrOnBoot();

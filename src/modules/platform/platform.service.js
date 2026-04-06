@@ -11,7 +11,10 @@ const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const {
   getQrImageUrl,
+  getFeedbackQrImageUrl,
+  getPublicFeedbackUrl,
   ensureQrImageForToilet,
+  ensureAllQrImagesForToilet,
   ensureQrImagesForToilets,
 } = require('./toiletQr.service');
 
@@ -197,7 +200,11 @@ const mapUnitRow = (row) => ({
   toiletBlockId: row.toilet_block_id,
   code: row.code,
   qrCode: row.qr_code || row.code,
+  appQrCode: row.qr_code || row.code,
   qrImageUrl: getQrImageUrl(row.id),
+  appQrImageUrl: getQrImageUrl(row.id),
+  feedbackQrImageUrl: getFeedbackQrImageUrl(row.id),
+  publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: row.id }),
   unitType: row.unit_type,
   status: row.status,
   sectorCode:
@@ -334,6 +341,11 @@ const resolveUnitByQr = async (req) => {
   await ensureQrImageForToilet({
     toiletUnitId: best.id,
     qrCodeValue: best.qr_code || best.code,
+  }).catch(() => null);
+  await ensureQrImageForToilet({
+    toiletUnitId: best.id,
+    qrCodeValue: getPublicFeedbackUrl({ toiletUnitId: best.id }),
+    variant: 'feedback',
   }).catch(() => null);
   return mapUnitRow(best);
 };
@@ -596,7 +608,11 @@ const getFacilityById = async (req) => {
       id: unit.id,
       code: unit.code,
       qrCode: unit.qr_code || unit.code,
+      appQrCode: unit.qr_code || unit.code,
       qrImageUrl: getQrImageUrl(unit.id),
+      appQrImageUrl: getQrImageUrl(unit.id),
+      feedbackQrImageUrl: getFeedbackQrImageUrl(unit.id),
+      publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: unit.id }),
       unitType: unit.unit_type,
       status: unit.status,
       toiletBlockId: unit.toilet_block_id,
@@ -795,9 +811,10 @@ const createUnit = async (req) => {
     tenantId: facility.tenant_id,
   });
 
-  await ensureQrImageForToilet({
+  const qrResult = await ensureAllQrImagesForToilet({
     toiletUnitId: row.id,
-    qrCodeValue: row.qr_code || row.code,
+    appQrCodeValue: row.qr_code || row.code,
+    feedbackQrValue: getPublicFeedbackUrl({ toiletUnitId: row.id }),
   });
 
   return {
@@ -806,7 +823,11 @@ const createUnit = async (req) => {
     toiletBlockId: row.toilet_block_id,
     code: row.code,
     qrCode: row.qr_code || row.code,
-    qrImageUrl: getQrImageUrl(row.id),
+    appQrCode: row.qr_code || row.code,
+    qrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(row.id),
+    appQrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(row.id),
+    feedbackQrImageUrl: qrResult?.feedbackQrImageUrl || getFeedbackQrImageUrl(row.id),
+    publicFeedbackUrl: qrResult?.publicFeedbackUrl || getPublicFeedbackUrl({ toiletUnitId: row.id }),
     unitType: row.unit_type,
     status: row.status,
     sectorCode: row.sector_code || null,

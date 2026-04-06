@@ -1,4 +1,5 @@
 const { isBlank, isUuid, parsePositiveInteger } = require('../../utils/validators');
+const { collectRoleScopeValidationErrors } = require('../../core/rbac/roleScopeRules');
 
 const ALLOWED_USER_STATUSES = new Set(['active', 'inactive', 'locked']);
 const ALLOWED_ASSIGNMENT_LEVELS = new Set(['tenant', 'geography', 'facility', 'toilet_unit']);
@@ -97,6 +98,15 @@ const validateCreateUser = (req) => {
   validateUuidField(req.body.tenantId, 'tenantId', errors);
   validateUuidField(req.body.geographyId, 'geographyId', errors);
   validateAssignments(req.body.assignments, errors);
+  if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
+    errors.push(
+      ...collectRoleScopeValidationErrors({
+        roleCodes: req.body.roleCodes,
+        geographyId: req.body.geographyId || null,
+        assignments: req.body.assignments || [],
+      })
+    );
+  }
   return errors;
 };
 
@@ -127,6 +137,15 @@ const validatePatchUser = (req) => {
   validateUuidField(req.body.tenantId, 'tenantId', errors);
   validateUuidField(req.body.geographyId, 'geographyId', errors);
   validateAssignments(req.body.assignments, errors);
+  if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
+    errors.push(
+      ...collectRoleScopeValidationErrors({
+        roleCodes: req.body.roleCodes,
+        geographyId: req.body.geographyId || null,
+        assignments: req.body.assignments || [],
+      })
+    );
+  }
   return errors;
 };
 
