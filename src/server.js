@@ -8,7 +8,7 @@ const { startLiveRedisBridge, closeLiveRedisBridge } = require('./core/live/live
 const { broadcastLocal } = require('./core/live/registerLiveForwarders');
 const { closeQueues, isRedisEnabled } = require('./core/queue/queueManager');
 const { ensureQrImagesForToilets } = require('./modules/platform/toiletQr.service');
-const { assertOpenAiAnalysisConfigured } = require('./modules/analysis/openaiAnalysis.service');
+const { getOpenAiAnalysisConfigState } = require('./modules/analysis/openaiAnalysis.service');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -253,6 +253,42 @@ const shouldAutoBackfillQrOnBoot = () => {
   return true;
 };
 
+const shouldFailOnAnalysisConfigError = () => {
+  const configured = String(process.env.ANALYSIS_BOOT_STRICT || '').trim().toLowerCase();
+  if (configured === 'true') return true;
+  if (configured === 'false') return false;
+  return false;
+};
+
+const isAnalysisTriggerOnUploadEnabled = () =>
+  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').trim().toLowerCase() === 'true';
+
+const validateAnalysisConfigAtBoot = () => {
+  const state = getOpenAiAnalysisConfigState();
+  if (state.ok) {
+    return;
+  }
+
+  const strictMode = shouldFailOnAnalysisConfigError();
+  const message =
+    `AI analysis configuration is invalid (${state.code || 'UNKNOWN'}): ${state.reason || 'Unknown reason'}.`;
+
+  if (strictMode) {
+    const error = new Error(`${message} Set ANALYSIS_BOOT_STRICT=false to continue boot without AI analysis.`);
+    error.code = state.code || 'AI_BOOT_CONFIG_INVALID';
+    throw error;
+  }
+
+  // eslint-disable-next-line no-console
+  console.warn(`${message} Continuing boot with AI analysis disabled.`);
+
+  if (isAnalysisTriggerOnUploadEnabled()) {
+    process.env.ANALYSIS_TRIGGER_ON_UPLOAD = 'false';
+    // eslint-disable-next-line no-console
+    console.warn('ANALYSIS_TRIGGER_ON_UPLOAD has been forced to false for this process.');
+  }
+};
+
 const backfillToiletQrOnBoot = async () => {
   if (!shouldAutoBackfillQrOnBoot()) {
     return;
@@ -275,7 +311,7 @@ const backfillToiletQrOnBoot = async () => {
 
 const bootstrap = async () => {
   try {
-    assertOpenAiAnalysisConfigured();
+    validateAnalysisConfigAtBoot();
     await runPendingMigrations();
     await runWithTransientDbRetry('Database connection', async () => {
       await sequelize.authenticate();

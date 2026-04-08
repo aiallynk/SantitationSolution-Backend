@@ -26,14 +26,17 @@ const normalizeOriginValue = (value) => {
   return raw;
 };
 
+const normalizeOriginToken = (value) =>
+  normalizeOriginValue(String(value || '').replace(/^['"]|['"]$/g, ''));
+
 const resolveAllowedOrigins = () => {
   const raw = String(process.env.CORS_ORIGIN || '').trim();
   if (!raw) {
     return null;
   }
   return raw
-    .split(',')
-    .map((entry) => normalizeOriginValue(entry))
+    .split(/[\n,;]/)
+    .map((entry) => normalizeOriginToken(entry))
     .filter(Boolean);
 };
 
@@ -90,6 +93,17 @@ app.use(
       return callback(null, false);
     },
     credentials: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Authorization',
+      'Content-Type',
+      'X-Requested-With',
+      'X-Request-Id',
+    ],
+    exposedHeaders: ['X-Request-Id'],
+    optionsSuccessStatus: 204,
+    preflightContinue: false,
+    maxAge: 86400,
   })
 );
 app.use(apiRateLimit);
