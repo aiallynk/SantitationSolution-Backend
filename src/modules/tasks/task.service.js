@@ -2,12 +2,16 @@ const { InspectionTask, Facility, ToiletUnit } = require('../../models');
 const AppError = require('../../core/errors/AppError');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
+const {
+  applyTenantScope,
+  applyFacilityScope,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
 const scopedWhere = (req, extra = {}) => {
-  const where = { ...extra };
-  if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
-  }
+  let where = { ...extra };
+  where = applyTenantScope(where, req);
+  where = applyFacilityScope(where, req);
   return where;
 };
 
@@ -57,6 +61,9 @@ const listTasks = async (req) => {
     where.assigned_to_user_id = req.query.assignedToUserId;
   }
   if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
     where.facility_id = req.query.facilityId;
   }
 
@@ -92,6 +99,9 @@ const getTaskById = async (req) => {
     throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && task.tenant_id !== req.user.tenantId) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, task.facility_id || null)) {
     throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
 
@@ -141,6 +151,9 @@ const createTask = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 
   let toiletUnit = null;
   if (req.body.toiletUnitId) {
@@ -184,6 +197,9 @@ const startTask = async (req) => {
   if (!req.user.isSuperAdmin && task.tenant_id !== req.user.tenantId) {
     throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, task.facility_id || null)) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   if (task.assigned_to_user_id !== req.user.id && !req.user.isSuperAdmin) {
     throw new AppError('Task can only be started by assigned user', 403, {
       code: 'TASK_NOT_ASSIGNEE',
@@ -213,6 +229,9 @@ const completeTask = async (req) => {
     throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && task.tenant_id !== req.user.tenantId) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, task.facility_id || null)) {
     throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   if (task.assigned_to_user_id !== req.user.id && !req.user.isSuperAdmin) {

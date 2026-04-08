@@ -3,6 +3,7 @@ const { collectRoleScopeValidationErrors } = require('../../core/rbac/roleScopeR
 
 const ALLOWED_USER_STATUSES = new Set(['active', 'inactive', 'locked']);
 const ALLOWED_ASSIGNMENT_LEVELS = new Set(['tenant', 'geography', 'facility', 'toilet_unit']);
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
 
 const validateUuidField = (value, field, errors) => {
   if (value === undefined || value === null || value === '') return;
@@ -80,6 +81,9 @@ const validateCreateUser = (req) => {
   const errors = [];
   if (isBlank(req.body.fullName)) errors.push('fullName is required');
   if (isBlank(req.body.email)) errors.push('email is required');
+  if (!isBlank(req.body.email) && !isLikelyEmail(req.body.email)) {
+    errors.push('email must be a valid email address');
+  }
   if (isBlank(req.body.password)) errors.push('password is required');
   if (!isBlank(req.body.password) && String(req.body.password).length < 8) {
     errors.push('password must be at least 8 characters');
@@ -112,6 +116,13 @@ const validateCreateUser = (req) => {
 
 const validatePatchUser = (req) => {
   const errors = [];
+  if (req.body.email !== undefined) {
+    if (isBlank(req.body.email)) {
+      errors.push('email cannot be blank when provided');
+    } else if (!isLikelyEmail(req.body.email)) {
+      errors.push('email must be a valid email address');
+    }
+  }
   if (req.body.password && String(req.body.password).length < 8) {
     errors.push('password must be at least 8 characters');
   }

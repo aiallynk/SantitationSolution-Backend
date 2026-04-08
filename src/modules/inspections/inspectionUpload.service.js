@@ -11,12 +11,14 @@ const {
   getPresignedPutObjectUrl,
   headObjectFromS3,
   buildObjectUrl,
+  getS3EncryptionPolicy,
 } = require('../media/s3.service');
 const { resolveMediaPairUrls } = require('../media/mediaUrl.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { recomputeInspectionAggregates } = require('./inspectionEvidence.service');
+const { isFacilityInScope } = require('../../core/rbac/scopeWhere');
 
 const ALLOWED_CAPTURE_STAGE = new Set(['before', 'after', 'evidence']);
 const ALLOWED_CONTENT_TYPES = new Set([
@@ -42,6 +44,55 @@ const normalizeEtag = (value) => {
   const normalized = String(value || '').trim();
   if (!normalized) return null;
   return normalized.replace(/^"+|"+$/g, '');
+};
+
+const normalizeSseAlgorithm = (value) => {
+  const normalized = String(value || '').trim();
+  if (!normalized) return null;
+  if (normalized.toUpperCase() === 'AES256') return 'AES256';
+  if (normalized.toLowerCase() === 'aws:kms') return 'aws:kms';
+  return normalized;
+};
+
+const isS3ObjectEncryptionCompliant = ({ policy, head }) => {
+  if (!policy?.enabled) {
+    return true;
+  }
+
+  const expectedAlgorithm = normalizeSseAlgorithm(policy.algorithm);
+  if (!expectedAlgorithm) {
+    return true;
+  }
+
+  const observedAlgorithm = normalizeSseAlgorithm(head?.serverSideEncryption);
+  if (!observedAlgorithm || observedAlgorithm !== expectedAlgorithm) {
+    return false;
+  }
+
+  if (expectedAlgorithm === 'aws:kms' && policy.kmsKeyId) {
+    const expectedKmsKeyId = String(policy.kmsKeyId || '').trim();
+    const observedKmsKeyId = String(head?.sseKmsKeyId || '').trim();
+    return observedKmsKeyId === expectedKmsKeyId;
+  }
+
+  return true;
+};
+
+const logInspectionUploadEvent = (req, event, payload = {}) => {
+  try {
+    const entry = {
+      event,
+      requestId: req?.requestId || null,
+      userId: req?.user?.id || null,
+      inspectionId: req?.params?.id || null,
+      mediaId: req?.params?.mediaId || null,
+      ...payload,
+    };
+    // eslint-disable-next-line no-console
+    console.info('[inspection-upload]', JSON.stringify(entry));
+  } catch (_) {
+    // no-op logging fallback
+  }
 };
 
 const isCompatibleContentType = (expected, actual) => {
@@ -93,6 +144,9 @@ const assertInspectionScope = async (req) => {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, inspection.facility_id || null)) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return inspection;
@@ -475,10 +529,47 @@ const confirmUpload = async (req) => {
     throw new AppError('Upload object key mismatch', 409, { code: 'UPLOAD_SESSION_INVALID' });
   }
 
+  logInspectionUploadEvent(req, 'upload.confirm.start', {
+    objectKey,
+    clientImageId: clientImageId || media.client_image_id || null,
+  });
+
   const head = await headObjectFromS3(objectKey);
   if (!head) {
     throw new AppError('Uploaded object not found in storage', 404, {
       code: 'OBJECT_NOT_FOUND',
+    });
+  }
+
+  logInspectionUploadEvent(req, 'upload.confirm.object_head', {
+    objectKey,
+    contentLength: Number(head.contentLength || 0),
+    contentType: head.contentType || null,
+    eTag: head.eTag || null,
+    serverSideEncryption: normalizeSseAlgorithm(head.serverSideEncryption),
+    sseKmsKeyId: head.sseKmsKeyId || null,
+  });
+
+  const encryptionPolicy = getS3EncryptionPolicy();
+  if (!isS3ObjectEncryptionCompliant({ policy: encryptionPolicy, head })) {
+    const expectedAlgorithm = normalizeSseAlgorithm(encryptionPolicy.algorithm);
+    const observedAlgorithm = normalizeSseAlgorithm(head.serverSideEncryption);
+    logInspectionUploadEvent(req, 'upload.confirm.encryption_mismatch', {
+      objectKey,
+      expectedAlgorithm,
+      expectedKmsKeyId: encryptionPolicy.kmsKeyId || null,
+      observedAlgorithm,
+      observedKmsKeyId: head.sseKmsKeyId || null,
+    });
+
+    throw new AppError('Uploaded object encryption does not match policy', 409, {
+      code: 'UPLOAD_ENCRYPTION_MISMATCH',
+      details: {
+        expectedAlgorithm,
+        expectedKmsKeyId: encryptionPolicy.kmsKeyId || null,
+        observedAlgorithm,
+        observedKmsKeyId: head.sseKmsKeyId || null,
+      },
     });
   }
 
@@ -663,6 +754,12 @@ const confirmUpload = async (req) => {
     fileUrl: media.file_url,
     thumbnailUrl: media.thumbnail_url || media.file_url,
     storageKey: media.storage_key || null,
+  });
+
+  logInspectionUploadEvent(req, 'upload.confirm.success', {
+    objectKey,
+    mediaId: media.id,
+    aiQueued: Boolean(analysisQueue?.queued),
   });
 
   return {

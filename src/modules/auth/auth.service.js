@@ -9,7 +9,10 @@ const {
   LoginSession,
   PasswordResetToken,
   Tenant,
+  WorkerAssignment,
 } = require('../../models');
+const { resolveRoleProfile } = require('../../core/rbac/accessProfiles');
+const { resolveEffectiveScope, uniqueIds } = require('../../core/rbac/scopeResolver');
 const {
   signAccessToken,
   signRefreshToken,
@@ -33,6 +36,22 @@ const includeRolePermission = [
   {
     model: Tenant,
     attributes: ['id', 'name', 'code', 'status'],
+  },
+  {
+    model: WorkerAssignment,
+    as: 'assignments',
+    required: false,
+    where: { status: 'active' },
+    attributes: [
+      'id',
+      'tenant_id',
+      'geography_id',
+      'facility_id',
+      'toilet_unit_id',
+      'assignment_level',
+      'assignment_role',
+      'status',
+    ],
   },
 ];
 
@@ -136,8 +155,30 @@ const deriveScopedAuth = (user, activeTenantId) => {
   };
 };
 
-const mapUser = ({ user, activeTenantId }) => {
+const mapUser = async ({ user, activeTenantId }) => {
   const scoped = deriveScopedAuth(user, activeTenantId);
+  const roleProfile = resolveRoleProfile({
+    role: scoped.roleCodes[0] || null,
+    roleCodes: scoped.roleCodes,
+  });
+  const activeAssignments = (Array.isArray(user.assignments) ? user.assignments : []).filter(
+    (row) => row.status === 'active',
+  );
+  const scope = await resolveEffectiveScope({
+    roleCode: scoped.roleCodes[0] || null,
+    roleProfile,
+    memberships: scoped.activeMemberships,
+    assignments: activeAssignments,
+    activeTenantId,
+    userId: user.id,
+    fallbackGeographyId: user.geography_id || null,
+  });
+  const assignmentFacilityIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.facility_id || assignment.facilityId || null),
+  );
+  const assignmentGeographyIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.geography_id || assignment.geographyId || null),
+  );
 
   return {
     id: user.id,
@@ -152,6 +193,20 @@ const mapUser = ({ user, activeTenantId }) => {
     roleCodes: scoped.roleCodes,
     allRoleCodes: scoped.allRoleCodes,
     permissions: scoped.permissionCodes,
+    roleType: roleProfile.roleType,
+    scopeLevel: scope.scopeLevel,
+    scopeId: scope.scopeId,
+    scopeIds: scope.scopeIds,
+    scopeGeographyIds: scope.scopeGeographyIds,
+    scopeFacilityIds: scope.scopeFacilityIds,
+    assignmentFacilityIds,
+    assignmentGeographyIds,
+    organizationId: activeTenantId,
+    allowedRoutes: roleProfile.allowedRoutes,
+    allowedActions: roleProfile.allowedActions,
+    defaultRoute: roleProfile.defaultRoute,
+    webEnabled: roleProfile.webEnabled,
+    mobileOnly: roleProfile.mobileOnly,
     tenantMemberships: scoped.memberships,
     activeMemberships: scoped.activeMemberships,
     activeTenant: user.Tenant
@@ -187,17 +242,31 @@ const createSession = async (user, refreshToken, req) => {
   return sessionId;
 };
 
-const buildAuthPayload = ({ user, accessToken, refreshToken, activeTenantId }) => {
-  const mapped = mapUser({ user, activeTenantId });
+const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantId }) => {
+  const mapped = await mapUser({ user, activeTenantId });
   return {
     accessToken,
     refreshToken,
     tokenType: 'Bearer',
     expiresAt: decodeTokenExpiry(accessToken)?.toISOString() || null,
     role: mapped.roleCodes[0] || null,
+    roleType: mapped.roleType,
     roleCodes: mapped.roleCodes,
+    allRoleCodes: mapped.allRoleCodes,
     permissions: mapped.permissions,
+    scopeLevel: mapped.scopeLevel,
+    scopeId: mapped.scopeId,
+    scopeIds: mapped.scopeIds,
+    scopeGeographyIds: mapped.scopeGeographyIds,
+    scopeFacilityIds: mapped.scopeFacilityIds,
+    organizationId: mapped.organizationId,
+    allowedRoutes: mapped.allowedRoutes,
+    allowedActions: mapped.allowedActions,
+    defaultRoute: mapped.defaultRoute,
+    webEnabled: mapped.webEnabled,
+    mobileOnly: mapped.mobileOnly,
     tenantMemberships: mapped.tenantMemberships,
+    activeMemberships: mapped.activeMemberships,
     activeTenantId,
     user: mapped,
   };

@@ -119,6 +119,13 @@ const resolveMediaBuffer = async (media) => {
     }
   }
 
+  if (!preferLocal && !storageKey && /^s3:\/\//i.test(fileUrl)) {
+    const presigned = await getPresignedGetObjectUrl({ storageKey: fileUrl });
+    if (presigned) {
+      return fetchRemoteImage(presigned);
+    }
+  }
+
   if (fileUrl) {
     if (/^https?:\/\//i.test(fileUrl)) {
       return fetchRemoteImage(fileUrl);

@@ -864,14 +864,135 @@ const runInspectionAnalysis = async ({
     }
   }
 
+  const failedImageIds = imageFailures.map((item) => item.imageId);
+  const failureMessage =
+    imageFailures.length > 0
+      ? imageFailures
+          .map((item) => `${item.imageId}: ${item.error}`)
+          .join(' | ')
+          .slice(0, 2000)
+      : 'AI analysis could not process any inspection images';
+  const processingMs = Date.now() - startedAt;
+  const processedAt = new Date();
+
   if (imageResults.length === 0) {
-    throw new AppError('AI analysis failed for all inspection images', 500, {
-      code: 'AI_ANALYSIS_ALL_IMAGES_FAILED',
+    const aggregate = await recomputeInspectionAggregates(inspection.id, {
+      updateToilet: true,
+    });
+    const refreshedInspection = await Inspection.findByPk(inspection.id);
+    const pipelineStatus =
+      refreshedInspection?.pipeline_status ||
+      aggregate?.pipelineStatus ||
+      'needs_review';
+    const processingStatus =
+      refreshedInspection?.processing_status ||
+      aggregate?.processingStatus ||
+      'completed';
+    const overallStatus =
+      refreshedInspection?.overall_status || inspection.overall_status || null;
+
+    await inspection.update({
+      processing_status: processingStatus,
+      pipeline_status: pipelineStatus,
+      submitted_at: inspection.submitted_at || processedAt,
+      review_required: true,
+      last_processing_error: failureMessage,
+      updated_at: processedAt,
+    });
+
+    if (submissionId) {
+      const submission = await InspectionSubmission.findByPk(submissionId);
+      if (submission) {
+        await submission.update({
+          status:
+            refreshedInspection?.status ||
+            aggregate?.status ||
+            pipelineStatus,
+          updated_at: new Date(),
+        });
+      }
+    }
+
+    if (processingJob) {
+      await processingJob.update({
+        status: 'succeeded',
+        completed_at: processedAt,
+        duration_ms: processingMs,
+        image_id: imageId || processingJob.image_id || null,
+        job_type: String(jobType || 'AI_ANALYSIS'),
+        last_error: failureMessage,
+        result: {
+          analysisId: null,
+          type: String(jobType || 'AI_ANALYSIS'),
+          imageId: imageId || null,
+          analyzedImageIds,
+          failedImageIds,
+          pipelineStatus,
+          overallStatus,
+          confidenceScore: null,
+          inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
+        },
+        updated_at: new Date(),
+      });
+    }
+
+    await InspectionEvent.create({
+      tenant_id: inspection.tenant_id,
+      inspection_id: inspection.id,
+      toilet_id: inspection.toilet_unit_id || null,
+      image_id: imageId || null,
+      event_type: 'analysis.completed',
+      event_status: pipelineStatus,
+      source: 'worker',
+      payload: {
+        analysisId: null,
+        type: String(jobType || 'AI_ANALYSIS'),
+        imageId: imageId || null,
+        analyzedImageIds,
+        failedImageIds,
+        queueJobId: queueJobId || null,
+        submissionId: submissionId || null,
+        confidenceScore: null,
+        reviewRequired: true,
+        severityLabel: null,
+        processingMs,
+        aggregate,
+      },
+      occurred_at: new Date(),
+    });
+
+    eventBus.emit(EVENTS.INSPECTION_UPDATED, {
+      inspectionId: inspection.id,
+      tenantId: inspection.tenant_id,
+      processingStatus,
+      pipelineStatus,
+      overallStatus,
+      reviewRequired: true,
+      inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
+    });
+
+    await createAuditLog({
+      req,
+      actorUserId: req?.user?.id || inspection.inspector_user_id,
+      tenantId: inspection.tenant_id,
+      action: 'analysis.inspection_run',
+      entityType: 'inspection',
+      entityId: inspection.id,
       details: {
-        inspectionId: inspection.id,
-        imageFailures,
+        analysisId: null,
+        type: String(jobType || 'AI_ANALYSIS'),
+        imageId: imageId || null,
+        analyzedImageIds,
+        failedImageIds,
+        overallStatus,
+        confidenceScore: null,
+        reviewRequired: true,
+        inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
+        processingMs,
       },
     });
+
+    return null;
   }
 
   const aggregate = await recomputeInspectionAggregates(inspection.id, {
@@ -883,8 +1004,6 @@ const runInspectionAnalysis = async ({
     imageResults,
     aggregate,
   });
-  const processingMs = Date.now() - startedAt;
-  const processedAt = new Date();
   result.processingMs = processingMs;
 
   const analysis = await AiAnalysisResult.create({
@@ -917,13 +1036,7 @@ const runInspectionAnalysis = async ({
     submitted_at: inspection.submitted_at || processedAt,
     overall_status: result.overallStatus,
     review_required: Boolean(refreshedInspection?.review_required || result.reviewRequired),
-    last_processing_error:
-      imageFailures.length > 0
-        ? imageFailures
-            .map((item) => `${item.imageId}: ${item.error}`)
-            .join(' | ')
-            .slice(0, 2000)
-        : null,
+    last_processing_error: imageFailures.length > 0 ? failureMessage : null,
     updated_at: processedAt,
   });
 
@@ -946,16 +1059,13 @@ const runInspectionAnalysis = async ({
       duration_ms: processingMs,
       image_id: imageId || processingJob.image_id || null,
       job_type: String(jobType || 'AI_ANALYSIS'),
-      last_error:
-        imageFailures.length > 0
-          ? imageFailures.map((item) => `${item.imageId}: ${item.error}`).join(' | ').slice(0, 2000)
-          : null,
+      last_error: imageFailures.length > 0 ? failureMessage : null,
       result: {
         analysisId: analysis.id,
         type: String(jobType || 'AI_ANALYSIS'),
         imageId: imageId || null,
         analyzedImageIds,
-        failedImageIds: imageFailures.map((item) => item.imageId),
+        failedImageIds,
         pipelineStatus,
         overallStatus: result.overallStatus,
         confidenceScore: result.confidenceScore,
@@ -978,7 +1088,7 @@ const runInspectionAnalysis = async ({
       type: String(jobType || 'AI_ANALYSIS'),
       imageId: imageId || null,
       analyzedImageIds,
-      failedImageIds: imageFailures.map((item) => item.imageId),
+      failedImageIds,
       queueJobId: queueJobId || null,
       submissionId: submissionId || null,
       confidenceScore: result.confidenceScore,
@@ -1055,7 +1165,7 @@ const runInspectionAnalysis = async ({
       type: String(jobType || 'AI_ANALYSIS'),
       imageId: imageId || null,
       analyzedImageIds,
-      failedImageIds: imageFailures.map((item) => item.imageId),
+      failedImageIds,
       overallStatus: result.overallStatus,
       confidenceScore: result.confidenceScore,
       reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),

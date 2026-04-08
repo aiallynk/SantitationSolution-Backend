@@ -18,6 +18,11 @@ const { uploadImage, removeTempFile } = require('../media/storage.service');
 const { resolveMediaUrl } = require('../media/mediaUrl.service');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const { getPublicFeedbackUrl } = require('../platform/toiletQr.service');
+const {
+  applyTenantScope,
+  applyFacilityScope,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
 const allowedPriorities = new Set(['low', 'medium', 'high', 'critical']);
 const allowedSourceChannels = new Set([
@@ -171,6 +176,9 @@ const resolveComplaintWithScope = async (req, complaintId, options = {}) => {
   if (!req.user.isSuperAdmin && complaint.tenant_id !== req.user.tenantId) {
     throw new AppError('Complaint out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, complaint.facility_id || null)) {
+    throw new AppError('Complaint out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   return complaint;
 };
 
@@ -223,6 +231,9 @@ const ensureFacilityScope = (req, facility) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('facilityId is out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('facilityId is out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 };
 
 const ensureToiletScope = (req, toiletUnit) => {
@@ -230,17 +241,24 @@ const ensureToiletScope = (req, toiletUnit) => {
   if (!req.user.isSuperAdmin && toiletUnit.Facility?.tenant_id !== req.user.tenantId) {
     throw new AppError('toiletUnitId is out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, toiletUnit.Facility?.id || toiletUnit.facility_id || null)) {
+    throw new AppError('toiletUnitId is out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 };
 
 const listComplaints = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  const where = {};
-  if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
-  }
+  let where = {};
+  where = applyTenantScope(where, req);
+  where = applyFacilityScope(where, req);
   if (req.query.status) where.status = String(req.query.status).toLowerCase();
   if (req.query.priority) where.priority = normalizePriority(req.query.priority);
-  if (req.query.facilityId) where.facility_id = req.query.facilityId;
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('facilityId is out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.facility_id = req.query.facilityId;
+  }
   if (req.query.toiletUnitId) where.toilet_unit_id = req.query.toiletUnitId;
   if (req.query.sourceChannel) {
     where.source_channel = normalizeSourceChannel(req.query.sourceChannel, 'field_app');

@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
 const AppError = require('../errors/AppError');
-const { PlatformUser, Role, Permission } = require('../../models');
+const { PlatformUser, Role, Permission, WorkerAssignment } = require('../../models');
+const { resolveRoleProfile } = require('../rbac/accessProfiles');
+const { resolveEffectiveScope, uniqueIds } = require('../rbac/scopeResolver');
 
 const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET || 'change-me-access-secret';
 // Legacy compatibility note:
@@ -29,6 +31,22 @@ const fetchUserWithRoles = async (userId) => {
           attributes: ['tenant_id', 'geography_id'],
         },
         include: [{ model: Permission }],
+      },
+      {
+        model: WorkerAssignment,
+        as: 'assignments',
+        required: false,
+        where: { status: 'active' },
+        attributes: [
+          'id',
+          'tenant_id',
+          'geography_id',
+          'facility_id',
+          'toilet_unit_id',
+          'assignment_level',
+          'assignment_role',
+          'status',
+        ],
       },
     ],
   });
@@ -72,7 +90,7 @@ const pickActiveTenantId = (req, user, memberships) => {
   return requested;
 };
 
-const buildAuthContext = ({ req, user }) => {
+const buildAuthContext = async ({ req, user }) => {
   const allRoleCodes = [...new Set((user.Roles || []).map((role) => role.code))];
   const memberships = normalizeMemberships(user);
   const isSuperAdmin = allRoleCodes.includes('super_admin');
@@ -96,6 +114,29 @@ const buildAuthContext = ({ req, user }) => {
     }
   }
 
+  const roleProfile = resolveRoleProfile({
+    role: roleCodes[0] || null,
+    roleCodes,
+  });
+  const activeAssignments = (Array.isArray(user.assignments) ? user.assignments : []).filter(
+    (row) => row.status === 'active',
+  );
+  const assignmentFacilityIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.facility_id || assignment.facilityId || null),
+  );
+  const assignmentGeographyIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.geography_id || assignment.geographyId || null),
+  );
+  const scope = await resolveEffectiveScope({
+    roleCode: roleCodes[0] || null,
+    roleProfile,
+    memberships: activeMemberships,
+    assignments: activeAssignments,
+    activeTenantId,
+    userId: user.id,
+    fallbackGeographyId: user.geography_id || null,
+  });
+
   return {
     id: user.id,
     tenantId: activeTenantId,
@@ -108,10 +149,25 @@ const buildAuthContext = ({ req, user }) => {
     allRoleCodes,
     roleCodes,
     permissionCodes: [...permissionCodes],
+    permissions: [...permissionCodes],
     memberships,
     activeMemberships,
     activeTenantId,
     isSuperAdmin,
+    roleType: roleProfile.roleType,
+    defaultRoute: roleProfile.defaultRoute,
+    allowedRoutes: roleProfile.allowedRoutes,
+    allowedActions: roleProfile.allowedActions,
+    webEnabled: roleProfile.webEnabled,
+    mobileOnly: roleProfile.mobileOnly,
+    organizationId: activeTenantId,
+    scopeLevel: scope.scopeLevel,
+    scopeId: scope.scopeId,
+    scopeIds: scope.scopeIds,
+    scopeGeographyIds: scope.scopeGeographyIds,
+    scopeFacilityIds: scope.scopeFacilityIds,
+    assignmentFacilityIds,
+    assignmentGeographyIds,
   };
 };
 
@@ -200,6 +256,22 @@ const requireAnyPermissions = (...permissionCodes) => {
   };
 };
 
+const requireAction = (actionCode) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (!actionCode || req.user.isSuperAdmin) {
+      return next();
+    }
+    const allowedActions = new Set(req.user.allowedActions || []);
+    if (!allowedActions.has(actionCode)) {
+      return next(new AppError('Insufficient action scope', 403, { code: 'ACTION_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
 const requireTenantContext = () => {
   return (req, res, next) => {
     if (!req.user) {
@@ -244,6 +316,7 @@ module.exports = {
   requireRoles,
   requirePermissions,
   requireAnyPermissions,
+  requireAction,
   requireTenantContext,
   applyTenantFilter,
   tenantScoped,

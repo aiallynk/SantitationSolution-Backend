@@ -14,15 +14,39 @@ const {
   DashboardAggregate,
   PlatformUser,
 } = require('../../models');
+const {
+  EMPTY_SCOPE_UUID,
+  applyTenantScope,
+  applyGeographyScope,
+  applyFacilityScope,
+  uniqueIds,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
-const scopedWhere = (req, key = 'tenant_id') => {
-  if (req.user.isSuperAdmin) {
-    if (req.query.tenantId) {
-      return { [key]: req.query.tenantId };
-    }
-    return {};
+const scopedTenantWhere = (req, where = {}, key = 'tenant_id') => {
+  return applyTenantScope(where, req, key);
+};
+
+const scopedFacilityWhere = (req, where = {}, facilityKey = 'facility_id', tenantKey = 'tenant_id') => {
+  let next = scopedTenantWhere(req, where, tenantKey);
+  next = applyFacilityScope(next, req, facilityKey);
+  return next;
+};
+
+const scopedFacilityEntityWhere = (req, where = {}) => {
+  let next = scopedTenantWhere(req, where);
+  next = applyGeographyScope(next, req, 'geography_id');
+
+  if (req.user?.isSuperAdmin) return next;
+
+  const facilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
+  if (facilityIds.length > 0) {
+    next.id = { [Op.in]: facilityIds };
+  } else if (req.user?.scopeLevel === 'facility') {
+    next.id = EMPTY_SCOPE_UUID;
   }
-  return { [key]: req.user.tenantId };
+
+  return next;
 };
 
 const toNumber = (value, fallback = 0) => {
@@ -31,12 +55,14 @@ const toNumber = (value, fallback = 0) => {
 };
 
 const getOverview = async (req) => {
-  const tenantFilter = scopedWhere(req);
-  const inspectionTenantFilter = scopedWhere(req);
-  const alertTenantFilter = scopedWhere(req);
-  const taskTenantFilter = scopedWhere(req);
-  const complaintTenantFilter = scopedWhere(req);
-  const sensorTenantFilter = scopedWhere(req);
+  const tenantFilter = scopedTenantWhere(req);
+  const facilityEntityFilter = scopedFacilityEntityWhere(req);
+  const inspectionTenantFilter = scopedFacilityWhere(req);
+  const alertTenantFilter = scopedFacilityWhere(req);
+  const taskTenantFilter = scopedFacilityWhere(req);
+  const complaintTenantFilter = scopedFacilityWhere(req);
+  const sensorTenantFilter = scopedFacilityWhere(req);
+  const userScopeFilter = applyGeographyScope({ ...tenantFilter }, req, 'geography_id');
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -52,7 +78,7 @@ const getOverview = async (req) => {
     tasksInProgress,
     usersActive,
   ] = await Promise.all([
-    Facility.count({ where: tenantFilter }),
+    Facility.count({ where: facilityEntityFilter }),
     Alert.count({ where: { ...alertTenantFilter, status: { [Op.in]: ['open', 'acknowledged'] } } }),
     Inspection.count({
       where: {
@@ -76,7 +102,7 @@ const getOverview = async (req) => {
     SensorDevice.count({ where: sensorTenantFilter }),
     Complaint.count({ where: { ...complaintTenantFilter, status: { [Op.ne]: 'resolved' } } }),
     InspectionTask.count({ where: { ...taskTenantFilter, status: 'in_progress' } }),
-    PlatformUser.count({ where: { ...tenantFilter, status: 'active' } }),
+    PlatformUser.count({ where: { ...userScopeFilter, status: 'active' } }),
   ]);
 
   return {
@@ -99,7 +125,7 @@ const getOverview = async (req) => {
 
 const getMap = async (req) => {
   const facilities = await Facility.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityEntityWhere(req),
     order: [['name', 'ASC']],
   });
 
@@ -140,7 +166,7 @@ const getMap = async (req) => {
 const getHeatmap = async (req) => {
   const inspections = await Inspection.findAll({
     where: {
-      ...scopedWhere(req),
+      ...scopedFacilityWhere(req),
       latitude: { [Op.ne]: null },
       longitude: { [Op.ne]: null },
     },
@@ -165,17 +191,30 @@ const getFacilityDashboard = async (req) => {
   const facility = await Facility.findByPk(facilityId);
   if (!facility) return null;
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) return null;
+  if (!isFacilityInScope(req, facility.id)) return null;
 
   const [inspections, alerts, tasks, complaints] = await Promise.all([
     Inspection.findAll({
-      where: { facility_id: facilityId },
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
       include: [{ model: AiAnalysisResult }, { model: InspectionMedia }],
       order: [['captured_at', 'DESC']],
       limit: 20,
     }),
-    Alert.findAll({ where: { facility_id: facilityId }, order: [['created_at', 'DESC']], limit: 30 }),
-    InspectionTask.findAll({ where: { facility_id: facilityId }, order: [['scheduled_at', 'DESC']], limit: 20 }),
-    Complaint.findAll({ where: { facility_id: facilityId }, order: [['created_at', 'DESC']], limit: 20 }),
+    Alert.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['created_at', 'DESC']],
+      limit: 30,
+    }),
+    InspectionTask.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['scheduled_at', 'DESC']],
+      limit: 20,
+    }),
+    Complaint.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['created_at', 'DESC']],
+      limit: 20,
+    }),
   ]);
 
   return {
@@ -239,12 +278,21 @@ const getTrends = async (req) => {
     start,
   };
   let tenantClause = '';
+  let facilityClause = '';
   if (!req.user.isSuperAdmin) {
     replacements.tenantId = req.user.tenantId;
     tenantClause = 'AND i.tenant_id = :tenantId';
   } else if (req.query.tenantId) {
     replacements.tenantId = req.query.tenantId;
     tenantClause = 'AND i.tenant_id = :tenantId';
+  }
+  const scopedFacilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
+  if (!req.user.isSuperAdmin && scopedFacilityIds.length > 0) {
+    replacements.scopeFacilityIds = scopedFacilityIds;
+    facilityClause = 'AND i.facility_id IN (:scopeFacilityIds)';
+  } else if (!req.user.isSuperAdmin && req.user?.scopeLevel === 'facility') {
+    replacements.scopeFacilityIds = [EMPTY_SCOPE_UUID];
+    facilityClause = 'AND i.facility_id IN (:scopeFacilityIds)';
   }
 
   const rows = await sequelize.query(
@@ -257,6 +305,7 @@ const getTrends = async (req) => {
       LEFT JOIN ai_analysis_results a ON a.inspection_id = i.id
       WHERE i.captured_at >= :start
         ${tenantClause}
+        ${facilityClause}
       GROUP BY DATE(i.captured_at)
       ORDER BY DATE(i.captured_at) ASC
     `,
@@ -284,7 +333,7 @@ const getTrends = async (req) => {
 
 const getWorkforce = async (req) => {
   const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityWhere(req),
     attributes: ['assigned_to_user_id', 'status', 'completed_at', 'created_at'],
   });
 
@@ -321,7 +370,7 @@ const getWorkforce = async (req) => {
 
 const getSla = async (req) => {
   const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityWhere(req),
     order: [['scheduled_at', 'DESC']],
     limit: 500,
   });
@@ -357,7 +406,7 @@ const getSla = async (req) => {
 
 const getStorageUsage = async (req) => {
   const rows = await StorageUsageMetric.findAll({
-    where: scopedWhere(req),
+    where: scopedTenantWhere(req),
     order: [['measured_at', 'DESC']],
     limit: Number(req.query.limit || 30),
   });
@@ -373,20 +422,20 @@ const getStorageUsage = async (req) => {
 
 const getPlatformHealth = async (req) => {
   const latestAggregate = await DashboardAggregate.findOne({
-    where: scopedWhere(req),
+    where: scopedTenantWhere(req),
     order: [['aggregate_date', 'DESC']],
   });
 
   const [alerts, sensorsFaulty] = await Promise.all([
     Alert.count({
       where: {
-        ...scopedWhere(req),
+        ...scopedFacilityWhere(req),
         status: 'open',
       },
     }),
     SensorDevice.count({
       where: {
-        ...scopedWhere(req),
+        ...scopedFacilityWhere(req),
         status: 'faulty',
       },
     }),
@@ -403,7 +452,7 @@ const getPlatformHealth = async (req) => {
 const getContractorPerformance = async (req) => {
   // Contractor mapping is not a first-class table yet; derive from facility metadata.
   const facilities = await Facility.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityEntityWhere(req),
     attributes: ['id', 'metadata'],
   });
   const byContractor = {};

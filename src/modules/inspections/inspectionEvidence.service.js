@@ -24,6 +24,7 @@ const {
   normalizeMediaUrl,
   resolveMediaPairUrls,
 } = require('../media/mediaUrl.service');
+const { applyTenantScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
 
 const REVIEW_CONFIDENCE_THRESHOLD = Number(
   process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7
@@ -323,8 +324,8 @@ const mapMediaEvidence = async (row, options = {}) => {
 };
 
 const scopedInspectionWhere = (req, where = {}) => {
-  if (!req?.user || req.user.isSuperAdmin) return where;
-  return { ...where, tenant_id: req.user.tenantId };
+  if (!req?.user) return where;
+  return applyTenantScope(where, req);
 };
 
 const assertInspectionScope = async (inspectionId, req, options = {}) => {
@@ -334,6 +335,9 @@ const assertInspectionScope = async (inspectionId, req, options = {}) => {
   });
   if (!inspection) {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
+  }
+  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return inspection;
 };
@@ -349,6 +353,9 @@ const assertToiletScope = async (toiletId, req) => {
     throw new AppError('Toilet not found', 404, { code: 'TOILET_NOT_FOUND' });
   }
   if (!req?.user?.isSuperAdmin && req?.user?.tenantId !== unit.Facility?.tenant_id) {
+    throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, unit.facility_id || unit.Facility?.id || null)) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return unit;
@@ -744,19 +751,41 @@ const recomputeToiletDailyAggregates = async (toiletId, { transaction = null } =
   );
 
   for (const row of dailyRows) {
-    await ToiletScoreDaily.upsert(
-      {
+    const date = String(row.date || '').slice(0, 10);
+    if (!date) {
+      continue;
+    }
+
+    const values = {
+      avg_before_score: round2(toNumber(row.avg_before_score, null)),
+      avg_after_score: round2(toNumber(row.avg_after_score, null)),
+      inspection_count: Number(row.inspection_count || 0),
+      dirty_count: Number(row.dirty_count || 0),
+      cleaned_count: Number(row.cleaned_count || 0),
+      avg_improvement: round2(toNumber(row.avg_improvement, null)),
+      updated_at: new Date(),
+    };
+
+    const existing = await ToiletScoreDaily.findOne({
+      where: {
         toilet_id: toiletId,
-        date: row.date,
-        avg_before_score: round2(toNumber(row.avg_before_score, null)),
-        avg_after_score: round2(toNumber(row.avg_after_score, null)),
-        inspection_count: Number(row.inspection_count || 0),
-        dirty_count: Number(row.dirty_count || 0),
-        cleaned_count: Number(row.cleaned_count || 0),
-        avg_improvement: round2(toNumber(row.avg_improvement, null)),
+        date,
       },
-      { transaction }
-    );
+      transaction,
+    });
+
+    if (existing) {
+      await existing.update(values, { transaction });
+    } else {
+      await ToiletScoreDaily.create(
+        {
+          toilet_id: toiletId,
+          date,
+          ...values,
+        },
+        { transaction }
+      );
+    }
   }
 };
 

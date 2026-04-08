@@ -6,6 +6,7 @@ const {
   getPersonaFamily,
   getRequiredScopeType,
 } = require('../src/core/rbac/personaFamilies');
+const { resolvePrimaryRoleCode } = require('../src/core/rbac/accessProfiles');
 const { ROLE_PERMISSION_BUNDLES } = require('../src/core/rbac/defaultRoleBundles');
 const { collectRoleScopeValidationErrors } = require('../src/core/rbac/roleScopeRules');
 
@@ -21,6 +22,7 @@ test('maps role codes to persona families', () => {
 test('role bundles include scoped admin variants and auditor read-only permissions', () => {
   const scopedRoles = ['country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin', 'facility_manager'];
   const tenantAdminPermissions = ROLE_PERMISSION_BUNDLES.tenant_admin;
+  assert.equal(tenantAdminPermissions.includes('task.manage'), true);
 
   scopedRoles.forEach((roleCode) => {
     assert.deepEqual(ROLE_PERMISSION_BUNDLES[roleCode], tenantAdminPermissions);
@@ -47,4 +49,11 @@ test('scope rules enforce scoped role requirements', () => {
     assignments: [{ assignmentLevel: 'facility', facilityId: 'facility-1' }],
   });
   assert.equal(validFacilityScope.length, 0);
+});
+
+test('primary role resolution prefers web persona over field_worker when both exist', () => {
+  const role = resolvePrimaryRoleCode({
+    roleCodes: ['field_worker', 'supervisor'],
+  });
+  assert.equal(role, 'supervisor');
 });

@@ -54,10 +54,38 @@ const validateUnitCreate = (req) => {
   return errors;
 };
 
+const validateQrResolve = (req) => {
+  const errors = [];
+  const value = req.body?.rawQrValue;
+  if (isBlank(value)) {
+    errors.push('rawQrValue is required');
+  }
+  if (value != null && typeof value !== 'string') {
+    errors.push('rawQrValue must be a string');
+  }
+  if (req.body?.normalizedQrValue != null && typeof req.body.normalizedQrValue !== 'string') {
+    errors.push('normalizedQrValue must be a string when provided');
+  }
+  if (req.body?.workerId != null && typeof req.body.workerId !== 'string') {
+    errors.push('workerId must be a string when provided');
+  }
+  if (req.body?.tenantId != null && typeof req.body.tenantId !== 'string') {
+    errors.push('tenantId must be a string when provided');
+  }
+  if (req.body?.siteId != null && typeof req.body.siteId !== 'string') {
+    errors.push('siteId must be a string when provided');
+  }
+  if (req.body?.scannedAt != null && Number.isNaN(Date.parse(String(req.body.scannedAt)))) {
+    errors.push('scannedAt must be an ISO datetime when provided');
+  }
+  return errors;
+};
+
 module.exports = {
   validateTenantCreate,
   validateGeographyCreate,
   validateFacilityCreate,
   validateBlockCreate,
   validateUnitCreate,
+  validateQrResolve,
 };

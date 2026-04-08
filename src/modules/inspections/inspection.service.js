@@ -23,6 +23,11 @@ const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const {
+  applyTenantScope,
+  applyFacilityScope,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
+const {
   recomputeInspectionAggregates,
   listInspectionImages,
   getInspectionImage,
@@ -134,10 +139,19 @@ const isUniqueConstraintError = (error) => {
 };
 
 const scopedWhere = (req, where = {}) => {
-  if (!req.user.isSuperAdmin) {
-    return { ...where, tenant_id: req.user.tenantId };
+  let next = applyTenantScope(where, req);
+  next = applyFacilityScope(next, req);
+  return next;
+};
+
+const assertInspectionScope = (req, inspection) => {
+  if (!inspection) return;
+  if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  return where;
+  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 };
 
 const createInspectionEvent = async ({
@@ -829,6 +843,9 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   if (req.body.toiletUnitId) {
     const unit = await ToiletUnit.findByPk(req.body.toiletUnitId);
     if (!unit || unit.facility_id !== facility.id) {
@@ -900,6 +917,7 @@ const uploadInspectionMedia = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
   if (!req.file?.path) {
     throw new AppError('file is required', 400, { code: 'FILE_REQUIRED' });
   }
@@ -1131,6 +1149,7 @@ const submitInspection = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
 
   const isUploadReady = (item) =>
     item.upload_status === 'confirmed' ||
@@ -1269,6 +1288,7 @@ const reviewInspection = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
 
   const action = normalizeReviewAction(req.body.action);
   const note = req.body.note ? sanitizeText(req.body.note, 800) : null;
@@ -1353,6 +1373,9 @@ const listInspections = async (req, myOnly = false) => {
     where.inspector_user_id = req.user.id;
   }
   if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('facilityId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
     where.facility_id = req.query.facilityId;
   }
 
@@ -1397,6 +1420,7 @@ const getInspectionById = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
   await hydrateInspectionMediaForDisplay(inspection);
   const reviewMap = await loadLatestReviewByInspectionIds([inspection.id]);
   return mapInspection(inspection, { withAnalysis: true, reviewByInspectionId: reviewMap });

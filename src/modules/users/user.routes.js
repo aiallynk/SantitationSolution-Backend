@@ -1,6 +1,6 @@
 const express = require('express');
 const userController = require('./user.controller');
-const { protect, requirePermissions } = require('../../core/middleware/auth');
+const { protect, requirePermissions, requireAction } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 const {
   validateUserListQuery,
@@ -14,8 +14,20 @@ router.use(protect);
 
 router.get('/users', requirePermissions('users.manage'), validate(validateUserListQuery), userController.getUsers);
 router.get('/users/:id', requirePermissions('users.manage'), userController.getUserById);
-router.post('/users', requirePermissions('users.manage'), validate(validateCreateUser), userController.postUser);
-router.patch('/users/:id', requirePermissions('users.manage'), validate(validatePatchUser), userController.patchUser);
+router.post(
+  '/users',
+  requirePermissions('users.manage'),
+  requireAction('user.manage'),
+  validate(validateCreateUser),
+  userController.postUser
+);
+router.patch(
+  '/users/:id',
+  requirePermissions('users.manage'),
+  requireAction('user.manage'),
+  validate(validatePatchUser),
+  userController.patchUser
+);
 
 router.get('/roles', requirePermissions('users.manage'), userController.getRoles);
 router.get('/permissions', requirePermissions('users.manage'), userController.getPermissions);

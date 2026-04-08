@@ -3,7 +3,8 @@ const path = require('path');
 const express = require('express');
 const multer = require('multer');
 const complaintController = require('./complaint.controller');
-const { protect, requirePermissions } = require('../../core/middleware/auth');
+const AppError = require('../../core/errors/AppError');
+const { protect, requirePermissions, requireAction } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 const {
   validateComplaintListQuery,
@@ -36,8 +37,35 @@ const publicUpload = multer({
     fileSize: Number(process.env.MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024),
   },
   fileFilter: (req, file, cb) => {
-    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
-      return cb(new Error('Only image uploads are supported'));
+    const mimetype = String(file.mimetype || '').toLowerCase();
+    const originalName = String(file.originalname || '');
+    const extension = path.extname(originalName).toLowerCase();
+    const allowedExtensions = new Set([
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.webp',
+      '.gif',
+      '.bmp',
+      '.heic',
+      '.heif',
+    ]);
+    const isImageMime = mimetype.startsWith('image/');
+    const canTrustExtension =
+      (mimetype === '' || mimetype === 'application/octet-stream') &&
+      allowedExtensions.has(extension);
+
+    if (!isImageMime && !canTrustExtension) {
+      return cb(
+        new AppError('Only image uploads are supported', 400, {
+          code: 'INVALID_MEDIA_TYPE',
+          details: {
+            mimetype: mimetype || null,
+            originalName,
+            extension: extension || null,
+          },
+        })
+      );
     }
     return cb(null, true);
   },
@@ -69,26 +97,29 @@ router.get(
 router.post(
   '/complaints',
   requirePermissions('inspection.create'),
+  requireAction('task.execute'),
   validate(validateComplaintCreate),
   complaintController.postComplaint
 );
 router.patch(
   '/complaints/:id/assign',
   requirePermissions('task.manage'),
+  requireAction('task.assign'),
   validate(validateComplaintAssign),
   complaintController.patchComplaintAssign
 );
 router.patch(
   '/complaints/:id/resolve',
   requirePermissions('task.manage'),
+  requireAction('task.verify'),
   complaintController.patchComplaintResolve
 );
 router.post(
   '/complaints/:id/dispatch',
   requirePermissions('task.manage'),
+  requireAction('task.assign'),
   validate(validateComplaintDispatch),
   complaintController.postComplaintDispatch
 );
 
 module.exports = router;
-

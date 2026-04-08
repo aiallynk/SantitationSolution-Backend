@@ -16,10 +16,25 @@ const {
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { assertRoleScopeRequirements } = require('../../core/rbac/roleScopeRules');
+const {
+  getPersonaFamily,
+  getRequiredScopeType,
+  normalizeRoleCode,
+} = require('../../core/rbac/personaFamilies');
+const {
+  assertRoleDelegationAllowed,
+  uniqueNormalizedRoleCodes,
+} = require('../../core/rbac/roleDelegationRules');
+const {
+  isGeographyInScope,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
 const unique = (values) => [...new Set(values)];
+const normalizeRoleCodes = (roleCodes = []) =>
+  uniqueNormalizedRoleCodes(roleCodes).map((roleCode) => normalizeRoleCode(roleCode));
 
 const toStatus = (value, fallback = 'active') => {
   const normalized = String(value || fallback).toLowerCase();
@@ -156,9 +171,52 @@ const toPayload = (user, assignmentsByUserId = new Map()) => {
   };
 };
 
-const assertUserScope = (req, user) => {
+const isUserWithinScope = (req, user, assignments = []) => {
+  if (req.user?.isSuperAdmin) return true;
+  if (user.tenant_id !== req.user.tenantId) return false;
+
+  const scopedGeographyIds = new Set(
+    (Array.isArray(req.user?.scopeGeographyIds) ? req.user.scopeGeographyIds : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  );
+  const scopedFacilityIds = new Set(
+    (Array.isArray(req.user?.scopeFacilityIds) ? req.user.scopeFacilityIds : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  );
+
+  if (scopedGeographyIds.size === 0 && scopedFacilityIds.size === 0) {
+    return true;
+  }
+
+  const userGeographyId = String(user.geography_id || '').trim();
+  if (userGeographyId && scopedGeographyIds.has(userGeographyId)) {
+    return true;
+  }
+
+  for (const assignment of Array.isArray(assignments) ? assignments : []) {
+    const assignmentGeographyId = String(assignment?.geographyId || assignment?.geography_id || '').trim();
+    if (assignmentGeographyId && scopedGeographyIds.has(assignmentGeographyId)) {
+      return true;
+    }
+    const assignmentFacilityId = String(assignment?.facilityId || assignment?.facility_id || '').trim();
+    if (assignmentFacilityId && scopedFacilityIds.has(assignmentFacilityId)) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+const assertUserScope = (req, user, assignments = []) => {
   if (!req.user.isSuperAdmin && user.tenant_id !== req.user.tenantId) {
     throw new AppError('Cannot access user outside your tenant', 403, {
+      code: 'SCOPE_FORBIDDEN',
+    });
+  }
+  if (!isUserWithinScope(req, user, assignments)) {
+    throw new AppError('Cannot access user outside your scope', 403, {
       code: 'SCOPE_FORBIDDEN',
     });
   }
@@ -293,6 +351,7 @@ const normalizeAssignments = ({ req, roleCodes, tenantId, bodyAssignments, geogr
 };
 
 const replaceAssignments = async ({
+  req,
   user,
   tenantId,
   roleCodes,
@@ -323,6 +382,22 @@ const replaceAssignments = async ({
       tenantId,
       transaction,
     });
+
+    if (geography && !isGeographyInScope(req, geography.id)) {
+      throw new AppError('assignment geography is outside actor scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
+    if (facility && !isFacilityInScope(req, facility.id)) {
+      throw new AppError('assignment facility is outside actor scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
+    if (toiletUnit && !isFacilityInScope(req, toiletUnit.facility_id || null)) {
+      throw new AppError('assignment toilet unit is outside actor scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
     const toiletUnit = await ensureToiletUnitScope({
       toiletUnitId: assignment.toiletUnitId || null,
       tenantId,
@@ -383,20 +458,23 @@ const listUsers = async (req) => {
 
   const include = buildUserInclude({ roleCode: req.query.roleCode });
 
-  const { rows, count } = await PlatformUser.findAndCountAll({
+  const rows = await PlatformUser.findAll({
     where,
     include,
     order: [['created_at', 'DESC']],
-    limit,
-    offset,
     distinct: true,
   });
 
   const userIds = rows.map((user) => user.id);
   const assignmentsByUserId = await getAssignmentsByUserIds(userIds);
+  const scopedRows = rows.filter((user) =>
+    isUserWithinScope(req, user, assignmentsByUserId.get(user.id) || [])
+  );
+  const pagedRows = scopedRows.slice(offset, offset + limit);
+  const count = scopedRows.length;
 
   return {
-    items: rows.map((user) => toPayload(user, assignmentsByUserId)),
+    items: pagedRows.map((user) => toPayload(user, assignmentsByUserId)),
     meta: {
       page,
       limit,
@@ -413,19 +491,26 @@ const getUserById = async (req) => {
   if (!user) {
     throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
   }
-  assertUserScope(req, user);
-
   const assignmentsByUserId = await getAssignmentsByUserIds([user.id]);
+  const userAssignments = assignmentsByUserId.get(user.id) || [];
+  assertUserScope(req, user, userAssignments);
+
   return toPayload(user, assignmentsByUserId);
 };
 
 const createUser = async (req) => {
-  const roleCodes = unique(req.body.roleCodes || []);
+  const roleCodes = normalizeRoleCodes(req.body.roleCodes || []);
   if (roleCodes.length === 0) {
     throw new AppError('roleCodes must be a non-empty array', 400, {
       code: 'VALIDATION_ERROR',
     });
   }
+
+  assertRoleDelegationAllowed({
+    actorRoleCodes: req.user.roleCodes || req.user.allRoleCodes || [],
+    targetRoleCodes: roleCodes,
+    isSuperAdmin: Boolean(req.user.isSuperAdmin),
+  });
 
   const requestedTenantId = req.body.tenantId || null;
   const tenantId = resolveCreateTenantId({
@@ -437,11 +522,16 @@ const createUser = async (req) => {
   return sequelize.transaction(async (transaction) => {
     await resolveRoles(roleCodes, { transaction });
     await ensureTenantExists(tenantId, { transaction });
-    await ensureGeographyScope({
+    const resolvedGeography = await ensureGeographyScope({
       geographyId: req.body.geographyId || null,
       tenantId,
       transaction,
     });
+    if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
+      throw new AppError('geographyId is outside actor scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
 
     const normalizedEmail = String(req.body.email).trim().toLowerCase();
     const existing = await PlatformUser.findOne({
@@ -515,6 +605,7 @@ const createUser = async (req) => {
     });
 
     await replaceAssignments({
+      req,
       user,
       tenantId,
       roleCodes,
@@ -555,7 +646,9 @@ const patchUser = async (req) => {
   if (!user) {
     throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
   }
-  assertUserScope(req, user);
+  const existingAssignmentsByUserId = await getAssignmentsByUserIds([user.id]);
+  const existingUserAssignments = existingAssignmentsByUserId.get(user.id) || [];
+  assertUserScope(req, user, existingUserAssignments);
 
   const nextTenantId = req.user.isSuperAdmin
     ? req.body.tenantId !== undefined
@@ -571,14 +664,22 @@ const patchUser = async (req) => {
 
   return sequelize.transaction(async (transaction) => {
     await ensureTenantExists(nextTenantId, { transaction });
-    await ensureGeographyScope({
+    const resolvedGeography = await ensureGeographyScope({
       geographyId: req.body.geographyId || user.geography_id,
       tenantId: nextTenantId,
       transaction,
     });
+    if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
+      throw new AppError('geographyId is outside actor scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
 
     const updates = {};
     if (req.body.fullName) updates.full_name = sanitizeText(req.body.fullName, 180);
+    if (req.body.email !== undefined) {
+      updates.email = String(req.body.email || '').trim().toLowerCase();
+    }
     if (req.body.phone !== undefined) updates.phone = req.body.phone ? sanitizeText(req.body.phone, 32) : null;
     if (req.body.status) updates.status = toStatus(req.body.status, user.status);
     if (req.body.password) {
@@ -597,6 +698,22 @@ const patchUser = async (req) => {
     }
     if (req.user.isSuperAdmin && req.body.tenantId !== undefined) {
       updates.tenant_id = nextTenantId || null;
+    }
+
+    if (
+      updates.email &&
+      updates.email !== user.email
+    ) {
+      const duplicateEmail = await PlatformUser.findOne({
+        where: {
+          id: { [Op.ne]: user.id },
+          email: updates.email,
+        },
+        transaction,
+      });
+      if (duplicateEmail) {
+        throw new AppError('Email already exists', 409, { code: 'EMAIL_EXISTS' });
+      }
     }
 
     if (
@@ -628,12 +745,17 @@ const patchUser = async (req) => {
 
     let roleCodes = unique((user.Roles || []).map((role) => role.code));
     if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
-      roleCodes = unique(req.body.roleCodes);
+      roleCodes = normalizeRoleCodes(req.body.roleCodes);
       if (!req.user.isSuperAdmin && hasGlobalRole(roleCodes)) {
         throw new AppError('Only super admin can assign platform roles', 403, {
           code: 'ROLE_SCOPE_FORBIDDEN',
         });
       }
+      assertRoleDelegationAllowed({
+        actorRoleCodes: req.user.roleCodes || req.user.allRoleCodes || [],
+        targetRoleCodes: roleCodes,
+        isSuperAdmin: Boolean(req.user.isSuperAdmin),
+      });
       if (req.user.isSuperAdmin && hasTenantRole(roleCodes) && !nextTenantId) {
         throw new AppError('Cannot assign tenant-scoped role without tenant', 400, {
           code: 'TENANT_REQUIRED',
@@ -681,6 +803,7 @@ const patchUser = async (req) => {
       nextAssignmentsForScopeValidation = assignments;
 
       await replaceAssignments({
+        req,
         user,
         tenantId: nextTenantId,
         roleCodes,
@@ -752,6 +875,8 @@ const listRoles = async () => {
     code: role.code,
     name: role.name,
     description: role.description,
+    personaFamily: getPersonaFamily(role.code),
+    requiredScopeType: getRequiredScopeType(role.code),
     permissionCodes: unique((role.Permissions || []).map((permission) => permission.code)),
   }));
 };

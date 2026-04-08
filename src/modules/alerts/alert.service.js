@@ -4,17 +4,20 @@ const { Alert } = require('../../models');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
+const { applyTenantScope, applyFacilityScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
 
 const scopedWhere = (req) => {
-  const where = {};
-  if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
-  } else if (req.query.tenantId) {
-    where.tenant_id = req.query.tenantId;
-  }
+  let where = {};
+  where = applyTenantScope(where, req);
+  where = applyFacilityScope(where, req);
   if (req.query.status) where.status = req.query.status;
   if (req.query.severity) where.severity = req.query.severity;
-  if (req.query.facilityId) where.facility_id = req.query.facilityId;
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.facility_id = req.query.facilityId;
+  }
   if (req.query.sourceType) where.source_type = req.query.sourceType;
   return where;
 };
@@ -62,6 +65,9 @@ const getAlertById = async (req) => {
   if (!req.user.isSuperAdmin && alert.tenant_id !== req.user.tenantId) {
     throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, alert.facility_id || null)) {
+    throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   return mapAlert(alert);
 };
 
@@ -71,6 +77,9 @@ const acknowledgeAlert = async (req) => {
     throw new AppError('Alert not found', 404, { code: 'ALERT_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && alert.tenant_id !== req.user.tenantId) {
+    throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, alert.facility_id || null)) {
     throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
 
@@ -105,6 +114,9 @@ const resolveAlert = async (req) => {
     throw new AppError('Alert not found', 404, { code: 'ALERT_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && alert.tenant_id !== req.user.tenantId) {
+    throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, alert.facility_id || null)) {
     throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
 

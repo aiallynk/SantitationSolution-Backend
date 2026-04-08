@@ -17,6 +17,9 @@ const {
 const {
   validateIngestion,
 } = require('../src/modules/sensors/sensor.validator');
+const {
+  validateQrResolve,
+} = require('../src/modules/platform/platform.validator');
 
 test('sanitizeText removes unsafe markup-like characters', () => {
   const result = sanitizeText('   <script>alert(1)</script>  ', 100);
@@ -60,6 +63,46 @@ test('validateCreateInspection validates required fields', () => {
 test('validateIngestion validates sensor payload basics', () => {
   const errors = validateIngestion({ body: { deviceId: '', timestamp: 'not-a-date' } });
   assert.deepEqual(errors, ['deviceId is required', 'timestamp must be a valid date']);
+});
+
+test('validateQrResolve requires rawQrValue', () => {
+  const errors = validateQrResolve({ body: {} });
+  assert.deepEqual(errors, ['rawQrValue is required']);
+});
+
+test('validateQrResolve rejects invalid payload field types', () => {
+  const errors = validateQrResolve({
+    body: {
+      rawQrValue: 123,
+      normalizedQrValue: 42,
+      workerId: true,
+      tenantId: { id: 't-1' },
+      siteId: ['s-1'],
+      scannedAt: 'bad-date',
+    },
+  });
+  assert.deepEqual(errors, [
+    'rawQrValue must be a string',
+    'normalizedQrValue must be a string when provided',
+    'workerId must be a string when provided',
+    'tenantId must be a string when provided',
+    'siteId must be a string when provided',
+    'scannedAt must be an ISO datetime when provided',
+  ]);
+});
+
+test('validateQrResolve accepts supported request payload', () => {
+  const errors = validateQrResolve({
+    body: {
+      rawQrValue: 'TOILET:FAC-001',
+      normalizedQrValue: 'TOILET:FAC-001',
+      workerId: 'worker-1',
+      tenantId: 'tenant-1',
+      siteId: 'site-1',
+      scannedAt: '2026-04-08T12:30:00.000Z',
+    },
+  });
+  assert.deepEqual(errors, []);
 });
 
 test('isBlank handles null/undefined/whitespace', () => {
