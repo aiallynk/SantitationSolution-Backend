@@ -24,6 +24,8 @@ services:
         value: "true"
       - key: REDIS_ENABLED
         value: "false"
+      - key: REDIS_REQUIRED_IN_PROD
+        value: "false"
       - key: CORS_ORIGIN
         value: https://*.vercel.app
       - key: DATABASE_URL
@@ -34,4 +36,3 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-

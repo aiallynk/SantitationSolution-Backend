@@ -53,6 +53,7 @@ Recommended production env values:
 - `DB_SSL=true`
 - `AUTO_RUN_MIGRATIONS=false` (migrate in pre-deploy)
 - `CORS_ORIGIN=https://*.vercel.app,https://<your-domain>`
+- `REDIS_REQUIRED_IN_PROD=false` (set `true` only when Redis is configured and reachable)
 
 ## Domain Modules
 

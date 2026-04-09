@@ -362,7 +362,7 @@ const bootstrap = async () => {
       // eslint-disable-next-line no-console
       console.log('Analysis worker is expected to run as a separate process');
     } else {
-      if (String(process.env.REDIS_REQUIRED_IN_PROD || 'true').toLowerCase() === 'true' &&
+      if (String(process.env.REDIS_REQUIRED_IN_PROD || 'false').toLowerCase() === 'true' &&
           String(process.env.NODE_ENV || 'development').toLowerCase() === 'production') {
         throw new Error('Redis queue is mandatory in production and is currently unavailable');
       }

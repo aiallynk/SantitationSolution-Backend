@@ -12,7 +12,7 @@ const isProduction = () =>
   String(process.env.NODE_ENV || 'development').trim().toLowerCase() === 'production';
 
 const isRedisRequiredInProd = () =>
-  String(process.env.REDIS_REQUIRED_IN_PROD || 'true').trim().toLowerCase() !== 'false';
+  String(process.env.REDIS_REQUIRED_IN_PROD || 'false').trim().toLowerCase() === 'true';
 
 const isRedisEnabled = () =>
   Boolean(
