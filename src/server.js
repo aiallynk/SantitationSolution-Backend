@@ -6,9 +6,21 @@ const { startHeartbeat } = require('./core/live/sseBroker');
 const { startWebSocketServer, closeWebSocketServer } = require('./core/live/wsBroker');
 const { startLiveRedisBridge, closeLiveRedisBridge } = require('./core/live/liveRedisBridge');
 const { broadcastLocal } = require('./core/live/registerLiveForwarders');
-const { closeQueues, isRedisEnabled } = require('./core/queue/queueManager');
+const {
+  closeQueues,
+  isRedisEnabled,
+  assertQueueRuntimePolicy,
+} = require('./core/queue/queueManager');
 const { ensureQrImagesForToilets } = require('./modules/platform/toiletQr.service');
 const { getOpenAiAnalysisConfigState } = require('./modules/analysis/openaiAnalysis.service');
+const {
+  startAnalysisJobWatchdog,
+  stopAnalysisJobWatchdog,
+} = require('./modules/analysis/analysisJobWatchdog.service');
+const {
+  startImageSessionReconciler,
+  stopImageSessionReconciler,
+} = require('./modules/inspections/imageSessionReconciler.service');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -325,6 +337,7 @@ const bootstrap = async () => {
     console.log('Database connection established');
     await backfillToiletQrOnBoot();
     await probeRedisConnectivity();
+    assertQueueRuntimePolicy();
 
     registerLiveForwarders();
     startHeartbeat();
@@ -349,9 +362,16 @@ const bootstrap = async () => {
       // eslint-disable-next-line no-console
       console.log('Analysis worker is expected to run as a separate process');
     } else {
+      if (String(process.env.REDIS_REQUIRED_IN_PROD || 'true').toLowerCase() === 'true' &&
+          String(process.env.NODE_ENV || 'development').toLowerCase() === 'production') {
+        throw new Error('Redis queue is mandatory in production and is currently unavailable');
+      }
       // eslint-disable-next-line no-console
       console.warn('Redis disabled: analysis queue running in inline fallback mode');
     }
+
+    startAnalysisJobWatchdog();
+    startImageSessionReconciler();
 
     server = app.listen(PORT, () => {
       // eslint-disable-next-line no-console
@@ -376,6 +396,8 @@ const gracefulShutdown = async (signal) => {
     }
     await closeWebSocketServer();
     await closeLiveRedisBridge();
+    stopAnalysisJobWatchdog();
+    stopImageSessionReconciler();
     await closeQueues();
     await sequelize.close();
     // eslint-disable-next-line no-console

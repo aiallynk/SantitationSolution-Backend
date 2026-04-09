@@ -379,6 +379,35 @@ const getObjectDataUrlFromS3 = async (storageKey) => {
   }
 };
 
+const getObjectBufferFromS3 = async (storageKey) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  const objectKey = normalizeS3ObjectKey(storageKey);
+  if (!objectKey) return null;
+
+  try {
+    const response = await client.send(
+      new GetObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: objectKey,
+      })
+    );
+    const bodyBuffer = await streamToBuffer(response.Body);
+    if (!bodyBuffer || bodyBuffer.length === 0) return null;
+    return {
+      buffer: bodyBuffer,
+      objectKey,
+      bucket: s3Config.bucket,
+      contentType: String(response.ContentType || resolveMimeType(objectKey)),
+      contentLength: Number(response.ContentLength || bodyBuffer.length || 0),
+      metadata: response.Metadata || null,
+    };
+  } catch (_) {
+    return null;
+  }
+};
+
 const headObjectFromS3 = async (storageKey) => {
   const client = getS3Client();
   if (!client) return null;
@@ -421,6 +450,7 @@ module.exports = {
   getPresignedPutObjectUrl,
   getPresignedGetObjectUrl,
   getObjectDataUrlFromS3,
+  getObjectBufferFromS3,
   headObjectFromS3,
   normalizeS3ObjectKey,
   buildObjectUrl,

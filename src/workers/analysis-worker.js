@@ -4,7 +4,11 @@ const net = require('net');
 const { sequelize } = require('../models');
 const { registerAnalysisWorker } = require('../modules/analysis/analysis.queue');
 const { assertOpenAiAnalysisConfigured } = require('../modules/analysis/openaiAnalysis.service');
-const { closeQueues, isRedisEnabled } = require('../core/queue/queueManager');
+const {
+  closeQueues,
+  isRedisEnabled,
+  assertQueueRuntimePolicy,
+} = require('../core/queue/queueManager');
 
 let worker = null;
 
@@ -65,6 +69,7 @@ const bootstrap = async () => {
       process.exit(1);
       return;
     }
+    assertQueueRuntimePolicy();
 
     worker = registerAnalysisWorker();
     if (!worker) {

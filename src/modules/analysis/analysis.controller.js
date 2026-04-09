@@ -1,6 +1,7 @@
 const { sendSuccess } = require('../../core/http/response');
 const { enqueueInspectionAnalysis } = require('./analysis.queue');
 const { getAnalysisResult, getInspectionAnalysisTrend } = require('./analysis.service');
+const { getPipelineDiagnostics } = require('./analysisDiagnostics.service');
 
 const postRunAnalysis = async (req, res, next) => {
   try {
@@ -88,10 +89,24 @@ const postAnalysisWebhook = async (req, res, next) => {
   }
 };
 
+const getAnalysisPipelineDiagnostics = async (req, res, next) => {
+  try {
+    const data = await getPipelineDiagnostics(req);
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'Analysis pipeline diagnostics fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   postRunAnalysis,
   postReprocessAnalysis,
   getInspectionAnalysisResult,
   getInspectionAnalysisTrendData,
   postAnalysisWebhook,
+  getAnalysisPipelineDiagnostics,
 };

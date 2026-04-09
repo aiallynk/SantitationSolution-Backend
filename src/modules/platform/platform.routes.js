@@ -1,6 +1,11 @@
 const express = require('express');
 const platformController = require('./platform.controller');
-const { protect, requirePermissions, requireAction } = require('../../core/middleware/auth');
+const {
+  protect,
+  requirePermissions,
+  requireAnyPermissions,
+  requireAction,
+} = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 const {
   validateTenantCreate,
@@ -67,10 +72,14 @@ router.post(
 router.get('/toilet-units', requirePermissions('dashboard.read'), platformController.getToiletUnits);
 // QR resolve is used by the mobile app to map scanned toilet/public QR values to a toilet unit.
 // Supervisors are allowed on mobile but may not have `inspection.create`, so keep this endpoint readable.
-router.get('/toilet-units/resolve', requirePermissions('dashboard.read'), platformController.getToiletUnitByQr);
+router.get(
+  '/toilet-units/resolve',
+  requireAnyPermissions('dashboard.read', 'inspection.create'),
+  platformController.getToiletUnitByQr
+);
 router.post(
   '/toilet-units/resolve',
-  requirePermissions('dashboard.read'),
+  requireAnyPermissions('dashboard.read', 'inspection.create'),
   validate(validateQrResolve),
   platformController.postToiletUnitByQr
 );

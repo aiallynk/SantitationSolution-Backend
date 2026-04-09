@@ -29,6 +29,8 @@ const {
   recomputeInspectionAggregates,
   scoreLabel,
 } = require('../inspections/inspectionEvidence.service');
+const { classifyAnalysisFailure } = require('./analysisFailureClassifier.service');
+const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -43,6 +45,9 @@ const mean = (values = []) => {
 };
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
 const FRAUD_SIMILARITY_THRESHOLD = Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92);
+const AI_IMAGE_MAX_RETRIES = Math.max(Number(process.env.AI_IMAGE_MAX_RETRIES || 4), 1);
+const AI_RETRY_BASE_DELAY_MS = Math.max(Number(process.env.AI_RETRY_BASE_DELAY_MS || 3000), 500);
+const JOB_LEASE_MS = Math.max(Number(process.env.ANALYSIS_JOB_LEASE_MS || 180000), 60000);
 
 const deriveStatus = (score) => {
   if (score >= 80) return 'clean';
@@ -479,6 +484,11 @@ const runInspectionAnalysis = async ({
       image_id: imageId || processingJob.image_id || null,
       job_type: String(jobType || 'AI_ANALYSIS'),
       started_at: new Date(),
+      leased_until: new Date(Date.now() + JOB_LEASE_MS),
+      last_heartbeat_at: new Date(),
+      failure_classification: null,
+      dead_letter_reason: null,
+      next_retry_at: null,
       updated_at: new Date(),
     });
   }
@@ -543,6 +553,7 @@ const runInspectionAnalysis = async ({
   const analyzedImageIds = [];
   const imageResults = [];
   const imageFailures = [];
+  const transientRetryImageIds = [];
   const configState = getOpenAiAnalysisConfigState();
 
   for (const mediaRow of mediaRows) {
@@ -605,9 +616,13 @@ const runInspectionAnalysis = async ({
 
     await mediaRow.update({
       ai_status: 'AI_PROCESSING',
+      processing_state: IMAGE_PROCESSING_STATES.AI_PROCESSING,
+      ai_attempt_count: Number(mediaRow.ai_attempt_count || 0) + 1,
       ai_error: null,
       validation_status: 'PENDING',
       validation_reason: null,
+      last_error_code: null,
+      last_error_message: null,
       updated_at: new Date(),
     });
 
@@ -745,6 +760,7 @@ const runInspectionAnalysis = async ({
 
       await mediaRow.update({
         ai_status: 'AI_COMPLETED',
+        processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
         image_quality_status: quality,
         overall_score: scoringRejected ? null : round2(overallScore),
         confidence_score: round2(confidence),
@@ -766,6 +782,9 @@ const runInspectionAnalysis = async ({
         scoring_version: result.scoringVersion || SCORING_VERSION,
         ai_processed_at: new Date(),
         ai_error: null,
+        last_error_code: null,
+        last_error_message: null,
+        next_retry_at: null,
         image_quality_score: qualityResult?.imageQualityScore || null,
         toilet_detected: toiletDetected,
         validation_status: resolvedValidationStatus,
@@ -820,6 +839,78 @@ const runInspectionAnalysis = async ({
       });
     } catch (imageError) {
       const code = String(imageError?.code || '').trim();
+      const failure = classifyAnalysisFailure(imageError);
+      const retryCount = Number(mediaRow.retry_count || 0);
+      const canRetry = failure.retryable && retryCount < AI_IMAGE_MAX_RETRIES;
+
+      if (canRetry) {
+        const nextRetryCount = retryCount + 1;
+        const delayMs = Math.min(
+          AI_RETRY_BASE_DELAY_MS * Math.pow(2, retryCount),
+          120000
+        );
+        const nextRetryAt = new Date(Date.now() + delayMs);
+
+        await mediaRow.update({
+          ai_status: 'AI_QUEUED',
+          processing_state: IMAGE_PROCESSING_STATES.AI_RETRYING,
+          retry_count: nextRetryCount,
+          last_retry_at: new Date(),
+          next_retry_at: nextRetryAt,
+          validation_status: 'PENDING',
+          validation_reason: `AI transient error, retry scheduled (attempt ${nextRetryCount}/${AI_IMAGE_MAX_RETRIES})`,
+          image_quality_status: qualityResult?.imageQualityStatus || 'unknown',
+          image_quality_score: qualityResult?.imageQualityScore || null,
+          toilet_detected: Boolean(toiletDetected),
+          visibility_score: visibilityScore,
+          perceptual_hash: perceptualHash || null,
+          similarity_score: similarityResult?.maxSimilarity || null,
+          review_required: false,
+          ai_error: failure.message,
+          last_error_code: failure.errorCode || null,
+          last_error_message: failure.message,
+          updated_at: new Date(),
+        });
+
+        const { enqueueInspectionAnalysis } = require('./analysis.queue');
+        await enqueueInspectionAnalysis({
+          inspectionId: inspection.id,
+          imageId: mediaRow.id,
+          tenantId: inspection.tenant_id,
+          jobType: String(jobType || 'AI_ANALYSIS'),
+          delayMs,
+          requestContext: {
+            requestId: req?.requestId || null,
+            reprocess: true,
+            reprocessToken: `retry-${mediaRow.id}-${nextRetryCount}`,
+            user: req?.user || null,
+          },
+        });
+
+        await InspectionEvent.create({
+          tenant_id: inspection.tenant_id,
+          inspection_id: inspection.id,
+          toilet_id: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+          image_id: mediaRow.id,
+          event_type: 'analysis.image.retrying',
+          event_status: 'AI_RETRYING',
+          source: 'worker',
+          payload: {
+            imageId: mediaRow.id,
+            attempt: nextRetryCount,
+            maxAttempts: AI_IMAGE_MAX_RETRIES,
+            nextRetryAt: nextRetryAt.toISOString(),
+            delayMs,
+            errorCode: failure.errorCode || null,
+            error: failure.message.slice(0, 400),
+          },
+          occurred_at: new Date(),
+        });
+
+        transientRetryImageIds.push(mediaRow.id);
+        continue;
+      }
+
       const validationStatus = code === 'NO_TOILET_DETECTED'
         ? 'FAILED_NO_TOILET'
         : code === 'LOW_VISIBILITY'
@@ -830,12 +921,16 @@ const runInspectionAnalysis = async ({
 
       imageFailures.push({
         imageId: mediaRow.id,
-        error: String(imageError.message || imageError).slice(0, 500),
+        error: failure.message.slice(0, 500),
       });
       await mediaRow.update({
         ai_status: 'AI_FAILED',
+        processing_state:
+          failure.classification === 'transient'
+            ? IMAGE_PROCESSING_STATES.AI_FAILED_TRANSIENT
+            : IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED,
         validation_status: validationStatus,
-        validation_reason: String(imageError.message || imageError).slice(0, 500),
+        validation_reason: failure.message.slice(0, 500),
         image_quality_status: qualityResult?.imageQualityStatus || 'invalid',
         image_quality_score: qualityResult?.imageQualityScore || null,
         toilet_detected: Boolean(toiletDetected),
@@ -843,7 +938,11 @@ const runInspectionAnalysis = async ({
         perceptual_hash: perceptualHash || null,
         similarity_score: similarityResult?.maxSimilarity || null,
         review_required: true,
-        ai_error: String(imageError.message || imageError).slice(0, 2000),
+        manual_review_required_at: new Date(),
+        ai_error: failure.message.slice(0, 2000),
+        last_error_code: failure.errorCode || null,
+        last_error_message: failure.message.slice(0, 2000),
+        next_retry_at: null,
         updated_at: new Date(),
       });
       await InspectionEvent.create({
@@ -856,7 +955,9 @@ const runInspectionAnalysis = async ({
         source: 'worker',
         payload: {
           imageId: mediaRow.id,
-          error: String(imageError.message || imageError).slice(0, 1000),
+          error: failure.message.slice(0, 1000),
+          errorCode: failure.errorCode || null,
+          failureClassification: failure.classification,
           validationStatus,
         },
         occurred_at: new Date(),
@@ -871,11 +972,15 @@ const runInspectionAnalysis = async ({
           .map((item) => `${item.imageId}: ${item.error}`)
           .join(' | ')
           .slice(0, 2000)
-      : 'AI analysis could not process any inspection images';
+      : transientRetryImageIds.length > 0
+        ? `Transient retries queued for images: ${transientRetryImageIds.join(', ')}`
+        : 'AI analysis could not process any inspection images';
   const processingMs = Date.now() - startedAt;
   const processedAt = new Date();
 
   if (imageResults.length === 0) {
+    const onlyTransientRetries =
+      transientRetryImageIds.length > 0 && imageFailures.length === 0;
     const aggregate = await recomputeInspectionAggregates(inspection.id, {
       updateToilet: true,
     });
@@ -892,11 +997,11 @@ const runInspectionAnalysis = async ({
       refreshedInspection?.overall_status || inspection.overall_status || null;
 
     await inspection.update({
-      processing_status: processingStatus,
-      pipeline_status: pipelineStatus,
+      processing_status: onlyTransientRetries ? 'queued' : processingStatus,
+      pipeline_status: onlyTransientRetries ? 'queued_for_ai' : pipelineStatus,
       submitted_at: inspection.submitted_at || processedAt,
-      review_required: true,
-      last_processing_error: failureMessage,
+      review_required: onlyTransientRetries ? false : true,
+      last_processing_error: onlyTransientRetries ? null : failureMessage,
       updated_at: processedAt,
     });
 
@@ -915,18 +1020,22 @@ const runInspectionAnalysis = async ({
 
     if (processingJob) {
       await processingJob.update({
-        status: 'succeeded',
+        status: onlyTransientRetries ? 'queued' : 'succeeded',
         completed_at: processedAt,
         duration_ms: processingMs,
         image_id: imageId || processingJob.image_id || null,
         job_type: String(jobType || 'AI_ANALYSIS'),
-        last_error: failureMessage,
+        last_error: onlyTransientRetries ? null : failureMessage,
+        leased_until: null,
+        last_heartbeat_at: new Date(),
+        failure_classification: onlyTransientRetries ? 'transient' : 'permanent',
         result: {
           analysisId: null,
           type: String(jobType || 'AI_ANALYSIS'),
           imageId: imageId || null,
           analyzedImageIds,
           failedImageIds,
+          transientRetryImageIds,
           pipelineStatus,
           overallStatus,
           confidenceScore: null,
@@ -942,7 +1051,7 @@ const runInspectionAnalysis = async ({
       toilet_id: inspection.toilet_unit_id || null,
       image_id: imageId || null,
       event_type: 'analysis.completed',
-      event_status: pipelineStatus,
+      event_status: onlyTransientRetries ? 'queued_for_ai' : pipelineStatus,
       source: 'worker',
       payload: {
         analysisId: null,
@@ -950,10 +1059,11 @@ const runInspectionAnalysis = async ({
         imageId: imageId || null,
         analyzedImageIds,
         failedImageIds,
+        transientRetryImageIds,
         queueJobId: queueJobId || null,
         submissionId: submissionId || null,
         confidenceScore: null,
-        reviewRequired: true,
+        reviewRequired: onlyTransientRetries ? false : true,
         severityLabel: null,
         processingMs,
         aggregate,
@@ -965,9 +1075,9 @@ const runInspectionAnalysis = async ({
       inspectionId: inspection.id,
       tenantId: inspection.tenant_id,
       processingStatus,
-      pipelineStatus,
+      pipelineStatus: onlyTransientRetries ? 'queued_for_ai' : pipelineStatus,
       overallStatus,
-      reviewRequired: true,
+      reviewRequired: onlyTransientRetries ? false : true,
       inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
     });
 
@@ -1060,6 +1170,10 @@ const runInspectionAnalysis = async ({
       image_id: imageId || processingJob.image_id || null,
       job_type: String(jobType || 'AI_ANALYSIS'),
       last_error: imageFailures.length > 0 ? failureMessage : null,
+      leased_until: null,
+      last_heartbeat_at: new Date(),
+      failure_classification: imageFailures.length > 0 ? 'permanent' : null,
+      next_retry_at: null,
       result: {
         analysisId: analysis.id,
         type: String(jobType || 'AI_ANALYSIS'),

@@ -211,6 +211,24 @@ const ToiletUnit = sequelize.define(
   { tableName: 'toilet_units', timestamps: false }
 );
 
+const ToiletQrCode = sequelize.define(
+  'ToiletQrCode',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    toilet_unit_id: { type: DataTypes.UUID, allowNull: false },
+    qr_code: { type: DataTypes.STRING(220), allowNull: false },
+    schema_version: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'legacy_v1' },
+    qr_payload: { type: DataTypes.JSONB, allowNull: true },
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'active' },
+    is_primary: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    created_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    updated_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'toilet_qr_codes', timestamps: false }
+);
+
 const InspectionTask = sequelize.define(
   'InspectionTask',
   {
@@ -259,6 +277,7 @@ const Inspection = sequelize.define(
       defaultValue: 'draft',
     },
     pipeline_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'draft' },
+    pipeline_counters: { type: DataTypes.JSONB, allowNull: true },
     review_required: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     last_processing_error: { type: DataTypes.STRING(2000), allowNull: true },
     assignment_id: { type: DataTypes.UUID, allowNull: true },
@@ -300,6 +319,15 @@ const InspectionMedia = sequelize.define(
     media_type: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'image' },
     capture_stage: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'evidence' },
     upload_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'pending' },
+    processing_state: { type: DataTypes.STRING(60), allowNull: false, defaultValue: 'captured' },
+    retry_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    ai_attempt_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    last_retry_at: { type: DataTypes.DATE, allowNull: true },
+    next_retry_at: { type: DataTypes.DATE, allowNull: true },
+    last_error_code: { type: DataTypes.STRING(120), allowNull: true },
+    last_error_message: { type: DataTypes.STRING(2000), allowNull: true },
+    manual_review_required_at: { type: DataTypes.DATE, allowNull: true },
+    storage_verified_at: { type: DataTypes.DATE, allowNull: true },
     ai_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'PENDING_UPLOAD' },
     image_quality_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'unknown' },
     image_quality_score: { type: DataTypes.DECIMAL(6, 4), allowNull: true },
@@ -396,6 +424,10 @@ const ImageSession = sequelize.define(
     content_type: { type: DataTypes.STRING(120), allowNull: false, defaultValue: 'image/jpeg' },
     expected_size: { type: DataTypes.BIGINT, allowNull: true },
     expected_sha256: { type: DataTypes.STRING(128), allowNull: true },
+    object_key_locked: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    reconcile_attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    reconciled_at: { type: DataTypes.DATE, allowNull: true },
+    last_reconcile_error: { type: DataTypes.STRING(1000), allowNull: true },
     status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'created' },
     upload_url_expires_at: { type: DataTypes.DATE, allowNull: true },
     uploaded_at: { type: DataTypes.DATE, allowNull: true },
@@ -437,6 +469,11 @@ const AiProcessingJob = sequelize.define(
     status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'queued' },
     attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
     max_attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 3 },
+    leased_until: { type: DataTypes.DATE, allowNull: true },
+    last_heartbeat_at: { type: DataTypes.DATE, allowNull: true },
+    next_retry_at: { type: DataTypes.DATE, allowNull: true },
+    failure_classification: { type: DataTypes.STRING(40), allowNull: true },
+    dead_letter_reason: { type: DataTypes.STRING(1000), allowNull: true },
     last_error: { type: DataTypes.STRING(2000), allowNull: true },
     dead_lettered_at: { type: DataTypes.DATE, allowNull: true },
     queued_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
@@ -884,6 +921,14 @@ Facility.hasMany(ToiletUnit, { foreignKey: 'facility_id' });
 ToiletUnit.belongsTo(Facility, { foreignKey: 'facility_id' });
 ToiletBlock.hasMany(ToiletUnit, { foreignKey: 'toilet_block_id' });
 ToiletUnit.belongsTo(ToiletBlock, { foreignKey: 'toilet_block_id' });
+Tenant.hasMany(ToiletQrCode, { foreignKey: 'tenant_id', as: 'toiletQrCodes' });
+ToiletQrCode.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+ToiletUnit.hasMany(ToiletQrCode, { foreignKey: 'toilet_unit_id', as: 'qrCodes' });
+ToiletQrCode.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id', as: 'toiletUnit' });
+PlatformUser.hasMany(ToiletQrCode, { foreignKey: 'created_by_user_id', as: 'createdToiletQrCodes' });
+ToiletQrCode.belongsTo(PlatformUser, { foreignKey: 'created_by_user_id', as: 'createdBy' });
+PlatformUser.hasMany(ToiletQrCode, { foreignKey: 'updated_by_user_id', as: 'updatedToiletQrCodes' });
+ToiletQrCode.belongsTo(PlatformUser, { foreignKey: 'updated_by_user_id', as: 'updatedBy' });
 
 Tenant.hasMany(WorkerAssignment, { foreignKey: 'tenant_id' });
 WorkerAssignment.belongsTo(Tenant, { foreignKey: 'tenant_id' });
@@ -1006,6 +1051,7 @@ module.exports = {
   Facility,
   ToiletBlock,
   ToiletUnit,
+  ToiletQrCode,
   InspectionTask,
   Inspection,
   InspectionMedia,

@@ -8,6 +8,12 @@ let redisSuppressed = false;
 let redisErrorLogged = false;
 let redisFallbackLogged = false;
 
+const isProduction = () =>
+  String(process.env.NODE_ENV || 'development').trim().toLowerCase() === 'production';
+
+const isRedisRequiredInProd = () =>
+  String(process.env.REDIS_REQUIRED_IN_PROD || 'true').trim().toLowerCase() !== 'false';
+
 const isRedisEnabled = () =>
   Boolean(
     !redisSuppressed &&
@@ -43,6 +49,32 @@ const suppressRedis = (reason) => {
     }
     redisConnection = null;
   }
+};
+
+const assertQueueRuntimePolicy = () => {
+  if (!isProduction() || !isRedisRequiredInProd()) {
+    return true;
+  }
+
+  if (!process.env.REDIS_URL) {
+    throw new Error(
+      'REDIS_REQUIRED_IN_PROD=true but REDIS_URL is missing. Refusing inline queue mode in production.'
+    );
+  }
+
+  if (String(process.env.REDIS_ENABLED || 'true').toLowerCase() !== 'true') {
+    throw new Error(
+      'REDIS_REQUIRED_IN_PROD=true but REDIS_ENABLED is false. Refusing inline queue mode in production.'
+    );
+  }
+
+  if (redisSuppressed) {
+    throw new Error(
+      'Redis was suppressed due connectivity issues and REDIS_REQUIRED_IN_PROD=true. Queue fallback is disabled in production.'
+    );
+  }
+
+  return true;
 };
 
 const getRedisConnection = () => {
@@ -246,4 +278,5 @@ module.exports = {
   getQueueMetrics,
   closeQueues,
   isRedisEnabled,
+  assertQueueRuntimePolicy,
 };

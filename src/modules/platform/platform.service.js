@@ -1,11 +1,16 @@
-const { Op } = require('sequelize');
+const crypto = require('crypto');
+const { Op, QueryTypes } = require('sequelize');
+const { v4: uuidv4 } = require('uuid');
 const AppError = require('../../core/errors/AppError');
 const {
+  sequelize,
   Tenant,
   Geography,
   Facility,
   ToiletBlock,
   ToiletUnit,
+  ToiletQrCode,
+  WorkerAssignment,
 } = require('../../models');
 const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
@@ -56,6 +61,276 @@ const normalizePermanentQrCode = (value) => {
   const text = sanitizeText(value, 180);
   if (!text) return '';
   return text.toUpperCase();
+};
+
+const QR_SCHEMA_V2 = 'v2';
+const QR_V2_PREFIX = 'SANQR2';
+const QR_V2_TOKEN_PATTERN =
+  /^SANQR2:([0-9A-F-]{36}):([0-9A-F-]{36}):([0-9A-F-]{36}):([A-F0-9]{64})$/i;
+
+const normalizeUuid = (value) => {
+  const text = String(value || '').trim();
+  if (!text || !isUuidLike(text)) return null;
+  return text.toLowerCase();
+};
+
+const normalizeQrVersion = (value) => {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return null;
+  if (text === '2' || text === 'v2' || text === 'qr_v2') return QR_SCHEMA_V2;
+  if (text === '1' || text === 'v1' || text === 'legacy' || text === 'legacy_v1') {
+    return 'legacy_v1';
+  }
+  return text;
+};
+
+const resolveQrSigningSecret = () =>
+  String(process.env.QR_V2_SIGNING_SECRET || process.env.JWT_SECRET || '').trim() ||
+  'sanitation-qr-signing-secret';
+
+const buildCanonicalQrSignatureInput = ({ version, toiletUnitId, tenantId, qrId }) =>
+  [String(version || '').trim(), String(tenantId || '').trim(), String(toiletUnitId || '').trim(), String(qrId || '').trim()].join(
+    '|'
+  );
+
+const signCanonicalQrPayload = ({ version, toiletUnitId, tenantId, qrId }) => {
+  const input = buildCanonicalQrSignatureInput({
+    version,
+    toiletUnitId: normalizeUuid(toiletUnitId),
+    tenantId: normalizeUuid(tenantId),
+    qrId: normalizeUuid(qrId),
+  });
+  return crypto.createHmac('sha256', resolveQrSigningSecret()).update(input).digest('hex');
+};
+
+const buildCanonicalQrV2Payload = ({ toiletUnitId, tenantId, qrId = null }) => {
+  const normalizedToiletUnitId = normalizeUuid(toiletUnitId);
+  const normalizedTenantId = normalizeUuid(tenantId);
+  const normalizedQrId = normalizeUuid(qrId || uuidv4());
+  if (!normalizedToiletUnitId || !normalizedTenantId || !normalizedQrId) {
+    throw new AppError('Unable to build canonical QR payload', 500, {
+      code: 'QR_PAYLOAD_BUILD_FAILED',
+    });
+  }
+
+  const signature = signCanonicalQrPayload({
+    version: QR_SCHEMA_V2,
+    toiletUnitId: normalizedToiletUnitId,
+    tenantId: normalizedTenantId,
+    qrId: normalizedQrId,
+  });
+
+  return {
+    version: QR_SCHEMA_V2,
+    toiletUnitId: normalizedToiletUnitId,
+    tenantId: normalizedTenantId,
+    qrId: normalizedQrId,
+    signature,
+  };
+};
+
+const encodeCanonicalQrV2Token = (payload = {}) => {
+  const toiletUnitId = normalizeUuid(payload.toiletUnitId);
+  const tenantId = normalizeUuid(payload.tenantId);
+  const qrId = normalizeUuid(payload.qrId);
+  const signature = String(payload.signature || '').trim().toUpperCase();
+  if (!toiletUnitId || !tenantId || !qrId || !signature) {
+    throw new AppError('Canonical QR payload is incomplete', 500, {
+      code: 'QR_PAYLOAD_INVALID',
+    });
+  }
+
+  return `${QR_V2_PREFIX}:${toiletUnitId.toUpperCase()}:${tenantId.toUpperCase()}:${qrId.toUpperCase()}:${signature}`;
+};
+
+const parseCanonicalQrV2Token = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const match = raw.match(QR_V2_TOKEN_PATTERN);
+  if (!match) return null;
+
+  const parsed = {
+    version: QR_SCHEMA_V2,
+    toiletUnitId: normalizeUuid(match[1]),
+    tenantId: normalizeUuid(match[2]),
+    qrId: normalizeUuid(match[3]),
+    signature: String(match[4] || '').trim().toLowerCase(),
+  };
+  if (!parsed.toiletUnitId || !parsed.tenantId || !parsed.qrId || !parsed.signature) {
+    return null;
+  }
+  return parsed;
+};
+
+const tryParseCanonicalQrPayload = (rawValue) => {
+  const raw = sanitizeText(rawValue, 800);
+  if (!raw) {
+    return {
+      payload: null,
+      explicitVersion: null,
+    };
+  }
+
+  const tokenPayload = parseCanonicalQrV2Token(raw);
+  if (tokenPayload) {
+    return {
+      payload: tokenPayload,
+      explicitVersion: QR_SCHEMA_V2,
+    };
+  }
+
+  try {
+    const parsedJson = JSON.parse(raw);
+    if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+      const explicitVersion = normalizeQrVersion(
+        parsedJson.version || parsedJson.v || parsedJson.schemaVersion
+      );
+      const payload = {
+        version: explicitVersion,
+        toiletUnitId: normalizeUuid(parsedJson.toiletUnitId || parsedJson.toilet_unit_id),
+        tenantId: normalizeUuid(parsedJson.tenantId || parsedJson.tenant_id),
+        qrId: normalizeUuid(parsedJson.qrId || parsedJson.qr_id || parsedJson.id),
+        signature: String(parsedJson.signature || parsedJson.sig || '').trim().toLowerCase() || null,
+      };
+      if (
+        payload.version &&
+        payload.toiletUnitId &&
+        payload.tenantId &&
+        payload.qrId &&
+        payload.signature
+      ) {
+        return {
+          payload,
+          explicitVersion: payload.version,
+        };
+      }
+      return {
+        payload: null,
+        explicitVersion,
+      };
+    }
+  } catch (_) {
+    // ignore non-JSON payload
+  }
+
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      const parsedUrl = new URL(raw);
+      const explicitVersion = normalizeQrVersion(
+        parsedUrl.searchParams.get('version') ||
+          parsedUrl.searchParams.get('v') ||
+          parsedUrl.searchParams.get('schemaVersion')
+      );
+      const payload = {
+        version: explicitVersion,
+        toiletUnitId: normalizeUuid(
+          parsedUrl.searchParams.get('toiletUnitId') ||
+            parsedUrl.searchParams.get('toilet_unit_id') ||
+            parsedUrl.searchParams.get('unitId')
+        ),
+        tenantId: normalizeUuid(
+          parsedUrl.searchParams.get('tenantId') ||
+            parsedUrl.searchParams.get('tenant_id')
+        ),
+        qrId: normalizeUuid(
+          parsedUrl.searchParams.get('qrId') ||
+            parsedUrl.searchParams.get('qr_id') ||
+            parsedUrl.searchParams.get('id')
+        ),
+        signature:
+          String(
+            parsedUrl.searchParams.get('signature') || parsedUrl.searchParams.get('sig') || ''
+          )
+            .trim()
+            .toLowerCase() || null,
+      };
+
+      if (
+        payload.version &&
+        payload.toiletUnitId &&
+        payload.tenantId &&
+        payload.qrId &&
+        payload.signature
+      ) {
+        return {
+          payload,
+          explicitVersion: payload.version,
+        };
+      }
+      return {
+        payload: null,
+        explicitVersion,
+      };
+    }
+  } catch (_) {
+    // ignore malformed URL QR payloads
+  }
+
+  const explicitVersion =
+    raw.toUpperCase().startsWith('SANQR') && !raw.toUpperCase().startsWith(QR_V2_PREFIX)
+      ? 'unsupported'
+      : null;
+
+  return {
+    payload: null,
+    explicitVersion,
+  };
+};
+
+const validateCanonicalQrPayload = (payload) => {
+  if (!payload) {
+    return {
+      valid: false,
+      reasonCode: 'INVALID_QR_FORMAT',
+      reason: 'Canonical payload not present',
+    };
+  }
+
+  const version = normalizeQrVersion(payload.version);
+  if (!version || version !== QR_SCHEMA_V2) {
+    return {
+      valid: false,
+      reasonCode: 'QR_UNSUPPORTED_VERSION',
+      reason: 'QR schema version is not supported',
+    };
+  }
+
+  const toiletUnitId = normalizeUuid(payload.toiletUnitId);
+  const tenantId = normalizeUuid(payload.tenantId);
+  const qrId = normalizeUuid(payload.qrId);
+  const signature = String(payload.signature || '').trim().toLowerCase();
+  if (!toiletUnitId || !tenantId || !qrId || !signature) {
+    return {
+      valid: false,
+      reasonCode: 'INVALID_QR_FORMAT',
+      reason: 'Canonical payload fields missing',
+    };
+  }
+
+  const expectedSignature = signCanonicalQrPayload({
+    version,
+    toiletUnitId,
+    tenantId,
+    qrId,
+  });
+  if (expectedSignature !== signature) {
+    return {
+      valid: false,
+      reasonCode: 'INVALID_QR_FORMAT',
+      reason: 'Canonical QR signature mismatch',
+    };
+  }
+
+  return {
+    valid: true,
+    payload: {
+      version,
+      toiletUnitId,
+      tenantId,
+      qrId,
+      signature,
+    },
+  };
 };
 
 const normalizeIdentifierPart = (value, fallback) => {
@@ -286,27 +561,39 @@ const buildQrResolveWhere = (candidates = []) => {
 
 const QR_RESOLVE_REASON_CODES = Object.freeze({
   INVALID_QR_FORMAT: 'INVALID_QR_FORMAT',
-  QR_NOT_MAPPED: 'QR_NOT_MAPPED',
+  QR_UNSUPPORTED_VERSION: 'QR_UNSUPPORTED_VERSION',
+  QR_NOT_FOUND: 'QR_NOT_FOUND',
   TOILET_NOT_FOUND: 'TOILET_NOT_FOUND',
   TOILET_INACTIVE: 'TOILET_INACTIVE',
-  TOILET_NOT_IN_USER_SCOPE: 'TOILET_NOT_IN_USER_SCOPE',
-  DUPLICATE_QR_MAPPING: 'DUPLICATE_QR_MAPPING',
+  TENANT_MISMATCH: 'TENANT_MISMATCH',
+  ORG_MISMATCH: 'ORG_MISMATCH',
+  ASSIGNMENT_MISSING: 'ASSIGNMENT_MISSING',
+  WORKER_SCOPE_DENIED: 'WORKER_SCOPE_DENIED',
+  SCOPE_REFRESH_RECOMMENDED: 'SCOPE_REFRESH_RECOMMENDED',
   QR_RESOLVED_SUCCESSFULLY: 'QR_RESOLVED_SUCCESSFULLY',
 });
 
 const QR_RESOLVE_MESSAGES = {
   [QR_RESOLVE_REASON_CODES.INVALID_QR_FORMAT]:
     'Invalid QR format. Please scan a valid toilet QR.',
-  [QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED]:
+  [QR_RESOLVE_REASON_CODES.QR_UNSUPPORTED_VERSION]:
+    'This QR version is not supported by the app yet.',
+  [QR_RESOLVE_REASON_CODES.QR_NOT_FOUND]:
     'This QR is not mapped to any toilet.',
   [QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND]:
     'Toilet not found for this QR.',
   [QR_RESOLVE_REASON_CODES.TOILET_INACTIVE]:
     'This toilet is inactive. Contact your supervisor.',
-  [QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE]:
-    'QR recognized, but this toilet is not assigned to your area.',
-  [QR_RESOLVE_REASON_CODES.DUPLICATE_QR_MAPPING]:
-    'This QR is mapped to multiple toilets. Contact administrator.',
+  [QR_RESOLVE_REASON_CODES.TENANT_MISMATCH]:
+    'This QR belongs to another organization.',
+  [QR_RESOLVE_REASON_CODES.ORG_MISMATCH]:
+    'QR metadata does not match the mapped toilet.',
+  [QR_RESOLVE_REASON_CODES.ASSIGNMENT_MISSING]:
+    'You do not have an active assignment for this QR.',
+  [QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED]:
+    'QR recognized, but this toilet is not assigned to you.',
+  [QR_RESOLVE_REASON_CODES.SCOPE_REFRESH_RECOMMENDED]:
+    'Toilet resolved, but your assignment scope is stale. Refreshing assignments.',
   [QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY]:
     'Toilet QR resolved successfully.',
 };
@@ -336,12 +623,13 @@ const logQrResolve = (req, level, payload = {}) => {
 
 const buildQrResolveResult = ({
   status = 'failed',
-  reasonCode = QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED,
+  reasonCode = QR_RESOLVE_REASON_CODES.QR_NOT_FOUND,
   rawQrValue = '',
   normalizedQrValue = '',
   parsed = {},
   toilet = null,
   details = null,
+  scopeRefreshRecommended = false,
 }) => ({
   status,
   resolved: status === 'resolved',
@@ -352,6 +640,7 @@ const buildQrResolveResult = ({
   parsed,
   toilet,
   details,
+  scopeRefreshRecommended: Boolean(scopeRefreshRecommended),
 });
 
 const isToiletInactive = (row) => {
@@ -395,6 +684,32 @@ const findDuplicateExactMatchIds = (rows = [], candidates = []) => {
   );
 };
 
+const isPrivilegedRoleForQrResolve = (req) => {
+  if (req?.user?.isSuperAdmin) return true;
+  if (String(req?.user?.scopeLevel || '').toLowerCase() === 'organization') return true;
+
+  const roleCodes = new Set(
+    (Array.isArray(req?.user?.roleCodes) ? req.user.roleCodes : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (
+    roleCodes.has('tenant_admin') ||
+    roleCodes.has('platform_ops') ||
+    roleCodes.has('supervisor') ||
+    roleCodes.has('facility_manager')
+  ) {
+    return true;
+  }
+
+  const permissionCodes = new Set(
+    (Array.isArray(req?.user?.permissionCodes) ? req.user.permissionCodes : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  return permissionCodes.has('inspection.review') || permissionCodes.has('task.manage');
+};
+
 const classifyResolvedToilet = ({ row, req }) => {
   if (!row) {
     return QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND;
@@ -402,84 +717,122 @@ const classifyResolvedToilet = ({ row, req }) => {
   if (isToiletInactive(row)) {
     return QR_RESOLVE_REASON_CODES.TOILET_INACTIVE;
   }
+  if (!req?.user?.isSuperAdmin && req?.user?.tenantId && row?.Facility?.tenant_id) {
+    if (String(req.user.tenantId) !== String(row.Facility.tenant_id)) {
+      return QR_RESOLVE_REASON_CODES.TENANT_MISMATCH;
+    }
+  }
   if (!isFacilityInScope(req, row.facility_id || row.Facility?.id || null)) {
-    return QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE;
+    return QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED;
   }
   return QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY;
 };
 
-const mapUnitRow = (row) => ({
-  id: row.id,
-  facilityId: row.facility_id,
-  facilityCode: row.Facility?.code || null,
-  facilityName: row.Facility?.name || null,
-  toiletBlockId: row.toilet_block_id,
-  code: row.code,
-  qrCode: row.qr_code || row.code,
-  appQrCode: row.qr_code || row.code,
-  qrImageUrl: getQrImageUrl(row.id),
-  appQrImageUrl: getQrImageUrl(row.id),
-  feedbackQrImageUrl: getFeedbackQrImageUrl(row.id),
-  publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: row.id }),
-  unitType: row.unit_type,
-  status: row.status,
-  sectorCode:
-    row.sector_code ||
-    row.Facility?.metadata?.sector ||
-    row.Facility?.metadata?.zone ||
-    null,
-  locationLabel:
-    row.location_label ||
-    row.Facility?.address_line ||
-    row.Facility?.name ||
-    null,
-  latitude:
-    row.latitude !== null && row.latitude !== undefined
-      ? Number(row.latitude)
-      : row.Facility?.latitude !== null && row.Facility?.latitude !== undefined
-        ? Number(row.Facility.latitude)
+const mapUnitRow = (row, options = {}) => {
+  const resolvedQrCode = String(options.resolvedQrCode || row.qr_code || row.code || '').trim();
+  const legacyQrCode = String(options.legacyQrCode || row.qr_code || row.code || '').trim();
+  return {
+    id: row.id,
+    facilityId: row.facility_id,
+    facilityCode: row.Facility?.code || null,
+    facilityName: row.Facility?.name || null,
+    toiletBlockId: row.toilet_block_id,
+    code: row.code,
+    qrId: options.qrId || null,
+    qrSchemaVersion: options.qrSchemaVersion || null,
+    qrCode: resolvedQrCode || legacyQrCode || null,
+    appQrCode: resolvedQrCode || legacyQrCode || null,
+    legacyQrCode: legacyQrCode || null,
+    qrImageUrl: getQrImageUrl(row.id),
+    appQrImageUrl: getQrImageUrl(row.id),
+    feedbackQrImageUrl: getFeedbackQrImageUrl(row.id),
+    publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: row.id }),
+    unitType: row.unit_type,
+    status: row.status,
+    sectorCode:
+      row.sector_code ||
+      row.Facility?.metadata?.sector ||
+      row.Facility?.metadata?.zone ||
+      null,
+    locationLabel:
+      row.location_label ||
+      row.Facility?.address_line ||
+      row.Facility?.name ||
+      null,
+    latitude:
+      row.latitude !== null && row.latitude !== undefined
+        ? Number(row.latitude)
+        : row.Facility?.latitude !== null && row.Facility?.latitude !== undefined
+          ? Number(row.Facility.latitude)
+          : null,
+    longitude:
+      row.longitude !== null && row.longitude !== undefined
+        ? Number(row.longitude)
+        : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
+          ? Number(row.Facility.longitude)
+          : null,
+    latestScore:
+      row.latest_score !== null && row.latest_score !== undefined
+        ? Number(row.latest_score)
         : null,
-  longitude:
-    row.longitude !== null && row.longitude !== undefined
-      ? Number(row.longitude)
-      : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
-        ? Number(row.Facility.longitude)
+    latestBeforeScore:
+      row.latest_before_score !== null && row.latest_before_score !== undefined
+        ? Number(row.latest_before_score)
         : null,
-  latestScore:
-    row.latest_score !== null && row.latest_score !== undefined
-      ? Number(row.latest_score)
-      : null,
-  latestBeforeScore:
-    row.latest_before_score !== null && row.latest_before_score !== undefined
-      ? Number(row.latest_before_score)
-      : null,
-  latestAfterScore:
-    row.latest_after_score !== null && row.latest_after_score !== undefined
-      ? Number(row.latest_after_score)
-      : null,
-  avgBeforeScore:
-    row.avg_before_score !== null && row.avg_before_score !== undefined
-      ? Number(row.avg_before_score)
-      : null,
-  avgAfterScore:
-    row.avg_after_score !== null && row.avg_after_score !== undefined
-      ? Number(row.avg_after_score)
-      : null,
-  avgImprovementScore:
-    row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
-      ? Number(row.avg_improvement_score)
-      : null,
-  totalInspections: Number(row.total_inspections || 0),
-  lastInspectionAt: row.last_inspection_at || null,
-  dirtyFrequency:
-    row.dirty_frequency !== null && row.dirty_frequency !== undefined
-      ? Number(row.dirty_frequency)
-      : 0,
-  lowPerformanceFrequency:
-    row.low_performance_frequency !== null && row.low_performance_frequency !== undefined
-      ? Number(row.low_performance_frequency)
-      : 0,
-});
+    latestAfterScore:
+      row.latest_after_score !== null && row.latest_after_score !== undefined
+        ? Number(row.latest_after_score)
+        : null,
+    avgBeforeScore:
+      row.avg_before_score !== null && row.avg_before_score !== undefined
+        ? Number(row.avg_before_score)
+        : null,
+    avgAfterScore:
+      row.avg_after_score !== null && row.avg_after_score !== undefined
+        ? Number(row.avg_after_score)
+        : null,
+    avgImprovementScore:
+      row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
+        ? Number(row.avg_improvement_score)
+        : null,
+    totalInspections: Number(row.total_inspections || 0),
+    lastInspectionAt: row.last_inspection_at || null,
+    dirtyFrequency:
+      row.dirty_frequency !== null && row.dirty_frequency !== undefined
+        ? Number(row.dirty_frequency)
+        : 0,
+    lowPerformanceFrequency:
+      row.low_performance_frequency !== null && row.low_performance_frequency !== undefined
+        ? Number(row.low_performance_frequency)
+        : 0,
+  };
+};
+
+const loadPrimaryQrMapForToiletIds = async (toiletIds = [], { transaction = null } = {}) => {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(toiletIds) ? toiletIds : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  );
+  if (ids.length === 0) return new Map();
+
+  const rows = await ToiletQrCode.findAll({
+    where: {
+      toilet_unit_id: { [Op.in]: ids },
+      status: 'active',
+      is_primary: true,
+    },
+    attributes: ['id', 'toilet_unit_id', 'qr_code', 'schema_version'],
+    transaction,
+  });
+  const map = new Map();
+  for (const row of rows) {
+    map.set(String(row.toilet_unit_id), row);
+  }
+  return map;
+};
 
 const scoreCandidateMatch = (row, candidates = []) => {
   const qr = normalizePermanentQrCode(row.qr_code || '');
@@ -497,6 +850,229 @@ const scoreCandidateMatch = (row, candidates = []) => {
   return 0;
 };
 
+const scoreQrRecordMatch = (row, candidates = []) => {
+  const qr = normalizePermanentQrCode(row.qr_code || '');
+  const qrId = String(row.id || '').trim().toLowerCase();
+  const toiletUnitId = String(row.toilet_unit_id || '').trim().toLowerCase();
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = normalizePermanentQrCode(candidates[index]);
+    if (!candidate) continue;
+    if (qr && qr === candidate) return 1400 - index;
+    if (isUuidLike(candidate) && qrId === candidate.toLowerCase()) return 1350 - index;
+    if (isUuidLike(candidate) && toiletUnitId === candidate.toLowerCase()) return 1300 - index;
+    if (qr && qr.includes(candidate)) return 900 - index;
+  }
+  return 0;
+};
+
+const resolveAssignmentAuthorization = async ({ req, row }) => {
+  if (!row) {
+    return {
+      allowed: false,
+      reasonCode: QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND,
+      details: null,
+      scopeRefreshRecommended: false,
+    };
+  }
+
+  if (req?.user?.isSuperAdmin) {
+    return {
+      allowed: true,
+      reasonCode: QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY,
+      details: {
+        mode: 'super_admin',
+      },
+      scopeRefreshRecommended: false,
+    };
+  }
+
+  const rowTenantId = String(row.Facility?.tenant_id || '').trim();
+  const userTenantId = String(req?.user?.tenantId || '').trim();
+  if (rowTenantId && userTenantId && rowTenantId !== userTenantId) {
+    return {
+      allowed: false,
+      reasonCode: QR_RESOLVE_REASON_CODES.TENANT_MISMATCH,
+      details: {
+        toiletTenantId: rowTenantId,
+        userTenantId,
+      },
+      scopeRefreshRecommended: false,
+    };
+  }
+
+  const privilegedRole = isPrivilegedRoleForQrResolve(req);
+  const assignments = await WorkerAssignment.findAll({
+    where: {
+      user_id: req?.user?.id || null,
+      tenant_id: rowTenantId || userTenantId || null,
+      status: 'active',
+    },
+    attributes: ['id', 'assignment_level', 'geography_id', 'facility_id', 'toilet_unit_id'],
+  });
+
+  const facilityId = String(row.facility_id || row.Facility?.id || '').trim();
+  const toiletId = String(row.id || '').trim();
+  const geographyId = String(row.Facility?.geography_id || '').trim();
+
+  const matchedAssignment = assignments.find((assignment) => {
+    const level = String(assignment.assignment_level || '').trim().toLowerCase();
+    if (level === 'tenant') return true;
+    if (level === 'toilet_unit') {
+      return (
+        String(assignment.toilet_unit_id || '').trim() === toiletId
+      );
+    }
+    if (level === 'facility') {
+      return (
+        String(assignment.facility_id || '').trim() === facilityId
+      );
+    }
+    if (level === 'geography') {
+      return (
+        geographyId &&
+        String(assignment.geography_id || '').trim() === geographyId
+      );
+    }
+    // legacy rows without assignment_level fallback
+    if (String(assignment.toilet_unit_id || '').trim() === toiletId) return true;
+    if (String(assignment.facility_id || '').trim() === facilityId) return true;
+    if (geographyId && String(assignment.geography_id || '').trim() === geographyId) return true;
+    return false;
+  });
+
+  if (!matchedAssignment && assignments.length === 0 && !privilegedRole) {
+    return {
+      allowed: false,
+      reasonCode: QR_RESOLVE_REASON_CODES.ASSIGNMENT_MISSING,
+      details: {
+        workerId: req?.user?.id || null,
+      },
+      scopeRefreshRecommended: false,
+    };
+  }
+
+  if (!matchedAssignment && !privilegedRole) {
+    return {
+      allowed: false,
+      reasonCode: QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED,
+      details: {
+        workerId: req?.user?.id || null,
+        assignmentCount: assignments.length,
+      },
+      scopeRefreshRecommended: false,
+    };
+  }
+
+  const tokenScopeAllowed = isFacilityInScope(req, facilityId || null);
+  return {
+    allowed: true,
+    reasonCode: tokenScopeAllowed
+      ? QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY
+      : QR_RESOLVE_REASON_CODES.SCOPE_REFRESH_RECOMMENDED,
+    details: {
+      mode: matchedAssignment ? 'assignment_match' : 'privileged_role',
+      assignmentId: matchedAssignment?.id || null,
+      assignmentLevel: matchedAssignment?.assignment_level || null,
+      tokenScopeAllowed,
+    },
+    scopeRefreshRecommended: !tokenScopeAllowed,
+  };
+};
+
+const loadQrMappedRowsByCandidates = async ({ candidates = [] }) => {
+  const normalizedCandidates = Array.from(
+    new Set(
+      (Array.isArray(candidates) ? candidates : [])
+        .map((candidate) => normalizePermanentQrCode(candidate))
+        .filter(Boolean)
+    )
+  ).slice(0, 24);
+  if (normalizedCandidates.length === 0) return [];
+
+  const idRows = await sequelize.query(
+    `
+      SELECT q.id
+      FROM toilet_qr_codes q
+      WHERE q.status = 'active'
+        AND UPPER(TRIM(q.qr_code)) = ANY(:candidateCodes)
+      ORDER BY q.is_primary DESC, q.created_at DESC
+      LIMIT 60
+    `,
+    {
+      replacements: { candidateCodes: normalizedCandidates },
+      type: QueryTypes.SELECT,
+    }
+  );
+  const qrIds = idRows.map((row) => String(row.id || '').trim()).filter(Boolean);
+  if (qrIds.length === 0) return [];
+
+  return ToiletQrCode.findAll({
+    where: { id: { [Op.in]: qrIds }, status: 'active' },
+    include: [
+      {
+        model: ToiletUnit,
+        as: 'toiletUnit',
+        required: false,
+        include: [
+          {
+            model: Facility,
+            attributes: [
+              'id',
+              'tenant_id',
+              'geography_id',
+              'code',
+              'name',
+              'address_line',
+              'latitude',
+              'longitude',
+              'metadata',
+              'status',
+            ],
+            required: false,
+          },
+        ],
+      },
+    ],
+    order: [['is_primary', 'DESC'], ['created_at', 'DESC']],
+  });
+};
+
+const loadLegacyToiletRowsByCandidates = async ({ candidates = [] }) => {
+  const normalizedCandidates = Array.from(
+    new Set(
+      (Array.isArray(candidates) ? candidates : [])
+        .map((candidate) => normalizePermanentQrCode(candidate))
+        .filter(Boolean)
+    )
+  ).slice(0, 12);
+  if (normalizedCandidates.length === 0) return [];
+
+  const where = buildQrResolveWhere(normalizedCandidates);
+  return ToiletUnit.findAll({
+    where,
+    include: [
+      {
+        model: Facility,
+        attributes: [
+          'id',
+          'tenant_id',
+          'geography_id',
+          'code',
+          'name',
+          'address_line',
+          'latitude',
+          'longitude',
+          'metadata',
+          'status',
+        ],
+        required: true,
+      },
+    ],
+    limit: 40,
+    order: [['code', 'ASC']],
+  });
+};
+
 const resolveToiletFromQr = async ({
   req,
   rawQrValue,
@@ -505,10 +1081,27 @@ const resolveToiletFromQr = async ({
 }) => {
   const rawInput = sanitizeText(rawQrValue, 800);
   const normalizedInput = normalizePermanentQrCode(normalizedQrValue || rawInput);
-  const candidates = extractQrCandidates(normalizedQrValue || rawInput);
+  const candidateSource = normalizedQrValue || rawInput;
+  const candidates = extractQrCandidates(candidateSource);
+  const canonical = tryParseCanonicalQrPayload(rawInput);
+  const canonicalValidation = canonical.payload ? validateCanonicalQrPayload(canonical.payload) : null;
+  const canonicalPayload = canonicalValidation?.valid ? canonicalValidation.payload : null;
+  if (canonicalPayload) {
+    candidates.unshift(encodeCanonicalQrV2Token(canonicalPayload));
+  }
+  const uniqueCandidates = Array.from(new Set(candidates)).slice(0, 24);
+
   const parsedMeta = {
-    extractedIdentifier: extractLikelyIdentifier(candidates),
-    candidates,
+    extractedIdentifier: extractLikelyIdentifier(uniqueCandidates),
+    candidates: uniqueCandidates,
+    canonicalPayload: canonicalPayload
+      ? {
+          version: canonicalPayload.version,
+          toiletUnitId: canonicalPayload.toiletUnitId,
+          tenantId: canonicalPayload.tenantId,
+          qrId: canonicalPayload.qrId,
+        }
+      : null,
   };
 
   logQrResolve(req, 'info', {
@@ -519,7 +1112,7 @@ const resolveToiletFromQr = async ({
     workerContext,
   });
 
-  if (candidates.length === 0) {
+  if (!rawInput || uniqueCandidates.length === 0) {
     return buildQrResolveResult({
       status: 'failed',
       reasonCode: QR_RESOLVE_REASON_CODES.INVALID_QR_FORMAT,
@@ -529,45 +1122,135 @@ const resolveToiletFromQr = async ({
     });
   }
 
-  const baseFacilityInclude = {
-    model: Facility,
-    attributes: [
-      'id',
-      'tenant_id',
-      'code',
-      'name',
-      'address_line',
-      'latitude',
-      'longitude',
-      'metadata',
-      'status',
-    ],
-    required: true,
-  };
-  const where = buildQrResolveWhere(candidates);
+  if (canonical.payload && canonicalValidation && !canonicalValidation.valid) {
+    return buildQrResolveResult({
+      status: 'failed',
+      reasonCode: canonicalValidation.reasonCode || QR_RESOLVE_REASON_CODES.INVALID_QR_FORMAT,
+      rawQrValue: rawInput,
+      normalizedQrValue: normalizedInput,
+      parsed: parsedMeta,
+      details: { reason: canonicalValidation.reason || null },
+    });
+  }
 
-  const tenantWideFacilityInclude = {
-    ...baseFacilityInclude,
-    where: withTenantScope(req, {}),
-  };
+  if (!canonical.payload && canonical.explicitVersion && canonical.explicitVersion !== 'legacy_v1') {
+    return buildQrResolveResult({
+      status: 'failed',
+      reasonCode: QR_RESOLVE_REASON_CODES.QR_UNSUPPORTED_VERSION,
+      rawQrValue: rawInput,
+      normalizedQrValue: normalizedInput,
+      parsed: parsedMeta,
+      details: {
+        detectedVersion: canonical.explicitVersion,
+      },
+    });
+  }
 
-  const rows = await ToiletUnit.findAll({
-    where,
-    include: [tenantWideFacilityInclude],
-    limit: 40,
-    order: [['code', 'ASC']],
-  });
+  let selectedQr = null;
+  let selectedToilet = null;
+  let lookupPath = null;
+
+  if (canonicalPayload?.qrId) {
+    const qrRow = await ToiletQrCode.findOne({
+      where: { id: canonicalPayload.qrId, status: 'active' },
+      include: [
+        {
+          model: ToiletUnit,
+          as: 'toiletUnit',
+          required: false,
+          include: [
+            {
+              model: Facility,
+              attributes: [
+                'id',
+                'tenant_id',
+                'geography_id',
+                'code',
+                'name',
+                'address_line',
+                'latitude',
+                'longitude',
+                'metadata',
+                'status',
+              ],
+              required: false,
+            },
+          ],
+        },
+      ],
+    });
+    if (qrRow) {
+      selectedQr = qrRow;
+      selectedToilet = qrRow.toiletUnit || null;
+      lookupPath = 'toilet_qr_codes.id';
+    }
+  }
+
+  if (!selectedQr) {
+    const qrRows = await loadQrMappedRowsByCandidates({ candidates: uniqueCandidates });
+    if (qrRows.length > 0) {
+      selectedQr = [...qrRows].sort(
+        (left, right) => scoreQrRecordMatch(right, uniqueCandidates) - scoreQrRecordMatch(left, uniqueCandidates)
+      )[0];
+      selectedToilet = selectedQr?.toiletUnit || null;
+      lookupPath = 'toilet_qr_codes.qr_code';
+    }
+  }
+
+  if (!selectedToilet) {
+    const legacyRows = await loadLegacyToiletRowsByCandidates({ candidates: uniqueCandidates });
+    if (legacyRows.length > 0) {
+      selectedToilet = [...legacyRows].sort(
+        (left, right) => scoreCandidateMatch(right, uniqueCandidates) - scoreCandidateMatch(left, uniqueCandidates)
+      )[0];
+      lookupPath = 'toilet_units.legacy_lookup';
+    }
+  }
+
   logQrResolve(req, 'info', {
     stage: 'db_lookup',
-    lookupPath: 'toilet_units.qr_code|code|id',
-    candidateCount: candidates.length,
-    matchCount: rows.length,
+    lookupPath: lookupPath || 'none',
+    candidateCount: uniqueCandidates.length,
+    qrId: selectedQr?.id || null,
+    matchedToiletId: selectedToilet?.id || null,
   });
 
-  if (!rows.length) {
-    const reasonCode = parsedMeta.extractedIdentifier && isUuidLike(parsedMeta.extractedIdentifier)
-      ? QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND
-      : QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED;
+  if (canonicalPayload && selectedQr) {
+    if (canonicalPayload.toiletUnitId !== String(selectedQr.toilet_unit_id || '').trim().toLowerCase()) {
+      return buildQrResolveResult({
+        status: 'failed',
+        reasonCode: QR_RESOLVE_REASON_CODES.ORG_MISMATCH,
+        rawQrValue: rawInput,
+        normalizedQrValue: normalizedInput,
+        parsed: parsedMeta,
+        details: {
+          expectedToiletUnitId: canonicalPayload.toiletUnitId,
+          mappedToiletUnitId: selectedQr.toilet_unit_id || null,
+        },
+      });
+    }
+    if (canonicalPayload.tenantId && selectedQr.tenant_id) {
+      if (canonicalPayload.tenantId !== String(selectedQr.tenant_id).trim().toLowerCase()) {
+        return buildQrResolveResult({
+          status: 'failed',
+          reasonCode: QR_RESOLVE_REASON_CODES.ORG_MISMATCH,
+          rawQrValue: rawInput,
+          normalizedQrValue: normalizedInput,
+          parsed: parsedMeta,
+          details: {
+            expectedTenantId: canonicalPayload.tenantId,
+            mappedTenantId: selectedQr.tenant_id || null,
+          },
+        });
+      }
+    }
+  }
+
+  if (!selectedToilet) {
+    const reasonCode =
+      parsedMeta.extractedIdentifier && isUuidLike(parsedMeta.extractedIdentifier)
+        ? QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND
+        : QR_RESOLVE_REASON_CODES.QR_NOT_FOUND;
     return buildQrResolveResult({
       status: 'failed',
       reasonCode,
@@ -577,48 +1260,7 @@ const resolveToiletFromQr = async ({
     });
   }
 
-  const exactMatchedIds = findDuplicateExactMatchIds(rows, candidates);
-  if (exactMatchedIds.length > 1) {
-    logQrResolve(req, 'warn', {
-      stage: 'duplicate_mapping',
-      matchedToiletIds: exactMatchedIds,
-      parsed: parsedMeta,
-    });
-    return buildQrResolveResult({
-      status: 'failed',
-      reasonCode: QR_RESOLVE_REASON_CODES.DUPLICATE_QR_MAPPING,
-      rawQrValue: rawInput,
-      normalizedQrValue: normalizedInput,
-      parsed: parsedMeta,
-      details: {
-        matchedToiletIds: exactMatchedIds,
-      },
-    });
-  }
-
-  const best = [...rows]
-    .sort(
-      (left, right) =>
-        scoreCandidateMatch(right, candidates) - scoreCandidateMatch(left, candidates)
-    )[0];
-  if (!best) {
-    return buildQrResolveResult({
-      status: 'failed',
-      reasonCode: QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED,
-      rawQrValue: rawInput,
-      normalizedQrValue: normalizedInput,
-      parsed: parsedMeta,
-    });
-  }
-
-  const classification = classifyResolvedToilet({ row: best, req });
-  if (classification === QR_RESOLVE_REASON_CODES.TOILET_INACTIVE) {
-    logQrResolve(req, 'warn', {
-      stage: 'inactive_toilet',
-      matchedToiletId: best.id,
-      unitStatus: best.status,
-      facilityStatus: best.Facility?.status || null,
-    });
+  if (isToiletInactive(selectedToilet)) {
     return buildQrResolveResult({
       status: 'failed',
       reasonCode: QR_RESOLVE_REASON_CODES.TOILET_INACTIVE,
@@ -626,57 +1268,72 @@ const resolveToiletFromQr = async ({
       normalizedQrValue: normalizedInput,
       parsed: parsedMeta,
       details: {
-        matchedToiletId: best.id,
-        unitStatus: best.status,
-        facilityStatus: best.Facility?.status || null,
+        toiletUnitId: selectedToilet.id,
+        unitStatus: selectedToilet.status,
+        facilityStatus: selectedToilet.Facility?.status || null,
       },
     });
   }
 
-  if (classification === QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE) {
-    logQrResolve(req, 'warn', {
-      stage: 'out_of_scope',
-      matchedToiletId: best.id,
-      matchedFacilityId: best.facility_id || best.Facility?.id || null,
-    });
+  const auth = await resolveAssignmentAuthorization({
+    req,
+    row: selectedToilet,
+  });
+  if (!auth.allowed) {
     return buildQrResolveResult({
       status: 'failed',
-      reasonCode: QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE,
+      reasonCode: auth.reasonCode || QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED,
       rawQrValue: rawInput,
       normalizedQrValue: normalizedInput,
       parsed: parsedMeta,
-      details: {
-        matchedToiletId: best.id,
-        matchedFacilityId: best.facility_id || best.Facility?.id || null,
-      },
+      details: auth.details || null,
     });
   }
 
+  const resolvedQrCode = selectedQr?.qr_code || selectedToilet.qr_code || selectedToilet.code;
   await ensureQrImageForToilet({
-    toiletUnitId: best.id,
-    qrCodeValue: best.qr_code || best.code,
+    toiletUnitId: selectedToilet.id,
+    qrCodeValue: resolvedQrCode,
   }).catch(() => null);
   await ensureQrImageForToilet({
-    toiletUnitId: best.id,
-    qrCodeValue: getPublicFeedbackUrl({ toiletUnitId: best.id }),
+    toiletUnitId: selectedToilet.id,
+    qrCodeValue: getPublicFeedbackUrl({ toiletUnitId: selectedToilet.id }),
     variant: 'feedback',
   }).catch(() => null);
 
-  const toilet = mapUnitRow(best);
+  const toilet = mapUnitRow(selectedToilet, {
+    resolvedQrCode,
+    legacyQrCode: selectedToilet.qr_code || selectedToilet.code,
+    qrId: selectedQr?.id || canonicalPayload?.qrId || null,
+    qrSchemaVersion: selectedQr?.schema_version || canonicalPayload?.version || null,
+  });
+
+  const successReasonCode = auth.scopeRefreshRecommended
+    ? QR_RESOLVE_REASON_CODES.SCOPE_REFRESH_RECOMMENDED
+    : QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY;
   logQrResolve(req, 'info', {
     stage: 'resolved',
-    reasonCode: QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY,
+    reasonCode: successReasonCode,
     matchedToiletId: toilet.id,
     matchedFacilityId: toilet.facilityId,
+    scopeRefreshRecommended: Boolean(auth.scopeRefreshRecommended),
   });
 
   return buildQrResolveResult({
     status: 'resolved',
-    reasonCode: QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY,
+    reasonCode: successReasonCode,
     rawQrValue: rawInput,
     normalizedQrValue: normalizedInput,
     parsed: parsedMeta,
     toilet,
+    details: {
+      lookupPath,
+      qrId: selectedQr?.id || canonicalPayload?.qrId || null,
+      qrSchemaVersion: selectedQr?.schema_version || canonicalPayload?.version || null,
+      scopeRefreshRecommended: Boolean(auth.scopeRefreshRecommended),
+      authorization: auth.details || null,
+    },
+    scopeRefreshRecommended: Boolean(auth.scopeRefreshRecommended),
   });
 };
 
@@ -1121,116 +1778,260 @@ const listUnits = async (req) => {
     include: [facilityInclude],
     order: [['code', 'ASC']],
   });
-  await ensureQrImagesForToilets(rows).catch(() => null);
-  return rows.map(mapUnitRow);
+  const primaryQrMap = await loadPrimaryQrMapForToiletIds(rows.map((row) => row.id));
+  const qrImageSeedRows = rows.map((row) => ({
+    id: row.id,
+    qr_code: primaryQrMap.get(String(row.id))?.qr_code || row.qr_code || row.code,
+    publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: row.id }),
+  }));
+  await ensureQrImagesForToilets(qrImageSeedRows).catch(() => null);
+  return rows.map((row) => {
+    const primaryQr = primaryQrMap.get(String(row.id)) || null;
+    return mapUnitRow(row, {
+      resolvedQrCode: primaryQr?.qr_code || row.qr_code || row.code,
+      legacyQrCode: row.qr_code || row.code,
+      qrId: primaryQr?.id || null,
+      qrSchemaVersion: primaryQr?.schema_version || null,
+    });
+  });
 };
 
 const createUnit = async (req) => {
-  const facility = await Facility.findByPk(req.body.facilityId);
-  if (!facility) {
-    throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
-  }
-  if (!req.user.isSuperAdmin && req.user.tenantId !== facility.tenant_id) {
-    throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
-  }
-  if (!isFacilityInScope(req, facility.id)) {
-    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
-  }
-
   const requestedCode = sanitizeText(req.body.code, 120);
   const unitType = sanitizeText(req.body.unitType, 40);
 
-  const toiletBlock = await ToiletBlock.findByPk(req.body.toiletBlockId, {
-    attributes: ['id', 'facility_id'],
-  });
-  if (!toiletBlock) {
-    throw new AppError('Toilet block not found', 404, { code: 'TOILET_BLOCK_NOT_FOUND' });
-  }
-  if (toiletBlock.facility_id !== facility.id) {
-    throw new AppError('toiletBlockId does not belong to facilityId', 400, {
-      code: 'BLOCK_FACILITY_MISMATCH',
+  const findQrCodeConflict = async ({ normalizedCode, transaction }) => {
+    const rows = await sequelize.query(
+      `
+        SELECT q.id, q.toilet_unit_id
+        FROM toilet_qr_codes q
+        WHERE UPPER(TRIM(q.qr_code)) = :normalizedCode
+        LIMIT 1
+      `,
+      {
+        replacements: { normalizedCode },
+        transaction,
+        type: QueryTypes.SELECT,
+      }
+    );
+    return rows[0] || null;
+  };
+
+  const createResult = await sequelize.transaction(async (transaction) => {
+    const facility = await Facility.findByPk(req.body.facilityId, {
+      transaction,
+      lock: transaction.LOCK.UPDATE,
     });
-  }
+    if (!facility) {
+      throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
+    }
+    if (!req.user.isSuperAdmin && req.user.tenantId !== facility.tenant_id) {
+      throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    if (!isFacilityInScope(req, facility.id)) {
+      throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
 
-  const unitCode = requestedCode
-    ? requestedCode.toUpperCase()
-    : await buildAutoToiletId({ facility, toiletBlock });
-
-  const qrCode = normalizePermanentQrCode(
-    req.body.permanentQrCode || req.body.qrCode || unitCode
-  );
-
-  const duplicateCode = await ToiletUnit.findOne({
-    where: {
-      facility_id: facility.id,
-      code: unitCode,
-    },
-    attributes: ['id'],
-  });
-  if (duplicateCode) {
-    throw new AppError('Toilet unit code already exists in this facility', 409, {
-      code: 'TOILET_UNIT_CODE_EXISTS',
+    const toiletBlock = await ToiletBlock.findByPk(req.body.toiletBlockId, {
+      attributes: ['id', 'facility_id'],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
     });
-  }
+    if (!toiletBlock) {
+      throw new AppError('Toilet block not found', 404, { code: 'TOILET_BLOCK_NOT_FOUND' });
+    }
+    if (toiletBlock.facility_id !== facility.id) {
+      throw new AppError('toiletBlockId does not belong to facilityId', 400, {
+        code: 'BLOCK_FACILITY_MISMATCH',
+      });
+    }
 
-  const duplicateQr = await ToiletUnit.findOne({
-    where: { qr_code: qrCode },
-    attributes: ['id'],
-  });
-  if (duplicateQr) {
-    throw new AppError('permanentQrCode already exists', 409, { code: 'QR_CODE_EXISTS' });
-  }
+    const unitCode = requestedCode
+      ? requestedCode.toUpperCase()
+      : await buildAutoToiletId({ facility, toiletBlock });
 
-  const row = await ToiletUnit.create({
-    facility_id: facility.id,
-    toilet_block_id: toiletBlock.id,
-    code: unitCode,
-    qr_code: qrCode,
-    unit_type: unitType,
-    status: req.body.status || 'moderate',
-    sector_code: normalizeSectorCode(
-      req.body.sectorCode || req.body.sector || facility.metadata?.sector || null
-    ),
-    location_label: req.body.locationLabel
-      ? sanitizeText(req.body.locationLabel, 300)
-      : facility.address_line || facility.name,
-    latitude: toOptionalCoordinate(req.body.latitude ?? facility.latitude),
-    longitude: toOptionalCoordinate(req.body.longitude ?? facility.longitude),
+    const legacyQrCode = normalizePermanentQrCode(
+      req.body.permanentQrCode || req.body.qrCode || unitCode
+    );
+
+    const duplicateCode = await ToiletUnit.findOne({
+      where: {
+        facility_id: facility.id,
+        code: unitCode,
+      },
+      attributes: ['id'],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (duplicateCode) {
+      throw new AppError('Toilet unit code already exists in this facility', 409, {
+        code: 'TOILET_UNIT_CODE_EXISTS',
+      });
+    }
+
+    const duplicateQr = await ToiletUnit.findOne({
+      where: { qr_code: legacyQrCode },
+      attributes: ['id'],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (duplicateQr) {
+      throw new AppError('permanentQrCode already exists', 409, { code: 'QR_CODE_EXISTS' });
+    }
+
+    const row = await ToiletUnit.create(
+      {
+        facility_id: facility.id,
+        toilet_block_id: toiletBlock.id,
+        code: unitCode,
+        qr_code: legacyQrCode,
+        unit_type: unitType,
+        status: req.body.status || 'moderate',
+        sector_code: normalizeSectorCode(
+          req.body.sectorCode || req.body.sector || facility.metadata?.sector || null
+        ),
+        location_label: req.body.locationLabel
+          ? sanitizeText(req.body.locationLabel, 300)
+          : facility.address_line || facility.name,
+        latitude: toOptionalCoordinate(req.body.latitude ?? facility.latitude),
+        longitude: toOptionalCoordinate(req.body.longitude ?? facility.longitude),
+      },
+      { transaction }
+    );
+
+    const canonicalPayload = buildCanonicalQrV2Payload({
+      toiletUnitId: row.id,
+      tenantId: facility.tenant_id,
+    });
+    const canonicalQrCode = encodeCanonicalQrV2Token(canonicalPayload);
+    const canonicalNormalized = normalizePermanentQrCode(canonicalQrCode);
+    const canonicalConflict = await findQrCodeConflict({
+      normalizedCode: canonicalNormalized,
+      transaction,
+    });
+    if (canonicalConflict && String(canonicalConflict.toilet_unit_id) !== String(row.id)) {
+      throw new AppError('Canonical QR value collision detected', 409, {
+        code: 'QR_CODE_EXISTS',
+      });
+    }
+
+    await ToiletQrCode.create(
+      {
+        id: canonicalPayload.qrId,
+        tenant_id: facility.tenant_id,
+        toilet_unit_id: row.id,
+        qr_code: canonicalQrCode,
+        schema_version: QR_SCHEMA_V2,
+        qr_payload: canonicalPayload,
+        status: 'active',
+        is_primary: true,
+        created_by_user_id: req.user?.id || null,
+        updated_by_user_id: req.user?.id || null,
+      },
+      { transaction }
+    );
+
+    const createAliasIfAvailable = async ({ qrCode, schemaVersion, payload }) => {
+      const normalized = normalizePermanentQrCode(qrCode);
+      if (!normalized) return;
+      const existing = await findQrCodeConflict({
+        normalizedCode: normalized,
+        transaction,
+      });
+      if (existing && String(existing.toilet_unit_id) !== String(row.id)) {
+        return;
+      }
+      if (existing) {
+        return;
+      }
+      await ToiletQrCode.create(
+        {
+          tenant_id: facility.tenant_id,
+          toilet_unit_id: row.id,
+          qr_code: normalized,
+          schema_version: schemaVersion,
+          qr_payload: payload || null,
+          status: 'active',
+          is_primary: false,
+          created_by_user_id: req.user?.id || null,
+          updated_by_user_id: req.user?.id || null,
+        },
+        { transaction }
+      );
+    };
+
+    await createAliasIfAvailable({
+      qrCode: legacyQrCode,
+      schemaVersion: 'legacy_v1',
+      payload: {
+        source: 'toilet_units.qr_code',
+        legacy: true,
+        toiletUnitId: row.id,
+      },
+    });
+    await createAliasIfAvailable({
+      qrCode: unitCode,
+      schemaVersion: 'legacy_code_alias',
+      payload: {
+        source: 'toilet_units.code',
+        legacy: true,
+        toiletUnitId: row.id,
+      },
+    });
+
+    return {
+      row,
+      facility,
+      canonicalPayload,
+      canonicalQrCode,
+      legacyQrCode,
+    };
   });
+
   await createAuditLog({
     req,
     action: 'toilet_unit.create',
     entityType: 'toilet_unit',
-    entityId: row.id,
-    tenantId: facility.tenant_id,
+    entityId: createResult.row.id,
+    tenantId: createResult.facility.tenant_id,
+    details: {
+      qrId: createResult.canonicalPayload.qrId,
+      qrSchemaVersion: QR_SCHEMA_V2,
+    },
   });
 
   const qrResult = await ensureAllQrImagesForToilet({
-    toiletUnitId: row.id,
-    appQrCodeValue: row.qr_code || row.code,
-    feedbackQrValue: getPublicFeedbackUrl({ toiletUnitId: row.id }),
+    toiletUnitId: createResult.row.id,
+    appQrCodeValue: createResult.canonicalQrCode,
+    feedbackQrValue: getPublicFeedbackUrl({ toiletUnitId: createResult.row.id }),
   });
 
   return {
-    id: row.id,
-    facilityId: row.facility_id,
-    toiletBlockId: row.toilet_block_id,
-    code: row.code,
-    qrCode: row.qr_code || row.code,
-    appQrCode: row.qr_code || row.code,
-    qrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(row.id),
-    appQrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(row.id),
-    feedbackQrImageUrl: qrResult?.feedbackQrImageUrl || getFeedbackQrImageUrl(row.id),
-    publicFeedbackUrl: qrResult?.publicFeedbackUrl || getPublicFeedbackUrl({ toiletUnitId: row.id }),
-    unitType: row.unit_type,
-    status: row.status,
-    sectorCode: row.sector_code || null,
-    locationLabel: row.location_label || null,
+    id: createResult.row.id,
+    facilityId: createResult.row.facility_id,
+    toiletBlockId: createResult.row.toilet_block_id,
+    code: createResult.row.code,
+    qrId: createResult.canonicalPayload.qrId,
+    qrSchemaVersion: QR_SCHEMA_V2,
+    qrCode: createResult.canonicalQrCode,
+    appQrCode: createResult.canonicalQrCode,
+    legacyQrCode: createResult.legacyQrCode || createResult.row.code,
+    qrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(createResult.row.id),
+    appQrImageUrl: qrResult?.appQrImageUrl || getQrImageUrl(createResult.row.id),
+    feedbackQrImageUrl: qrResult?.feedbackQrImageUrl || getFeedbackQrImageUrl(createResult.row.id),
+    publicFeedbackUrl:
+      qrResult?.publicFeedbackUrl || getPublicFeedbackUrl({ toiletUnitId: createResult.row.id }),
+    unitType: createResult.row.unit_type,
+    status: createResult.row.status,
+    sectorCode: createResult.row.sector_code || null,
+    locationLabel: createResult.row.location_label || null,
     latitude:
-      row.latitude !== null && row.latitude !== undefined ? Number(row.latitude) : null,
+      createResult.row.latitude !== null && createResult.row.latitude !== undefined
+        ? Number(createResult.row.latitude)
+        : null,
     longitude:
-      row.longitude !== null && row.longitude !== undefined
-        ? Number(row.longitude)
+      createResult.row.longitude !== null && createResult.row.longitude !== undefined
+        ? Number(createResult.row.longitude)
         : null,
   };
 };
@@ -1254,6 +2055,10 @@ module.exports = {
   extractQrCandidates,
   findDuplicateExactMatchIds,
   classifyResolvedToilet,
+  buildCanonicalQrV2Payload,
+  encodeCanonicalQrV2Token,
+  tryParseCanonicalQrPayload,
+  validateCanonicalQrPayload,
   QR_RESOLVE_REASON_CODES,
   createUnit,
 };

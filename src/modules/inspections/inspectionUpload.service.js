@@ -19,6 +19,10 @@ const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { recomputeInspectionAggregates } = require('./inspectionEvidence.service');
 const { isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const {
+  IMAGE_PROCESSING_STATES,
+  resolveLegacyProcessingState,
+} = require('./imageLifecycle.constants');
 
 const ALLOWED_CAPTURE_STAGE = new Set(['before', 'after', 'evidence']);
 const ALLOWED_CONTENT_TYPES = new Set([
@@ -253,7 +257,7 @@ const createUploadSessions = async (req) => {
       const contentLength = Number(image.contentLength || 0);
       const expectedSha256 = String(image.sha256 || '').trim().toLowerCase() || null;
       const extension = extensionFromContentType(contentType);
-      const objectKey = `sanitation/${inspection.tenant_id}/inspections/${inspection.id}/${captureStage}/${clientImageId}${extension}`;
+      const candidateObjectKey = `sanitation/${inspection.tenant_id}/inspections/${inspection.id}/${captureStage}/${clientImageId}${extension}`;
 
       const existingMedia = await InspectionMedia.findOne({
         where: {
@@ -271,11 +275,20 @@ const createUploadSessions = async (req) => {
         client_image_id: clientImageId,
         capture_stage: captureStage,
         upload_status: 'upload_session_created',
+        processing_state: IMAGE_PROCESSING_STATES.QUEUED_FOR_UPLOAD,
         ai_status: 'PENDING_UPLOAD',
+        retry_count: existingMedia ? Number(existingMedia.retry_count || 0) : 0,
+        ai_attempt_count: existingMedia ? Number(existingMedia.ai_attempt_count || 0) : 0,
+        last_retry_at: null,
+        next_retry_at: null,
+        storage_verified_at: null,
+        last_error_code: null,
+        last_error_message: null,
+        manual_review_required_at: null,
         validation_status: 'PENDING',
         validation_reason: null,
         scoring_rejected: false,
-        storage_key: objectKey,
+        storage_key: candidateObjectKey,
         sha256: expectedSha256,
         ordinal: Number.isFinite(Number(image.ordinal)) ? Number(image.ordinal) : null,
         captured_at: image.capturedAt ? new Date(image.capturedAt) : null,
@@ -345,6 +358,36 @@ const createUploadSessions = async (req) => {
           await media.update(mediaUpdatePayload, { transaction });
         }
       } else {
+        const existingState = resolveLegacyProcessingState({
+          uploadStatus: media.upload_status,
+          aiStatus: media.ai_status,
+          reviewRequired: media.review_required,
+        });
+        const isAlreadyDurable =
+          (media.upload_status === 'confirmed' || media.upload_status === 'uploaded') &&
+          Boolean(String(media.storage_key || '').trim()) &&
+          (existingState === IMAGE_PROCESSING_STATES.STORAGE_VERIFIED ||
+            existingState === IMAGE_PROCESSING_STATES.QUEUED_FOR_AI ||
+            existingState === IMAGE_PROCESSING_STATES.AI_PROCESSING ||
+            existingState === IMAGE_PROCESSING_STATES.AI_COMPLETED);
+
+        if (isAlreadyDurable) {
+          sessions.push({
+            mediaId: media.id,
+            clientImageId,
+            uploadUrl: null,
+            method: 'PUT',
+            headers: {},
+            objectKey: media.storage_key,
+            expiresAt: null,
+            uploadRequired: false,
+            alreadyUploaded: true,
+            uploadStatus: media.upload_status,
+            aiStatus: media.ai_status,
+          });
+          continue;
+        }
+
         await media.update(
           {
             ...mediaUpdatePayload,
@@ -372,7 +415,7 @@ const createUploadSessions = async (req) => {
       }
 
       const uploadSession = await getPresignedPutObjectUrl({
-        objectKey,
+        objectKey: candidateObjectKey,
         contentType,
         contentLength:
           Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null,
@@ -403,7 +446,7 @@ const createUploadSessions = async (req) => {
             ordinal: Number.isFinite(Number(image.ordinal))
               ? Number(image.ordinal)
               : existingSession.ordinal,
-            object_key: objectKey,
+            object_key: candidateObjectKey,
             upload_method: 'PUT',
             content_type: contentType,
             expected_size:
@@ -429,7 +472,7 @@ const createUploadSessions = async (req) => {
             client_image_id: clientImageId,
             capture_stage: captureStage,
             ordinal: Number.isFinite(Number(image.ordinal)) ? Number(image.ordinal) : null,
-            object_key: objectKey,
+            object_key: candidateObjectKey,
             upload_method: 'PUT',
             content_type: contentType,
             expected_size:
@@ -451,8 +494,10 @@ const createUploadSessions = async (req) => {
         uploadUrl: uploadSession.uploadUrl,
         method: 'PUT',
         headers: uploadSession.headers,
-        objectKey,
+        objectKey: candidateObjectKey,
         expiresAt: uploadSession.expiresAt,
+        uploadRequired: true,
+        alreadyUploaded: false,
       });
     }
 
@@ -628,6 +673,7 @@ const confirmUpload = async (req) => {
         : null;
   await media.update({
     upload_status: 'confirmed',
+    processing_state: IMAGE_PROCESSING_STATES.STORAGE_VERIFIED,
     ai_status: 'UPLOADED',
     validation_status: 'PENDING',
     validation_reason: null,
@@ -670,6 +716,10 @@ const confirmUpload = async (req) => {
     ai_error: null,
     uploaded_at: now,
     confirmed_at: now,
+    storage_verified_at: now,
+    last_error_code: null,
+    last_error_message: null,
+    next_retry_at: null,
     updated_at: now,
   });
 
@@ -715,7 +765,10 @@ const confirmUpload = async (req) => {
   if (isAutoAnalysisOnUploadEnabled()) {
     await media.update({
       ai_status: 'AI_QUEUED',
+      processing_state: IMAGE_PROCESSING_STATES.QUEUED_FOR_AI,
       ai_error: null,
+      last_error_code: null,
+      last_error_message: null,
       updated_at: new Date(),
     });
 
@@ -765,6 +818,9 @@ const confirmUpload = async (req) => {
   return {
     mediaId: media.id,
     uploadStatus: 'confirmed',
+    processingState: isAutoAnalysisOnUploadEnabled()
+      ? IMAGE_PROCESSING_STATES.QUEUED_FOR_AI
+      : IMAGE_PROCESSING_STATES.STORAGE_VERIFIED,
     aiStatus: isAutoAnalysisOnUploadEnabled() ? 'AI_QUEUED' : 'UPLOADED',
     fileUrl: urls.fileUrl,
     thumbnailUrl: urls.thumbnailUrl,
@@ -830,7 +886,13 @@ const retryUploadSession = async (req) => {
   await media.update({
     storage_key: objectKey,
     upload_status: 'upload_session_created',
+    processing_state: IMAGE_PROCESSING_STATES.QUEUED_FOR_UPLOAD,
     ai_status: 'PENDING_UPLOAD',
+    retry_count: Number(media.retry_count || 0) + 1,
+    last_retry_at: new Date(),
+    next_retry_at: null,
+    last_error_code: null,
+    last_error_message: null,
     sha256: expectedSha256 || media.sha256,
     updated_at: new Date(),
   });

@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { getPresignedGetObjectUrl } = require('../media/s3.service');
+const { getObjectBufferFromS3 } = require('../media/s3.service');
 
 const getMimeType = (filePath) => {
   const ext = path.extname(filePath || '').toLowerCase();
@@ -92,6 +92,18 @@ const fetchRemoteImage = async (url) => {
   };
 };
 
+const resolveS3Image = async (storageKey) => {
+  const payload = await getObjectBufferFromS3(storageKey);
+  if (!payload || !payload.buffer || payload.buffer.length === 0) {
+    return null;
+  }
+  return {
+    buffer: payload.buffer,
+    mimeType: payload.contentType || 'image/jpeg',
+    localPath: null,
+  };
+};
+
 const resolveMediaBuffer = async (media) => {
   const metadata =
     media?.metadata && typeof media.metadata === 'object' ? media.metadata : null;
@@ -113,16 +125,16 @@ const resolveMediaBuffer = async (media) => {
   }
 
   if (storageKey && !preferLocal) {
-    const presigned = await getPresignedGetObjectUrl({ storageKey });
-    if (presigned) {
-      return fetchRemoteImage(presigned);
+    const fromS3 = await resolveS3Image(storageKey);
+    if (fromS3) {
+      return fromS3;
     }
   }
 
   if (!preferLocal && !storageKey && /^s3:\/\//i.test(fileUrl)) {
-    const presigned = await getPresignedGetObjectUrl({ storageKey: fileUrl });
-    if (presigned) {
-      return fetchRemoteImage(presigned);
+    const fromS3 = await resolveS3Image(fileUrl);
+    if (fromS3) {
+      return fromS3;
     }
   }
 

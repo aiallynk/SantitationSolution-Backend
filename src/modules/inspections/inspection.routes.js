@@ -90,6 +90,7 @@ router.get('/toilets/:id/latest-inspection', requirePermissions('dashboard.read'
 router.get('/toilets/:id/score-trends', requirePermissions('dashboard.read'), inspectionController.getToiletScoreTrends);
 router.get('/toilets/:id/inspection-history', requirePermissions('dashboard.read'), inspectionController.getToiletInspectionHistory);
 router.get('/inspections/:id/images', requirePermissions('inspection.create'), inspectionController.getInspectionImages);
+router.get('/inspections/:id/image-jobs', requirePermissions('inspection.create'), inspectionController.getInspectionImageJobs);
 router.get('/inspections/:id/comparison', requirePermissions('dashboard.read'), inspectionController.getInspectionComparison);
 router.get('/inspections/:id/trend', requirePermissions('dashboard.read'), inspectionController.getInspectionTrend);
 router.get('/inspection-images/:imageId', requirePermissions('inspection.create'), inspectionController.getInspectionImageById);
