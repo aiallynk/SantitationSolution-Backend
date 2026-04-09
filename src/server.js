@@ -295,13 +295,18 @@ const backfillToiletQrOnBoot = async () => {
   }
 
   try {
+    const forceRegenerate =
+      String(process.env.QR_FORCE_REGENERATE_ON_BOOT || 'false').trim().toLowerCase() ===
+      'true';
     const units = await ToiletUnit.findAll({
       attributes: ['id', 'code', 'qr_code'],
     });
-    const result = await ensureQrImagesForToilets(units);
+    const result = await ensureQrImagesForToilets(units, {
+      forceRegenerate,
+    });
     // eslint-disable-next-line no-console
     console.log(
-      `Toilet QR bootstrap completed: total=${result.total} generated=${result.generated} skipped=${result.skipped} failed=${result.failed}`
+      `Toilet QR bootstrap completed: total=${result.total} generated=${result.generated} skipped=${result.skipped} failed=${result.failed} forceRegenerate=${forceRegenerate}`
     );
   } catch (error) {
     // eslint-disable-next-line no-console

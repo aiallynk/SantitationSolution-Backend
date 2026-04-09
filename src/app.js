@@ -97,6 +97,7 @@ app.use(
     allowedHeaders: [
       'Authorization',
       'Content-Type',
+      'Idempotency-Key',
       'X-Requested-With',
       'X-Request-Id',
     ],
