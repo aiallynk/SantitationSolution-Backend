@@ -32,9 +32,54 @@ const removeIndexSafe = async (queryInterface, table, name) => {
   }
 };
 
+const hasTable = async (queryInterface, table) => {
+  try {
+    await queryInterface.describeTable(table);
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
+const ensureUuidFunctionAvailability = async (queryInterface) => {
+  // Best effort: managed Postgres providers sometimes pre-enable only one extension.
+  await queryInterface.sequelize.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto";').catch(() => {});
+  await queryInterface.sequelize.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";').catch(() => {});
+
+  const [rows] = await queryInterface.sequelize.query(`
+    SELECT CASE
+      WHEN to_regprocedure('gen_random_uuid()') IS NOT NULL THEN 'gen_random_uuid()'
+      WHEN to_regprocedure('uuid_generate_v4()') IS NOT NULL THEN 'uuid_generate_v4()'
+      ELSE NULL
+    END AS uuid_fn
+  `);
+
+  return rows?.[0]?.uuid_fn || null;
+};
+
+const fallbackDeterministicUuidExpression = (seedSql) => `
+  (
+    SUBSTR(MD5(${seedSql}), 1, 8) || '-' ||
+    SUBSTR(MD5(${seedSql}), 9, 4) || '-' ||
+    SUBSTR(MD5(${seedSql}), 13, 4) || '-' ||
+    SUBSTR(MD5(${seedSql}), 17, 4) || '-' ||
+    SUBSTR(MD5(${seedSql}), 21, 12)
+  )::uuid
+`;
+
+const resolveInsertUuidExpression = (uuidFunctionExpression, fallbackSeedSql) => {
+  if (uuidFunctionExpression) {
+    return uuidFunctionExpression;
+  }
+
+  return fallbackDeterministicUuidExpression(fallbackSeedSql);
+};
+
 /** @type {import('sequelize-cli').Migration} */
 module.exports = {
   async up(queryInterface) {
+    const uuidFunctionExpression = await ensureUuidFunctionAvailability(queryInterface);
+
     await addColumnIfMissing(queryInterface, 'inspection_media', 'processing_state', {
       type: DataTypes.STRING(60),
       allowNull: false,
@@ -177,71 +222,85 @@ module.exports = {
       'ai_processing_jobs_status_next_retry_idx'
     );
 
-    await queryInterface.createTable('toilet_qr_codes', {
-      id: {
+    const qrCodeTableExists = await hasTable(queryInterface, 'toilet_qr_codes');
+    if (!qrCodeTableExists) {
+      const idColumn = {
         type: DataTypes.UUID,
-        defaultValue: DataTypes.UUIDV4,
         primaryKey: true,
         allowNull: false,
-      },
-      tenant_id: {
-        type: DataTypes.UUID,
-        allowNull: true,
-        references: { model: 'tenants', key: 'id' },
-        onDelete: 'SET NULL',
-      },
-      toilet_unit_id: {
-        type: DataTypes.UUID,
-        allowNull: false,
-        references: { model: 'toilet_units', key: 'id' },
-        onDelete: 'CASCADE',
-      },
-      qr_code: {
-        type: DataTypes.STRING(220),
-        allowNull: false,
-      },
-      schema_version: {
-        type: DataTypes.STRING(40),
-        allowNull: false,
-        defaultValue: 'legacy_v1',
-      },
-      qr_payload: {
-        type: DataTypes.JSONB,
-        allowNull: true,
-      },
-      status: {
-        type: DataTypes.STRING(20),
-        allowNull: false,
-        defaultValue: 'active',
-      },
-      is_primary: {
-        type: DataTypes.BOOLEAN,
-        allowNull: false,
-        defaultValue: false,
-      },
-      created_by_user_id: {
-        type: DataTypes.UUID,
-        allowNull: true,
-        references: { model: 'platform_users', key: 'id' },
-        onDelete: 'SET NULL',
-      },
-      updated_by_user_id: {
-        type: DataTypes.UUID,
-        allowNull: true,
-        references: { model: 'platform_users', key: 'id' },
-        onDelete: 'SET NULL',
-      },
-      created_at: {
-        type: DataTypes.DATE,
-        allowNull: false,
-        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP'),
-      },
-      updated_at: {
-        type: DataTypes.DATE,
-        allowNull: false,
-        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP'),
-      },
-    });
+      };
+      if (uuidFunctionExpression) {
+        idColumn.defaultValue = Sequelize.literal(uuidFunctionExpression);
+      }
+
+      await queryInterface.createTable('toilet_qr_codes', {
+        id: idColumn,
+        tenant_id: {
+          type: DataTypes.UUID,
+          allowNull: true,
+          references: { model: 'tenants', key: 'id' },
+          onDelete: 'SET NULL',
+        },
+        toilet_unit_id: {
+          type: DataTypes.UUID,
+          allowNull: false,
+          references: { model: 'toilet_units', key: 'id' },
+          onDelete: 'CASCADE',
+        },
+        qr_code: {
+          type: DataTypes.STRING(220),
+          allowNull: false,
+        },
+        schema_version: {
+          type: DataTypes.STRING(40),
+          allowNull: false,
+          defaultValue: 'legacy_v1',
+        },
+        qr_payload: {
+          type: DataTypes.JSONB,
+          allowNull: true,
+        },
+        status: {
+          type: DataTypes.STRING(20),
+          allowNull: false,
+          defaultValue: 'active',
+        },
+        is_primary: {
+          type: DataTypes.BOOLEAN,
+          allowNull: false,
+          defaultValue: false,
+        },
+        created_by_user_id: {
+          type: DataTypes.UUID,
+          allowNull: true,
+          references: { model: 'platform_users', key: 'id' },
+          onDelete: 'SET NULL',
+        },
+        updated_by_user_id: {
+          type: DataTypes.UUID,
+          allowNull: true,
+          references: { model: 'platform_users', key: 'id' },
+          onDelete: 'SET NULL',
+        },
+        created_at: {
+          type: DataTypes.DATE,
+          allowNull: false,
+          defaultValue: Sequelize.literal('CURRENT_TIMESTAMP'),
+        },
+        updated_at: {
+          type: DataTypes.DATE,
+          allowNull: false,
+          defaultValue: Sequelize.literal('CURRENT_TIMESTAMP'),
+        },
+      });
+    }
+
+    if (uuidFunctionExpression) {
+      await queryInterface.sequelize.query(`
+        ALTER TABLE toilet_qr_codes
+        ALTER COLUMN id SET DEFAULT ${uuidFunctionExpression};
+      `);
+    }
 
     await addIndexSafe(
       queryInterface,
@@ -267,8 +326,14 @@ module.exports = {
       WHERE is_primary = true AND status = 'active';
     `);
 
+    const primaryQrInsertIdExpression = resolveInsertUuidExpression(
+      uuidFunctionExpression,
+      `tu.id::text || ':legacy_v1:' || UPPER(TRIM(tu.qr_code))`
+    );
+
     await queryInterface.sequelize.query(`
       INSERT INTO toilet_qr_codes (
+        id,
         tenant_id,
         toilet_unit_id,
         qr_code,
@@ -280,6 +345,7 @@ module.exports = {
         updated_at
       )
       SELECT
+        ${primaryQrInsertIdExpression},
         f.tenant_id,
         tu.id,
         UPPER(TRIM(tu.qr_code)),
@@ -300,8 +366,14 @@ module.exports = {
       ON CONFLICT DO NOTHING;
     `);
 
+    const aliasQrInsertIdExpression = resolveInsertUuidExpression(
+      uuidFunctionExpression,
+      `tu.id::text || ':legacy_code_alias:' || UPPER(TRIM(tu.code))`
+    );
+
     await queryInterface.sequelize.query(`
       INSERT INTO toilet_qr_codes (
+        id,
         tenant_id,
         toilet_unit_id,
         qr_code,
@@ -313,6 +385,7 @@ module.exports = {
         updated_at
       )
       SELECT
+        ${aliasQrInsertIdExpression},
         f.tenant_id,
         tu.id,
         UPPER(TRIM(tu.code)),
