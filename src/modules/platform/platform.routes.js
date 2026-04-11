@@ -38,7 +38,7 @@ router.patch(
 router.get('/geographies/tree', requirePermissions('dashboard.read'), platformController.getGeographiesTree);
 router.post(
   '/geographies',
-  requirePermissions('tenants.manage'),
+  requireAnyPermissions('tenants.manage', 'task.manage'),
   requireAction('hierarchy.manage'),
   validate(validateGeographyCreate),
   platformController.postGeography

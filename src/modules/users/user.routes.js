@@ -28,6 +28,12 @@ router.patch(
   validate(validatePatchUser),
   userController.patchUser
 );
+router.delete(
+  '/users/:id',
+  requirePermissions('users.manage'),
+  requireAction('user.manage'),
+  userController.deleteUser
+);
 
 router.get('/roles', requirePermissions('users.manage'), userController.getRoles);
 router.get('/permissions', requirePermissions('users.manage'), userController.getPermissions);

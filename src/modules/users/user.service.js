@@ -382,6 +382,11 @@ const replaceAssignments = async ({
       tenantId,
       transaction,
     });
+    const toiletUnit = await ensureToiletUnitScope({
+      toiletUnitId: assignment.toiletUnitId || null,
+      tenantId,
+      transaction,
+    });
 
     if (geography && !isGeographyInScope(req, geography.id)) {
       throw new AppError('assignment geography is outside actor scope', 403, {
@@ -398,11 +403,6 @@ const replaceAssignments = async ({
         code: 'SCOPE_FORBIDDEN',
       });
     }
-    const toiletUnit = await ensureToiletUnitScope({
-      toiletUnitId: assignment.toiletUnitId || null,
-      tenantId,
-      transaction,
-    });
 
     const inferredLevel =
       assignment.assignmentLevel ||
@@ -865,6 +865,84 @@ const patchUser = async (req) => {
   });
 };
 
+const deleteUser = async (req) => {
+  const user = await PlatformUser.findByPk(req.params.id, {
+    include: buildUserInclude(),
+  });
+  if (!user) {
+    throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
+  }
+
+  const existingAssignmentsByUserId = await getAssignmentsByUserIds([user.id]);
+  const existingUserAssignments = existingAssignmentsByUserId.get(user.id) || [];
+  assertUserScope(req, user, existingUserAssignments);
+
+  if (String(user.id) === String(req.user?.id || '')) {
+    throw new AppError('You cannot delete your own account', 400, {
+      code: 'SELF_DELETE_FORBIDDEN',
+    });
+  }
+
+  const deletionReason = sanitizeText(req.body?.reason || 'Deleted via user management', 300);
+
+  return sequelize.transaction(async (transaction) => {
+    await WorkerAssignment.update(
+      {
+        status: 'inactive',
+        updated_by_user_id: req.user.id,
+        updated_at: new Date(),
+      },
+      {
+        where: {
+          user_id: user.id,
+          status: 'active',
+        },
+        transaction,
+      }
+    );
+
+    const nextMetadata =
+      user.metadata && typeof user.metadata === 'object' && !Array.isArray(user.metadata)
+        ? { ...user.metadata }
+        : {};
+
+    nextMetadata.deletedAt = new Date().toISOString();
+    nextMetadata.deletedByUserId = req.user.id;
+    nextMetadata.deletionReason = deletionReason;
+
+    await user.update(
+      {
+        status: 'inactive',
+        metadata: nextMetadata,
+        updated_at: new Date(),
+      },
+      { transaction }
+    );
+
+    const payload = await PlatformUser.findByPk(user.id, {
+      include: buildUserInclude(),
+      transaction,
+    });
+    const assignmentsByUserId = await getAssignmentsByUserIds([user.id], {
+      transaction,
+    });
+
+    await createAuditLog({
+      req,
+      action: 'users.delete',
+      entityType: 'platform_user',
+      entityId: user.id,
+      tenantId: payload?.tenant_id || user.tenant_id,
+      details: {
+        mode: 'soft_delete',
+        reason: deletionReason,
+      },
+    });
+
+    return toPayload(payload, assignmentsByUserId);
+  });
+};
+
 const listRoles = async () => {
   const roles = await Role.findAll({
     include: [{ model: Permission, attributes: ['id', 'code', 'name'] }],
@@ -896,6 +974,7 @@ module.exports = {
   getUserById,
   createUser,
   patchUser,
+  deleteUser,
   listRoles,
   listPermissions,
 };

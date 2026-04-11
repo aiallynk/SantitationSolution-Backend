@@ -53,6 +53,19 @@ const patchUser = async (req, res, next) => {
   }
 };
 
+const deleteUser = async (req, res, next) => {
+  try {
+    const payload = await userService.deleteUser(req);
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'User deleted successfully',
+      data: payload,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getRoles = async (req, res, next) => {
   try {
     const payload = await userService.listRoles();
@@ -84,6 +97,7 @@ module.exports = {
   getUserById,
   postUser,
   patchUser,
+  deleteUser,
   getRoles,
   getPermissions,
 };
