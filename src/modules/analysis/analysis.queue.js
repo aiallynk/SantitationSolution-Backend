@@ -8,6 +8,7 @@ const {
   InspectionEvent,
   InspectionMedia,
 } = require('../../models');
+const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
 
 const ANALYSIS_QUEUE = 'inspection-analysis';
 const ANALYSIS_JOB_TYPE = 'AI_ANALYSIS';
@@ -159,6 +160,11 @@ const createProcessingJobRecord = async ({
     status: 'queued',
     attempts: 0,
     max_attempts: maxAttempts,
+    leased_until: null,
+    last_heartbeat_at: null,
+    next_retry_at: null,
+    failure_classification: null,
+    dead_letter_reason: null,
     queued_at: new Date(),
     payload: payload || null,
   });
@@ -231,24 +237,70 @@ const findRecentProcessingJob = async ({
   }
 
   await staleRunning.update({
-    status: 'failed',
+    status: Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+      ? 'dead_letter'
+      : 'failed',
+    failure_classification:
+      Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+        ? 'permanent'
+        : 'transient',
+    dead_letter_reason:
+      Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+        ? 'Marked stale after timeout watchdog'
+        : null,
+    dead_lettered_at:
+      Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+        ? new Date()
+        : null,
+    leased_until: null,
+    last_heartbeat_at: new Date(),
+    next_retry_at: new Date(),
     last_error: 'Marked stale after timeout watchdog',
     updated_at: new Date(),
   });
 
   await InspectionMedia.update(
     {
-      ai_status: 'AI_FAILED',
-      validation_status: 'FAILED_SOURCE',
-      validation_reason: 'Marked stale after timeout watchdog',
-      review_required: true,
-      ai_error: 'Marked stale after timeout watchdog',
+      ai_status:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? 'AI_FAILED'
+          : 'AI_QUEUED',
+      processing_state:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED
+          : IMAGE_PROCESSING_STATES.AI_RETRYING,
+      validation_status:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? 'FAILED_SOURCE'
+          : 'PENDING',
+      validation_reason:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? 'Marked stale after timeout watchdog'
+          : 'Retry scheduled after stale processing watchdog',
+      review_required:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3),
+      manual_review_required_at:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? new Date()
+          : null,
+      retry_count: Number(staleRunning.attempts || 0),
+      last_retry_at: new Date(),
+      next_retry_at: null,
+      last_error_code: 'ANALYSIS_STALE_WATCHDOG',
+      last_error_message:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? 'Marked stale after timeout watchdog'
+          : 'Retry scheduled after stale processing watchdog',
+      ai_error:
+        Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+          ? 'Marked stale after timeout watchdog'
+          : 'Retry scheduled after stale processing watchdog',
       updated_at: new Date(),
     },
     {
       where: {
         id: imageId,
-        ai_status: 'AI_PROCESSING',
+        ai_status: { [Op.in]: ['AI_PROCESSING', 'AI_QUEUED'] },
       },
     }
   );
@@ -257,8 +309,14 @@ const findRecentProcessingJob = async ({
     inspectionId,
     tenantId: staleRunning.tenant_id,
     imageId,
-    eventType: 'analysis.job.stale_marked_failed',
-    eventStatus: 'failed',
+    eventType:
+      Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+        ? 'analysis.job.stale_marked_failed'
+        : 'analysis.job.stale_requeued',
+    eventStatus:
+      Number(staleRunning.attempts || 0) >= Number(staleRunning.max_attempts || 3)
+        ? 'failed'
+        : 'queued',
     payload: {
       staleQueueJobId: staleRunning.queue_job_id || null,
       staleJobId: staleRunning.id,
@@ -292,6 +350,9 @@ const markInlineJobFailure = async ({
   if (processingJob) {
     await processingJob.update({
       status: 'failed',
+      failure_classification: 'permanent',
+      leased_until: null,
+      last_heartbeat_at: new Date(),
       last_error: errorMessage,
       updated_at: new Date(),
     });
@@ -301,10 +362,15 @@ const markInlineJobFailure = async ({
     await InspectionMedia.update(
       {
         ai_status: 'AI_FAILED',
+        processing_state: IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED,
         validation_status: 'FAILED_SOURCE',
         validation_reason: errorMessage.slice(0, 500),
         review_required: true,
+        manual_review_required_at: new Date(),
         ai_error: errorMessage,
+        last_error_code: 'INLINE_ANALYSIS_FAILURE',
+        last_error_message: errorMessage,
+        next_retry_at: null,
         updated_at: new Date(),
       },
       {
@@ -407,6 +473,7 @@ const enqueueInspectionAnalysis = async ({
   imageId = null,
   tenantId = null,
   jobType = ANALYSIS_JOB_TYPE,
+  delayMs = 0,
   requestContext = {},
 }) => {
   const maxAttempts = resolveMaxAttempts();
@@ -454,6 +521,9 @@ const enqueueInspectionAnalysis = async ({
       },
       removeOnComplete: Number(process.env.ANALYSIS_QUEUE_REMOVE_COMPLETE || 200),
       removeOnFail: false,
+      ...(Number.isFinite(Number(delayMs)) && Number(delayMs) > 0
+        ? { delay: Number(delayMs) }
+        : {}),
     }
   );
 
@@ -593,10 +663,44 @@ const registerAnalysisWorker = () => {
         await processingJob.update({
           status: terminalFailure ? 'dead_letter' : 'failed',
           attempts: attemptsMade,
+          failure_classification: terminalFailure ? 'permanent' : 'transient',
           last_error: String(error?.message || 'Unknown analysis worker failure').slice(0, 2000),
           dead_lettered_at: terminalFailure ? new Date() : null,
+          dead_letter_reason: terminalFailure
+            ? String(error?.message || 'Unknown analysis worker failure').slice(0, 1000)
+            : null,
+          leased_until: null,
+          last_heartbeat_at: new Date(),
+          next_retry_at: terminalFailure ? null : new Date(),
           updated_at: new Date(),
         });
+      }
+
+      if (job?.data?.imageId) {
+        await InspectionMedia.update(
+          {
+            ai_status: terminalFailure ? 'AI_FAILED' : 'AI_QUEUED',
+            processing_state: terminalFailure
+              ? IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED
+              : IMAGE_PROCESSING_STATES.AI_RETRYING,
+            validation_status: terminalFailure ? 'FAILED_SOURCE' : 'PENDING',
+            validation_reason: terminalFailure
+              ? String(error?.message || 'Unknown analysis worker failure').slice(0, 500)
+              : 'Transient worker failure. Retry scheduled.',
+            review_required: terminalFailure,
+            manual_review_required_at: terminalFailure ? new Date() : null,
+            last_error_code: terminalFailure
+              ? 'ANALYSIS_JOB_DEAD_LETTER'
+              : 'ANALYSIS_JOB_RETRY',
+            last_error_message: String(error?.message || 'Unknown analysis worker failure').slice(0, 2000),
+            ai_error: String(error?.message || 'Unknown analysis worker failure').slice(0, 2000),
+            next_retry_at: terminalFailure ? null : new Date(),
+            updated_at: new Date(),
+          },
+          {
+            where: { id: job.data.imageId },
+          }
+        );
       }
 
       if (terminalFailure) {

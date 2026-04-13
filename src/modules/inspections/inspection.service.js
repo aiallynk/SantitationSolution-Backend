@@ -23,8 +23,14 @@ const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const {
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
+const {
   recomputeInspectionAggregates,
   listInspectionImages,
+  listInspectionImageJobs,
   getInspectionImage,
   triggerInspectionImageAi,
   listToiletInspections,
@@ -34,6 +40,9 @@ const {
   getToiletScoreTrends,
   getToiletInspectionHistory,
 } = require('./inspectionEvidence.service');
+const {
+  IMAGE_PROCESSING_STATES,
+} = require('./imageLifecycle.constants');
 
 const REVIEW_LABELS = {
   reviewed: 'Reviewed',
@@ -134,10 +143,20 @@ const isUniqueConstraintError = (error) => {
 };
 
 const scopedWhere = (req, where = {}) => {
-  if (!req.user.isSuperAdmin) {
-    return { ...where, tenant_id: req.user.tenantId };
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'inspection', {
+    tenantKey: 'tenant_id',
+    facilityKey: 'facility_id',
+  });
+};
+
+const assertInspectionScope = (req, inspection) => {
+  if (!inspection) return;
+  if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  return where;
+  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 };
 
 const createInspectionEvent = async ({
@@ -450,6 +469,10 @@ const mapInspection = (
     submittedAt: inspection.submitted_at,
     processingStatus: inspection.processing_status,
     pipelineStatus: inspection.pipeline_status || inspection.processing_status,
+    pipelineCounters:
+      inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+        ? inspection.pipeline_counters
+        : null,
     inspectionStatus: inspection.status || null,
     reviewRequired: Boolean(inspection.review_required),
     lastProcessingError: inspection.last_processing_error || null,
@@ -531,6 +554,7 @@ const mapInspection = (
       clientImageId: item.client_image_id || null,
       captureStage: item.capture_stage,
       uploadStatus: item.upload_status || null,
+      processingState: item.processing_state || null,
       fileUrl: normalizeMediaUrl(item.file_url),
       thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
       uploadedAt: item.uploaded_at,
@@ -539,6 +563,14 @@ const mapInspection = (
       contentLength: Number(item.content_length || 0) || null,
       etag: item.etag || null,
       aiStatus: item.ai_status || null,
+      retryCount: Number(item.retry_count || 0),
+      aiAttemptCount: Number(item.ai_attempt_count || 0),
+      nextRetryAt: item.next_retry_at || null,
+      lastRetryAt: item.last_retry_at || null,
+      storageVerifiedAt: item.storage_verified_at || null,
+      lastErrorCode: item.last_error_code || null,
+      lastErrorMessage: item.last_error_message || null,
+      manualReviewRequiredAt: item.manual_review_required_at || null,
       imageQualityStatus: item.image_quality_status || null,
       imageQualityScore:
         item.image_quality_score !== null && item.image_quality_score !== undefined
@@ -609,6 +641,7 @@ const mapInspection = (
       clientImageId: item.client_image_id || null,
       captureStage: item.capture_stage,
       uploadStatus: item.upload_status || null,
+      processingState: item.processing_state || null,
       fileUrl: normalizeMediaUrl(item.file_url),
       thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
       uploadedAt: item.uploaded_at,
@@ -617,6 +650,14 @@ const mapInspection = (
       contentLength: Number(item.content_length || 0) || null,
       etag: item.etag || null,
       aiStatus: item.ai_status || null,
+      retryCount: Number(item.retry_count || 0),
+      aiAttemptCount: Number(item.ai_attempt_count || 0),
+      nextRetryAt: item.next_retry_at || null,
+      lastRetryAt: item.last_retry_at || null,
+      storageVerifiedAt: item.storage_verified_at || null,
+      lastErrorCode: item.last_error_code || null,
+      lastErrorMessage: item.last_error_message || null,
+      manualReviewRequiredAt: item.manual_review_required_at || null,
       imageQualityStatus: item.image_quality_status || null,
       imageQualityScore:
         item.image_quality_score !== null && item.image_quality_score !== undefined
@@ -687,6 +728,7 @@ const mapInspection = (
       clientImageId: item.client_image_id || null,
       captureStage: item.capture_stage,
       uploadStatus: item.upload_status || null,
+      processingState: item.processing_state || null,
       fileUrl: normalizeMediaUrl(item.file_url),
       thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
       uploadedAt: item.uploaded_at,
@@ -695,6 +737,14 @@ const mapInspection = (
       contentLength: Number(item.content_length || 0) || null,
       etag: item.etag || null,
       aiStatus: item.ai_status || null,
+      retryCount: Number(item.retry_count || 0),
+      aiAttemptCount: Number(item.ai_attempt_count || 0),
+      nextRetryAt: item.next_retry_at || null,
+      lastRetryAt: item.last_retry_at || null,
+      storageVerifiedAt: item.storage_verified_at || null,
+      lastErrorCode: item.last_error_code || null,
+      lastErrorMessage: item.last_error_message || null,
+      manualReviewRequiredAt: item.manual_review_required_at || null,
       imageQualityStatus: item.image_quality_status || null,
       imageQualityScore:
         item.image_quality_score !== null && item.image_quality_score !== undefined
@@ -829,6 +879,9 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   if (req.body.toiletUnitId) {
     const unit = await ToiletUnit.findByPk(req.body.toiletUnitId);
     if (!unit || unit.facility_id !== facility.id) {
@@ -900,6 +953,7 @@ const uploadInspectionMedia = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
   if (!req.file?.path) {
     throw new AppError('file is required', 400, { code: 'FILE_REQUIRED' });
   }
@@ -936,6 +990,9 @@ const uploadInspectionMedia = async (req) => {
     media_type: 'image',
     capture_stage: captureStage,
     upload_status: 'confirmed',
+    processing_state: isAutoAnalysisOnUploadEnabled()
+      ? IMAGE_PROCESSING_STATES.QUEUED_FOR_AI
+      : IMAGE_PROCESSING_STATES.STORAGE_VERIFIED,
     ai_status: isAutoAnalysisOnUploadEnabled() ? 'AI_QUEUED' : 'UPLOADED',
     etag: uploaded.metadata?.eTag || null,
     sha256: String(req.body.sha256 || '').trim() || null,
@@ -953,6 +1010,10 @@ const uploadInspectionMedia = async (req) => {
     storage_key: uploaded.storageKey,
     thumbnail_url: uploaded.fileUrl,
     uploaded_at: now,
+    storage_verified_at: now,
+    last_error_code: null,
+    last_error_message: null,
+    next_retry_at: null,
     ai_error: null,
     validation_status: 'PENDING',
     validation_reason: null,
@@ -1131,23 +1192,26 @@ const submitInspection = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-
-  const isUploadReady = (item) =>
-    item.upload_status === 'confirmed' ||
-    item.upload_status === 'uploaded' ||
-    (String(item.upload_status || '').toLowerCase() === 'pending' && Boolean(item.uploaded_at));
+  assertInspectionScope(req, inspection);
 
   const hasBefore = inspection.InspectionMedia.some(
-    (item) => item.capture_stage === 'before' && isUploadReady(item)
+    (item) => item.capture_stage === 'before'
   );
   const hasAfter = inspection.InspectionMedia.some(
-    (item) => item.capture_stage === 'after' && isUploadReady(item)
+    (item) => item.capture_stage === 'after'
   );
   if (!hasBefore || !hasAfter) {
     throw new AppError('Before and after media are required before submission', 400, {
       code: 'MEDIA_INCOMPLETE',
     });
   }
+
+  const confirmedCount = inspection.InspectionMedia.filter(
+    (item) =>
+      item.upload_status === 'confirmed' ||
+      item.upload_status === 'uploaded'
+  ).length;
+  const pendingUploadCount = Math.max(inspection.InspectionMedia.length - confirmedCount, 0);
 
   const clientSubmissionId = String(req.body.clientSubmissionId || '').trim() || null;
   const idempotencyKey = String(req.header('Idempotency-Key') || '').trim() || null;
@@ -1180,10 +1244,11 @@ const submitInspection = async (req) => {
   }
 
   const now = req.body.submittedAt ? new Date(req.body.submittedAt) : new Date();
+  const pipelineStatus = pendingUploadCount > 0 ? 'pending_upload' : 'queued_for_ai';
   await inspection.update({
     submitted_at: now,
     processing_status: 'queued',
-    pipeline_status: 'queued_for_ai',
+    pipeline_status: pipelineStatus,
     status: 'SUBMITTED',
     updated_at: new Date(),
   });
@@ -1193,13 +1258,15 @@ const submitInspection = async (req) => {
     inspection_id: inspection.id,
     client_submission_id: clientSubmissionId,
     idempotency_key: idempotencyKey,
-    status: 'queued_for_ai',
+    status: pipelineStatus,
     submitted_at: now,
     acknowledged_at: new Date(),
     metadata: {
       beforeCount: inspection.InspectionMedia.filter((item) => item.capture_stage === 'before').length,
       afterCount: inspection.InspectionMedia.filter((item) => item.capture_stage === 'after').length,
       totalCount: inspection.InspectionMedia.length,
+      confirmedCount,
+      pendingUploadCount,
     },
   });
 
@@ -1209,6 +1276,12 @@ const submitInspection = async (req) => {
       queued: false,
       skipped: true,
       reason: 'IMAGE_LEVEL_PIPELINE_ACTIVE',
+    };
+  } else if (confirmedCount === 0) {
+    enqueueResult = {
+      queued: false,
+      skipped: true,
+      reason: 'NO_CONFIRMED_MEDIA_YET',
     };
   } else {
     enqueueResult = await enqueueInspectionAnalysis({
@@ -1231,7 +1304,7 @@ const submitInspection = async (req) => {
     inspection,
     req,
     eventType: 'inspection.submitted',
-    eventStatus: 'queued_for_ai',
+    eventStatus: pipelineStatus,
     payload: {
       submissionId: submission.id,
       queued: Boolean(enqueueResult?.queued),
@@ -1244,7 +1317,7 @@ const submitInspection = async (req) => {
     inspectionId: inspection.id,
     tenantId: inspection.tenant_id,
     processingStatus: 'queued',
-    pipelineStatus: 'queued_for_ai',
+    pipelineStatus,
     inspectionStatus: 'SUBMITTED',
   });
 
@@ -1253,7 +1326,7 @@ const submitInspection = async (req) => {
   return {
     inspectionId: inspection.id,
     submissionId: submission.id,
-    processingStatus: 'queued_for_ai',
+    processingStatus: pipelineStatus,
     inspectionStatus: 'SUBMITTED',
     reviewRequired: Boolean(inspection.review_required),
   };
@@ -1269,6 +1342,7 @@ const reviewInspection = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
 
   const action = normalizeReviewAction(req.body.action);
   const note = req.body.note ? sanitizeText(req.body.note, 800) : null;
@@ -1353,6 +1427,9 @@ const listInspections = async (req, myOnly = false) => {
     where.inspector_user_id = req.user.id;
   }
   if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('facilityId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
     where.facility_id = req.query.facilityId;
   }
 
@@ -1397,6 +1474,7 @@ const getInspectionById = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  assertInspectionScope(req, inspection);
   await hydrateInspectionMediaForDisplay(inspection);
   const reviewMap = await loadLatestReviewByInspectionIds([inspection.id]);
   return mapInspection(inspection, { withAnalysis: true, reviewByInspectionId: reviewMap });
@@ -1406,6 +1484,10 @@ const startInspection = async (req) => createInspection(req);
 
 const getInspectionImages = async (req) => {
   return listInspectionImages(req.params.id, req);
+};
+
+const getInspectionImageJobs = async (req) => {
+  return listInspectionImageJobs(req.params.id, req);
 };
 
 const getInspectionImageById = async (req) => {
@@ -1455,6 +1537,7 @@ module.exports = {
   listInspections,
   getInspectionById,
   getInspectionImages,
+  getInspectionImageJobs,
   getInspectionImageById,
   triggerInspectionImageAnalysis,
   getToiletInspections,

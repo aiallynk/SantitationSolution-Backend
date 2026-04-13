@@ -1,7 +1,7 @@
 const AppError = require('../errors/AppError');
 const {
-  FACILITY_SCOPED_ADMIN_ROLE_CODES,
   GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES,
+  ROLE_CODES,
   normalizeRoleCode,
 } = require('./personaFamilies');
 
@@ -32,13 +32,24 @@ const collectRoleScopeValidationErrors = ({ roleCodes = [], geographyId = null, 
     );
   }
 
-  const hasFacilityScopedRole = normalizedRoleCodes.some((roleCode) =>
-    FACILITY_SCOPED_ADMIN_ROLE_CODES.has(roleCode)
-  );
-  // Keep legacy compatibility: allow geographyId fallback when facility assignment is missing.
-  if (hasFacilityScopedRole && !hasFacilityScopedAssignment(assignments) && !geographyId) {
+  const hasFacilityManagerRole = normalizedRoleCodes.includes(ROLE_CODES.FACILITY_MANAGER);
+  const hasSupervisorRole = normalizedRoleCodes.includes(ROLE_CODES.SUPERVISOR);
+  const hasWorkerRole = normalizedRoleCodes.includes(ROLE_CODES.FIELD_WORKER);
+  const hasFacilityAssignment = hasFacilityScopedAssignment(assignments);
+
+  if (hasSupervisorRole && !hasScopedAssignment(assignments)) {
     errors.push(
-      'facility_manager role requires facility-scoped assignment (facilityId/toiletUnitId) or geographyId for legacy compatibility'
+      'supervisor role requires zone/ward or facility assignment (geographyId/facilityId/toiletUnitId)'
+    );
+  }
+  if (hasWorkerRole && !hasScopedAssignment(assignments)) {
+    errors.push(
+      'field_worker role requires zone/ward or facility assignment (geographyId/facilityId/toiletUnitId)'
+    );
+  }
+  if (hasFacilityManagerRole && !hasFacilityAssignment) {
+    errors.push(
+      'facility_manager role requires facility-scoped assignment (facilityId/toiletUnitId)'
     );
   }
 

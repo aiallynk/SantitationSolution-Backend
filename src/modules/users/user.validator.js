@@ -2,7 +2,19 @@ const { isBlank, isUuid, parsePositiveInteger } = require('../../utils/validator
 const { collectRoleScopeValidationErrors } = require('../../core/rbac/roleScopeRules');
 
 const ALLOWED_USER_STATUSES = new Set(['active', 'inactive', 'locked']);
-const ALLOWED_ASSIGNMENT_LEVELS = new Set(['tenant', 'geography', 'facility', 'toilet_unit']);
+const ALLOWED_ASSIGNMENT_LEVELS = new Set([
+  'tenant',
+  'geography',
+  'country',
+  'state',
+  'district',
+  'city',
+  'zone',
+  'ward',
+  'facility',
+  'toilet_unit',
+]);
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
 
 const validateUuidField = (value, field, errors) => {
   if (value === undefined || value === null || value === '') return;
@@ -38,7 +50,9 @@ const validateAssignments = (assignments, errors, prefix = 'assignments') => {
       assignment.assignmentLevel !== undefined &&
       !ALLOWED_ASSIGNMENT_LEVELS.has(String(assignment.assignmentLevel).toLowerCase())
     ) {
-      errors.push(`${prefix}[${index}].assignmentLevel must be one of tenant|geography|facility|toilet_unit`);
+      errors.push(
+        `${prefix}[${index}].assignmentLevel must be one of tenant|geography|country|state|district|city|zone|ward|facility|toilet_unit`
+      );
     }
     if (
       assignment.status !== undefined &&
@@ -52,6 +66,7 @@ const validateAssignments = (assignments, errors, prefix = 'assignments') => {
     ) {
       errors.push(`${prefix}[${index}].assignmentRole must be 80 characters or fewer`);
     }
+    validateUuidField(assignment.supervisorUserId, `${prefix}[${index}].supervisorUserId`, errors);
     validateUuidField(assignment.geographyId, `${prefix}[${index}].geographyId`, errors);
     validateUuidField(assignment.facilityId, `${prefix}[${index}].facilityId`, errors);
     validateUuidField(assignment.toiletUnitId, `${prefix}[${index}].toiletUnitId`, errors);
@@ -80,6 +95,9 @@ const validateCreateUser = (req) => {
   const errors = [];
   if (isBlank(req.body.fullName)) errors.push('fullName is required');
   if (isBlank(req.body.email)) errors.push('email is required');
+  if (!isBlank(req.body.email) && !isLikelyEmail(req.body.email)) {
+    errors.push('email must be a valid email address');
+  }
   if (isBlank(req.body.password)) errors.push('password is required');
   if (!isBlank(req.body.password) && String(req.body.password).length < 8) {
     errors.push('password must be at least 8 characters');
@@ -92,12 +110,27 @@ const validateCreateUser = (req) => {
   if (req.body.employeeCode && String(req.body.employeeCode).trim().length > 64) {
     errors.push('employeeCode must be 64 characters or fewer');
   }
+  if (req.body.userId && String(req.body.userId).trim().length > 40) {
+    errors.push('userId must be 40 characters or fewer');
+  }
+  if (req.body.userIdCode && String(req.body.userIdCode).trim().length > 40) {
+    errors.push('userIdCode must be 40 characters or fewer');
+  }
+  if (req.body.remarks && String(req.body.remarks).trim().length > 500) {
+    errors.push('remarks must be 500 characters or fewer');
+  }
   if (req.body.status && !ALLOWED_USER_STATUSES.has(String(req.body.status).toLowerCase())) {
     errors.push('status must be one of active|inactive|locked');
   }
   validateUuidField(req.body.tenantId, 'tenantId', errors);
   validateUuidField(req.body.geographyId, 'geographyId', errors);
+  validateUuidField(req.body.supervisorUserId, 'supervisorUserId', errors);
   validateAssignments(req.body.assignments, errors);
+  ['countryName', 'stateName', 'districtName', 'cityName', 'zoneName', 'wardName'].forEach((field) => {
+    if (req.body[field] !== undefined && String(req.body[field]).trim().length > 180) {
+      errors.push(`${field} must be 180 characters or fewer`);
+    }
+  });
   if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
     errors.push(
       ...collectRoleScopeValidationErrors({
@@ -112,11 +145,27 @@ const validateCreateUser = (req) => {
 
 const validatePatchUser = (req) => {
   const errors = [];
+  if (req.body.email !== undefined) {
+    if (isBlank(req.body.email)) {
+      errors.push('email cannot be blank when provided');
+    } else if (!isLikelyEmail(req.body.email)) {
+      errors.push('email must be a valid email address');
+    }
+  }
   if (req.body.password && String(req.body.password).length < 8) {
     errors.push('password must be at least 8 characters');
   }
   if (req.body.employeeCode && String(req.body.employeeCode).trim().length > 64) {
     errors.push('employeeCode must be 64 characters or fewer');
+  }
+  if (req.body.userId !== undefined && String(req.body.userId || '').trim().length > 40) {
+    errors.push('userId must be 40 characters or fewer');
+  }
+  if (req.body.userIdCode !== undefined && String(req.body.userIdCode || '').trim().length > 40) {
+    errors.push('userIdCode must be 40 characters or fewer');
+  }
+  if (req.body.remarks !== undefined && String(req.body.remarks || '').trim().length > 500) {
+    errors.push('remarks must be 500 characters or fewer');
   }
   if (req.body.status && !ALLOWED_USER_STATUSES.has(String(req.body.status).toLowerCase())) {
     errors.push('status must be one of active|inactive|locked');
@@ -136,7 +185,13 @@ const validatePatchUser = (req) => {
   }
   validateUuidField(req.body.tenantId, 'tenantId', errors);
   validateUuidField(req.body.geographyId, 'geographyId', errors);
+  validateUuidField(req.body.supervisorUserId, 'supervisorUserId', errors);
   validateAssignments(req.body.assignments, errors);
+  ['countryName', 'stateName', 'districtName', 'cityName', 'zoneName', 'wardName'].forEach((field) => {
+    if (req.body[field] !== undefined && String(req.body[field]).trim().length > 180) {
+      errors.push(`${field} must be 180 characters or fewer`);
+    }
+  });
   if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
     errors.push(
       ...collectRoleScopeValidationErrors({

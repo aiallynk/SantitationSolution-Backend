@@ -1,5 +1,12 @@
 const express = require('express');
-const { protect } = require('../../core/middleware/auth');
+const {
+  protect,
+  requireAction,
+  requirePermissions,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
+} = require('../../core/middleware/auth');
 const { sendSuccess } = require('../../core/http/response');
 const dashboardService = require('../../modules/dashboard/dashboard.service');
 const alertService = require('../../modules/alerts/alert.service');
@@ -7,14 +14,31 @@ const inspectionService = require('../../modules/inspections/inspection.service'
 const analysisService = require('../../modules/analysis/analysis.service');
 const authRouter = require('../../modules/auth/auth.routes');
 const AppError = require('../../core/errors/AppError');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
+const OPS_AND_MOBILE_SURFACES = [
+  SurfaceTypes.OPS_WEB,
+  SurfaceTypes.OPS_WEB_AND_MOBILE,
+  SurfaceTypes.MOBILE_ONLY,
+];
+const COMMON_SCOPE_RULE = {
+  scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY],
+};
+const OPS_WEB_SURFACES = [SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE];
 
 // Legacy auth aliases
 router.use('/auth', authRouter);
 
 // Legacy inspections aliases for current frontend contract.
-router.get('/inspections', protect, async (req, res, next) => {
+router.get(
+  '/inspections',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('inspection.review'),
+  async (req, res, next) => {
   try {
     const result = await inspectionService.listInspections(req, false);
     return sendSuccess(res, {
@@ -27,7 +51,14 @@ router.get('/inspections', protect, async (req, res, next) => {
   }
 });
 
-router.get('/inspections/recent', protect, async (req, res, next) => {
+router.get(
+  '/inspections/recent',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('inspection.review'),
+  async (req, res, next) => {
   try {
     const result = await inspectionService.listInspections(
       {
@@ -49,7 +80,14 @@ router.get('/inspections/recent', protect, async (req, res, next) => {
   }
 });
 
-router.get('/inspections/:id', protect, async (req, res, next) => {
+router.get(
+  '/inspections/:id',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const data = await inspectionService.getInspectionById(req);
     return sendSuccess(res, { message: 'Inspection fetched successfully', data });
@@ -59,7 +97,14 @@ router.get('/inspections/:id', protect, async (req, res, next) => {
 });
 
 // Legacy analytics aliases.
-router.get('/analytics/summary', protect, async (req, res, next) => {
+router.get(
+  '/analytics/summary',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const data = await dashboardService.getOverview(req);
     return sendSuccess(res, { message: 'Summary fetched successfully', data });
@@ -68,7 +113,14 @@ router.get('/analytics/summary', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analytics/trends', protect, async (req, res, next) => {
+router.get(
+  '/analytics/trends',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const data = await dashboardService.getTrends(req);
     return sendSuccess(res, { message: 'Trends fetched successfully', data: { items: data } });
@@ -77,7 +129,14 @@ router.get('/analytics/trends', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analytics/alerts', protect, async (req, res, next) => {
+router.get(
+  '/analytics/alerts',
+  protect,
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const result = await alertService.listAlerts(req);
     return sendSuccess(res, {
@@ -90,7 +149,14 @@ router.get('/analytics/alerts', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analytics/heatmap', protect, async (req, res, next) => {
+router.get(
+  '/analytics/heatmap',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const points = await dashboardService.getHeatmap(req);
     return sendSuccess(res, { message: 'Heatmap data fetched successfully', data: { points } });
@@ -99,7 +165,14 @@ router.get('/analytics/heatmap', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analytics/zones', protect, async (req, res, next) => {
+router.get(
+  '/analytics/zones',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const facilities = await dashboardService.getMap(req);
     const zones = {};
@@ -119,7 +192,14 @@ router.get('/analytics/zones', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analytics/critical', protect, async (req, res, next) => {
+router.get(
+  '/analytics/critical',
+  protect,
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const alertsResult = await alertService.listAlerts({
       ...req,
@@ -134,7 +214,15 @@ router.get('/analytics/critical', protect, async (req, res, next) => {
   }
 });
 
-router.patch('/analytics/alerts/:id/acknowledge', protect, async (req, res, next) => {
+router.patch(
+  '/analytics/alerts/:id/acknowledge',
+  protect,
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('alerts.manage'),
+  requireAction('alert.manage'),
+  async (req, res, next) => {
   try {
     req.params.id = req.params.id;
     const data = await alertService.acknowledgeAlert(req);
@@ -144,7 +232,14 @@ router.patch('/analytics/alerts/:id/acknowledge', protect, async (req, res, next
   }
 });
 
-router.post('/inspections/upload', protect, async (req, res, next) => {
+router.post(
+  '/inspections/upload',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('inspection.create'),
+  async (req, res, next) => {
   try {
     throw new AppError(
       'Legacy /inspections/upload is deprecated. Use /api/v1/inspections/:id/media',
@@ -156,7 +251,14 @@ router.post('/inspections/upload', protect, async (req, res, next) => {
   }
 });
 
-router.post('/inspections/submit', protect, async (req, res, next) => {
+router.post(
+  '/inspections/submit',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('inspection.create'),
+  async (req, res, next) => {
   try {
     throw new AppError(
       'Legacy /inspections/submit is deprecated. Use /api/v1/inspections and /api/v1/inspections/:id/submit',
@@ -168,7 +270,14 @@ router.post('/inspections/submit', protect, async (req, res, next) => {
   }
 });
 
-router.get('/alerts/:id', protect, async (req, res, next) => {
+router.get(
+  '/alerts/:id',
+  protect,
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const data = await alertService.getAlertById(req);
     return sendSuccess(res, { message: 'Alert fetched successfully', data });
@@ -177,7 +286,14 @@ router.get('/alerts/:id', protect, async (req, res, next) => {
   }
 });
 
-router.get('/analysis/inspections/:inspectionId/result', protect, async (req, res, next) => {
+router.get(
+  '/analysis/inspections/:inspectionId/result',
+  protect,
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  async (req, res, next) => {
   try {
     const data = await analysisService.getAnalysisResult(req.params.inspectionId, req);
     return sendSuccess(res, { message: 'Analysis result fetched successfully', data });

@@ -4,20 +4,40 @@ const {
   protect,
   requirePermissions,
   requireAnyPermissions,
+  requireAction,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
 } = require('../../core/middleware/auth');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
 const { validateTaskCreate } = require('./task.validator');
 
 const router = express.Router();
 
 router.use(protect);
+router.use(
+  requireSurface(
+    SurfaceTypes.OPS_WEB,
+    SurfaceTypes.OPS_WEB_AND_MOBILE,
+    SurfaceTypes.MOBILE_ONLY,
+  ),
+  requireRouteKey(RouteKeys.OPS_TASKS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
 router.get(
   '/tasks',
   requireAnyPermissions('task.manage', 'inspection.create', 'dashboard.read'),
   taskController.getTasks
 );
-router.post('/tasks', requirePermissions('task.manage'), validate(validateTaskCreate), taskController.postTask);
+router.post(
+  '/tasks',
+  requirePermissions('task.manage'),
+  requireAction('task.manage'),
+  validate(validateTaskCreate),
+  taskController.postTask
+);
 router.get(
   '/tasks/my',
   requireAnyPermissions('inspection.create', 'task.manage', 'dashboard.read'),
@@ -31,11 +51,13 @@ router.get(
 router.patch(
   '/tasks/:id/start',
   requireAnyPermissions('inspection.create', 'task.manage'),
+  requireAction('task.execute'),
   taskController.patchTaskStart
 );
 router.patch(
   '/tasks/:id/complete',
   requireAnyPermissions('inspection.create', 'task.manage'),
+  requireAction('task.execute'),
   taskController.patchTaskComplete
 );
 

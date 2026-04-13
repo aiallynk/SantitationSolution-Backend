@@ -13,16 +13,39 @@ const {
   StorageUsageMetric,
   DashboardAggregate,
   PlatformUser,
+  WorkerAssignment,
+  UserRole,
+  Role,
+  ToiletUnit,
 } = require('../../models');
+const {
+  EMPTY_SCOPE_UUID,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+  uniqueIds,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
+const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 
-const scopedWhere = (req, key = 'tenant_id') => {
-  if (req.user.isSuperAdmin) {
-    if (req.query.tenantId) {
-      return { [key]: req.query.tenantId };
-    }
-    return {};
-  }
-  return { [key]: req.user.tenantId };
+const scopedTenantWhere = (req, where = {}, key = 'tenant_id') => {
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
+    tenantKey: key,
+  });
+};
+
+const scopedFacilityWhere = (req, where = {}, facilityKey = 'facility_id', tenantKey = 'tenant_id') => {
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'facility', {
+    tenantKey,
+    facilityKey,
+  });
+};
+
+const scopedFacilityEntityWhere = (req, where = {}) => {
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'facility', {
+    tenantKey: 'tenant_id',
+    geographyKey: 'geography_id',
+    facilityKey: 'id',
+  });
 };
 
 const toNumber = (value, fallback = 0) => {
@@ -30,13 +53,51 @@ const toNumber = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const toTimestamp = (value) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  const time = parsed.getTime();
+  return Number.isFinite(time) ? time : null;
+};
+
+const toIsoOrNull = (value) => {
+  const time = toTimestamp(value);
+  return time == null ? null : new Date(time).toISOString();
+};
+
+const pickEarlierIso = (left, right) => {
+  if (!left) return right || null;
+  if (!right) return left || null;
+  return toTimestamp(left) <= toTimestamp(right) ? left : right;
+};
+
+const pickLaterIso = (left, right) => {
+  if (!left) return right || null;
+  if (!right) return left || null;
+  return toTimestamp(left) >= toTimestamp(right) ? left : right;
+};
+
+const isOnOrAfter = (isoValue, thresholdDate) => {
+  const ts = toTimestamp(isoValue);
+  const threshold = toTimestamp(thresholdDate);
+  if (ts == null || threshold == null) return false;
+  return ts >= threshold;
+};
+
 const getOverview = async (req) => {
-  const tenantFilter = scopedWhere(req);
-  const inspectionTenantFilter = scopedWhere(req);
-  const alertTenantFilter = scopedWhere(req);
-  const taskTenantFilter = scopedWhere(req);
-  const complaintTenantFilter = scopedWhere(req);
-  const sensorTenantFilter = scopedWhere(req);
+  const tenantFilter = scopedTenantWhere(req);
+  const facilityEntityFilter = scopedFacilityEntityWhere(req);
+  const inspectionTenantFilter = scopedFacilityWhere(req);
+  const alertTenantFilter = scopedFacilityWhere(req);
+  const taskTenantFilter = scopedFacilityWhere(req);
+  const complaintTenantFilter = scopedFacilityWhere(req);
+  const sensorTenantFilter = scopedFacilityWhere(req);
+  const userScopeFilter = applyScopeToQuery(
+    { ...tenantFilter },
+    buildAccessContextFromUser(req?.user || {}),
+    'geography',
+    { tenantKey: 'tenant_id', geographyKey: 'geography_id' },
+  );
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -52,7 +113,7 @@ const getOverview = async (req) => {
     tasksInProgress,
     usersActive,
   ] = await Promise.all([
-    Facility.count({ where: tenantFilter }),
+    Facility.count({ where: facilityEntityFilter }),
     Alert.count({ where: { ...alertTenantFilter, status: { [Op.in]: ['open', 'acknowledged'] } } }),
     Inspection.count({
       where: {
@@ -76,7 +137,7 @@ const getOverview = async (req) => {
     SensorDevice.count({ where: sensorTenantFilter }),
     Complaint.count({ where: { ...complaintTenantFilter, status: { [Op.ne]: 'resolved' } } }),
     InspectionTask.count({ where: { ...taskTenantFilter, status: 'in_progress' } }),
-    PlatformUser.count({ where: { ...tenantFilter, status: 'active' } }),
+    PlatformUser.count({ where: { ...userScopeFilter, status: 'active' } }),
   ]);
 
   return {
@@ -99,7 +160,7 @@ const getOverview = async (req) => {
 
 const getMap = async (req) => {
   const facilities = await Facility.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityEntityWhere(req),
     order: [['name', 'ASC']],
   });
 
@@ -140,7 +201,7 @@ const getMap = async (req) => {
 const getHeatmap = async (req) => {
   const inspections = await Inspection.findAll({
     where: {
-      ...scopedWhere(req),
+      ...scopedFacilityWhere(req),
       latitude: { [Op.ne]: null },
       longitude: { [Op.ne]: null },
     },
@@ -165,17 +226,30 @@ const getFacilityDashboard = async (req) => {
   const facility = await Facility.findByPk(facilityId);
   if (!facility) return null;
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) return null;
+  if (!isFacilityInScope(req, facility.id)) return null;
 
   const [inspections, alerts, tasks, complaints] = await Promise.all([
     Inspection.findAll({
-      where: { facility_id: facilityId },
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
       include: [{ model: AiAnalysisResult }, { model: InspectionMedia }],
       order: [['captured_at', 'DESC']],
       limit: 20,
     }),
-    Alert.findAll({ where: { facility_id: facilityId }, order: [['created_at', 'DESC']], limit: 30 }),
-    InspectionTask.findAll({ where: { facility_id: facilityId }, order: [['scheduled_at', 'DESC']], limit: 20 }),
-    Complaint.findAll({ where: { facility_id: facilityId }, order: [['created_at', 'DESC']], limit: 20 }),
+    Alert.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['created_at', 'DESC']],
+      limit: 30,
+    }),
+    InspectionTask.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['scheduled_at', 'DESC']],
+      limit: 20,
+    }),
+    Complaint.findAll({
+      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      order: [['created_at', 'DESC']],
+      limit: 20,
+    }),
   ]);
 
   return {
@@ -239,12 +313,21 @@ const getTrends = async (req) => {
     start,
   };
   let tenantClause = '';
+  let facilityClause = '';
   if (!req.user.isSuperAdmin) {
     replacements.tenantId = req.user.tenantId;
     tenantClause = 'AND i.tenant_id = :tenantId';
   } else if (req.query.tenantId) {
     replacements.tenantId = req.query.tenantId;
     tenantClause = 'AND i.tenant_id = :tenantId';
+  }
+  const scopedFacilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
+  if (!req.user.isSuperAdmin && scopedFacilityIds.length > 0) {
+    replacements.scopeFacilityIds = scopedFacilityIds;
+    facilityClause = 'AND i.facility_id IN (:scopeFacilityIds)';
+  } else if (!req.user.isSuperAdmin && req.user?.scopeLevel === 'facility') {
+    replacements.scopeFacilityIds = [EMPTY_SCOPE_UUID];
+    facilityClause = 'AND i.facility_id IN (:scopeFacilityIds)';
   }
 
   const rows = await sequelize.query(
@@ -257,6 +340,7 @@ const getTrends = async (req) => {
       LEFT JOIN ai_analysis_results a ON a.inspection_id = i.id
       WHERE i.captured_at >= :start
         ${tenantClause}
+        ${facilityClause}
       GROUP BY DATE(i.captured_at)
       ORDER BY DATE(i.captured_at) ASC
     `,
@@ -283,45 +367,429 @@ const getTrends = async (req) => {
 };
 
 const getWorkforce = async (req) => {
-  const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
-    attributes: ['assigned_to_user_id', 'status', 'completed_at', 'created_at'],
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const lookbackRaw = Number(req.query.activityDays || 7);
+  const activityLookbackDays = Number.isFinite(lookbackRaw)
+    ? Math.min(Math.max(lookbackRaw, 1), 30)
+    : 7;
+  const activityStart = new Date(todayStart);
+  activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
+
+  const scopedTaskRows = await InspectionTask.findAll({
+    where: scopedFacilityWhere(req),
+    attributes: [
+      'assigned_to_user_id',
+      'facility_id',
+      'toilet_unit_id',
+      'status',
+      'scheduled_at',
+      'started_at',
+      'completed_at',
+      'created_at',
+    ],
+    raw: true,
   });
 
-  const byWorker = {};
-  for (const task of tasks) {
-    if (!byWorker[task.assigned_to_user_id]) {
-      byWorker[task.assigned_to_user_id] = {
-        workerId: task.assigned_to_user_id,
-        totalTasks: 0,
-        completedTasks: 0,
-        inProgressTasks: 0,
-        averageCompletionMinutes: 0,
-      };
+  const assignmentScopeWhere = applyScopeToQuery(
+    scopedTenantWhere(req, { status: 'active' }),
+    buildAccessContextFromUser(req?.user || {}),
+    'audit',
+    {
+      tenantKey: 'tenant_id',
+      geographyKey: 'geography_id',
+      facilityKey: 'facility_id',
+    },
+  );
+  const scopedAssignmentRows = await WorkerAssignment.findAll({
+    where: assignmentScopeWhere,
+    attributes: ['user_id', 'geography_id', 'facility_id', 'toilet_unit_id'],
+    raw: true,
+  });
+
+  const taskWorkerIds = uniqueIds(scopedTaskRows.map((row) => row.assigned_to_user_id));
+  const assignmentWorkerIds = uniqueIds(scopedAssignmentRows.map((row) => row.user_id));
+  const candidateWorkerIds = uniqueIds([...taskWorkerIds, ...assignmentWorkerIds]);
+  if (candidateWorkerIds.length === 0) return [];
+
+  const fieldWorkerRole = await Role.findOne({
+    where: { code: ROLE_CODES.FIELD_WORKER },
+    attributes: ['id'],
+    raw: true,
+  });
+  if (!fieldWorkerRole?.id) return [];
+
+  const fieldWorkerRoleRows = await UserRole.findAll({
+    where: {
+      ...scopedTenantWhere(req, { role_id: fieldWorkerRole.id }, 'tenant_id'),
+      user_id: { [Op.in]: candidateWorkerIds },
+    },
+    attributes: ['user_id'],
+    raw: true,
+  });
+  const scopedWorkerIds = uniqueIds(fieldWorkerRoleRows.map((row) => row.user_id));
+  if (scopedWorkerIds.length === 0) return [];
+
+  const workerRows = await PlatformUser.findAll({
+    where: {
+      id: { [Op.in]: scopedWorkerIds },
+      status: 'active',
+    },
+    attributes: ['id', 'full_name', 'employee_code', 'metadata', 'updated_at'],
+    raw: true,
+  });
+  if (workerRows.length === 0) return [];
+
+  const activeWorkerIds = uniqueIds(workerRows.map((row) => row.id));
+  const activeWorkerIdSet = new Set(activeWorkerIds.map((id) => String(id)));
+
+  const assignmentRows = scopedAssignmentRows.filter((row) =>
+    activeWorkerIdSet.has(String(row.user_id || ''))
+  );
+  const taskRows = scopedTaskRows.filter((row) =>
+    activeWorkerIdSet.has(String(row.assigned_to_user_id || ''))
+  );
+
+  const assignmentToiletUnitIds = uniqueIds(assignmentRows.map((row) => row.toilet_unit_id));
+  const assignmentToiletUnitRows =
+    assignmentToiletUnitIds.length > 0
+      ? await ToiletUnit.findAll({
+          where: { id: { [Op.in]: assignmentToiletUnitIds } },
+          attributes: ['id', 'facility_id', 'location_label'],
+          raw: true,
+        })
+      : [];
+  const assignmentToiletUnitById = new Map(
+    assignmentToiletUnitRows.map((row) => [String(row.id), row])
+  );
+
+  const isSupervisorActor = (Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : []).includes(
+    ROLE_CODES.SUPERVISOR
+  );
+
+  const workforceByWorkerId = new Map();
+  for (const worker of workerRows) {
+    const workerId = String(worker.id);
+    workforceByWorkerId.set(workerId, {
+      workerId,
+      workerName: worker.full_name || `Worker-${workerId.slice(0, 6).toUpperCase()}`,
+      employeeCode: worker.employee_code || null,
+      phoneBatteryPct: toNumber(
+        worker?.metadata?.phoneBatteryPct ??
+          worker?.metadata?.batteryPct ??
+          worker?.metadata?.deviceBatteryPct,
+        null
+      ),
+      totalTasks: 0,
+      completedTasks: 0,
+      inProgressTasks: 0,
+      averageCompletionAccumulator: 0,
+      checkInLogs: [],
+      checkOutLogs: [],
+      locationTrail: [],
+      facilityIds: new Set(),
+      lastSeenAt: toIsoOrNull(worker.updated_at),
+      latestLocationPoint: null,
+      firstInspectionTodayAt: null,
+      assignedToSupervisor: Boolean(isSupervisorActor),
+      supervisorId: isSupervisorActor ? req.user.id : null,
+    });
+  }
+
+  for (const assignment of assignmentRows) {
+    const workerId = String(assignment.user_id || '');
+    const row = workforceByWorkerId.get(workerId);
+    if (!row) continue;
+    if (assignment.facility_id) {
+      row.facilityIds.add(String(assignment.facility_id));
+    } else if (assignment.toilet_unit_id) {
+      const toiletUnit = assignmentToiletUnitById.get(String(assignment.toilet_unit_id));
+      if (toiletUnit?.facility_id) {
+        row.facilityIds.add(String(toiletUnit.facility_id));
+      }
     }
-    const row = byWorker[task.assigned_to_user_id];
+  }
+
+  for (const task of taskRows) {
+    const workerId = String(task.assigned_to_user_id || '');
+    const row = workforceByWorkerId.get(workerId);
+    if (!row) continue;
+
     row.totalTasks += 1;
     if (task.status === 'completed') {
       row.completedTasks += 1;
-      if (task.completed_at && task.created_at) {
-        const durationMinutes =
-          (new Date(task.completed_at).getTime() - new Date(task.created_at).getTime()) / 60000;
-        row.averageCompletionMinutes += Math.max(0, durationMinutes);
+      const completedAtTs = toTimestamp(task.completed_at);
+      const createdAtTs = toTimestamp(task.created_at);
+      if (completedAtTs != null && createdAtTs != null) {
+        row.averageCompletionAccumulator += Math.max(0, (completedAtTs - createdAtTs) / 60000);
       }
     } else if (task.status === 'in_progress') {
       row.inProgressTasks += 1;
     }
+
+    if (task.facility_id) {
+      row.facilityIds.add(String(task.facility_id));
+    }
+
+    const startedAt = toIsoOrNull(task.started_at);
+    if (startedAt && isOnOrAfter(startedAt, todayStart)) {
+      row.checkInLogs.push({
+        at: startedAt,
+        source: 'task_start',
+        facilityId: task.facility_id || null,
+        toiletUnitId: task.toilet_unit_id || null,
+      });
+    }
+
+    const completedAt = toIsoOrNull(task.completed_at);
+    if (completedAt && isOnOrAfter(completedAt, todayStart)) {
+      row.checkOutLogs.push({
+        at: completedAt,
+        source: 'task_complete',
+        facilityId: task.facility_id || null,
+        toiletUnitId: task.toilet_unit_id || null,
+      });
+    }
+
+    const activityAt =
+      completedAt ||
+      startedAt ||
+      toIsoOrNull(task.created_at) ||
+      toIsoOrNull(task.scheduled_at) ||
+      null;
+    row.lastSeenAt = pickLaterIso(row.lastSeenAt, activityAt);
   }
-  return Object.values(byWorker).map((row) => ({
-    ...row,
-    averageCompletionMinutes:
-      row.completedTasks > 0 ? Number((row.averageCompletionMinutes / row.completedTasks).toFixed(2)) : 0,
-  }));
+
+  const inspectionRows = await Inspection.findAll({
+    where: scopedFacilityWhere(req, {
+      inspector_user_id: { [Op.in]: activeWorkerIds },
+      captured_at: { [Op.gte]: activityStart },
+    }),
+    attributes: [
+      'id',
+      'inspector_user_id',
+      'facility_id',
+      'toilet_unit_id',
+      'latitude',
+      'longitude',
+      'captured_at',
+      'submitted_at',
+      'created_at',
+    ],
+    include: [
+      {
+        model: Facility,
+        attributes: ['id', 'name', 'address_line'],
+      },
+      {
+        model: ToiletUnit,
+        attributes: ['id', 'code', 'location_label'],
+      },
+    ],
+    order: [['captured_at', 'DESC']],
+  });
+
+  for (const inspection of inspectionRows) {
+    const workerId = String(inspection.inspector_user_id || '');
+    const row = workforceByWorkerId.get(workerId);
+    if (!row) continue;
+
+    const eventAt = toIsoOrNull(
+      inspection.submitted_at || inspection.captured_at || inspection.created_at
+    );
+    if (!eventAt) continue;
+
+    const lat = toNumber(inspection.latitude, null);
+    const lng = toNumber(inspection.longitude, null);
+    const locationLabel =
+      inspection.ToiletUnit?.location_label ||
+      inspection.Facility?.name ||
+      inspection.Facility?.address_line ||
+      null;
+
+    const point = {
+      at: eventAt,
+      source: 'inspection',
+      inspectionId: inspection.id,
+      facilityId: inspection.facility_id || null,
+      facilityName: inspection.Facility?.name || null,
+      toiletUnitId: inspection.toilet_unit_id || null,
+      toiletUnitCode: inspection.ToiletUnit?.code || null,
+      locationLabel,
+      gpsLat: lat,
+      gpsLng: lng,
+    };
+
+    if (
+      !row.latestLocationPoint ||
+      toTimestamp(point.at) > toTimestamp(row.latestLocationPoint.at)
+    ) {
+      row.latestLocationPoint = point;
+    }
+
+    if (inspection.facility_id) {
+      row.facilityIds.add(String(inspection.facility_id));
+    }
+
+    row.lastSeenAt = pickLaterIso(row.lastSeenAt, point.at);
+
+    if (isOnOrAfter(point.at, todayStart)) {
+      row.locationTrail.push(point);
+      row.firstInspectionTodayAt = pickEarlierIso(row.firstInspectionTodayAt, point.at);
+    }
+  }
+
+  for (const row of workforceByWorkerId.values()) {
+    if (row.checkInLogs.length === 0 && row.firstInspectionTodayAt) {
+      row.checkInLogs.push({
+        at: row.firstInspectionTodayAt,
+        source: 'inspection_capture',
+        facilityId: row.latestLocationPoint?.facilityId || null,
+        toiletUnitId: row.latestLocationPoint?.toiletUnitId || null,
+        locationLabel: row.latestLocationPoint?.locationLabel || null,
+        gpsLat: row.latestLocationPoint?.gpsLat ?? null,
+        gpsLng: row.latestLocationPoint?.gpsLng ?? null,
+      });
+    }
+  }
+
+  const allFacilityIds = uniqueIds(
+    [...workforceByWorkerId.values()].flatMap((row) => [...row.facilityIds.values()])
+  );
+
+  const facilityRows =
+    allFacilityIds.length > 0
+      ? await Facility.findAll({
+          where: { id: { [Op.in]: allFacilityIds } },
+          attributes: ['id', 'name', 'address_line'],
+          raw: true,
+        })
+      : [];
+  const facilityById = new Map(facilityRows.map((row) => [String(row.id), row]));
+
+  const sensorRows =
+    allFacilityIds.length > 0
+      ? await SensorDevice.findAll({
+          where: scopedFacilityWhere(req, {
+            facility_id: { [Op.in]: allFacilityIds },
+          }),
+          attributes: ['facility_id', 'status'],
+          raw: true,
+        })
+      : [];
+
+  const sensorByFacilityId = new Map();
+  for (const sensor of sensorRows) {
+    const facilityId = String(sensor.facility_id || '');
+    if (!facilityId) continue;
+    const bucket = sensorByFacilityId.get(facilityId) || { total: 0, online: 0, offline: 0 };
+    bucket.total += 1;
+    if (sensor.status === 'active') {
+      bucket.online += 1;
+    } else {
+      bucket.offline += 1;
+    }
+    sensorByFacilityId.set(facilityId, bucket);
+  }
+
+  const results = [];
+  const nowIso = new Date().toISOString();
+
+  for (const row of workforceByWorkerId.values()) {
+    const checkInLogs = row.checkInLogs
+      .filter((entry) => Boolean(entry?.at))
+      .sort((left, right) => toTimestamp(left.at) - toTimestamp(right.at));
+    const checkOutLogs = row.checkOutLogs
+      .filter((entry) => Boolean(entry?.at))
+      .sort((left, right) => toTimestamp(left.at) - toTimestamp(right.at));
+    const locationTrail = row.locationTrail
+      .filter((entry) => Boolean(entry?.at))
+      .sort((left, right) => toTimestamp(right.at) - toTimestamp(left.at))
+      .slice(0, 25);
+
+    const checkInAt = checkInLogs[0]?.at || null;
+    const checkOutAt = checkOutLogs[checkOutLogs.length - 1]?.at || null;
+
+    let attendanceStatus = 'Absent';
+    if (checkOutAt) {
+      attendanceStatus = 'Checked out';
+    } else if (checkInAt || row.inProgressTasks > 0 || locationTrail.length > 0) {
+      attendanceStatus = 'Present';
+    }
+
+    const shiftStartTs = toTimestamp(checkInAt);
+    const shiftEndTs = toTimestamp(checkOutAt || nowIso);
+    const workingMinutes =
+      shiftStartTs != null && shiftEndTs != null
+        ? Math.max(0, Math.round((shiftEndTs - shiftStartTs) / 60000))
+        : 0;
+
+    const workerFacilityIds = [...row.facilityIds.values()];
+    const sensorTotals = workerFacilityIds.reduce(
+      (acc, facilityId) => {
+        const current = sensorByFacilityId.get(String(facilityId));
+        if (!current) return acc;
+        acc.total += current.total;
+        acc.online += current.online;
+        acc.offline += current.offline;
+        return acc;
+      },
+      { total: 0, online: 0, offline: 0 }
+    );
+
+    const fallbackFacility = facilityById.get(String(workerFacilityIds[0] || '')) || null;
+    const locationLabel =
+      row.latestLocationPoint?.locationLabel ||
+      fallbackFacility?.name ||
+      fallbackFacility?.address_line ||
+      null;
+
+    results.push({
+      workerId: row.workerId,
+      workerName: row.workerName,
+      employeeCode: row.employeeCode,
+      attendanceStatus,
+      checkInAt,
+      checkOutAt,
+      checkInLogs: checkInLogs.slice(0, 25),
+      checkOutLogs: checkOutLogs.slice(0, 25),
+      totalTasks: row.totalTasks,
+      completedTasks: row.completedTasks,
+      inProgressTasks: row.inProgressTasks,
+      averageCompletionMinutes:
+        row.completedTasks > 0
+          ? Number((row.averageCompletionAccumulator / row.completedTasks).toFixed(2))
+          : 0,
+      workingMinutes,
+      workingHours: Number((workingMinutes / 60).toFixed(2)),
+      phoneBatteryPct: row.phoneBatteryPct,
+      sensorTotal: workerFacilityIds.length > 0 ? sensorTotals.total : null,
+      sensorOnline: workerFacilityIds.length > 0 ? sensorTotals.online : null,
+      sensorOffline: workerFacilityIds.length > 0 ? sensorTotals.offline : null,
+      gpsLat: row.latestLocationPoint?.gpsLat ?? null,
+      gpsLng: row.latestLocationPoint?.gpsLng ?? null,
+      locationLabel,
+      locationTrail,
+      lastSeenAt: row.lastSeenAt || checkOutAt || checkInAt || null,
+      assignedToSupervisor: row.assignedToSupervisor,
+      supervisorId: row.supervisorId,
+      facilityIds: workerFacilityIds,
+      facilityCount: workerFacilityIds.length,
+      currentLocation: row.latestLocationPoint || null,
+    });
+  }
+
+  return results.sort((left, right) =>
+    String(left.workerName || left.workerId || '').localeCompare(
+      String(right.workerName || right.workerId || '')
+    )
+  );
 };
 
 const getSla = async (req) => {
   const tasks = await InspectionTask.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityWhere(req),
     order: [['scheduled_at', 'DESC']],
     limit: 500,
   });
@@ -357,7 +825,7 @@ const getSla = async (req) => {
 
 const getStorageUsage = async (req) => {
   const rows = await StorageUsageMetric.findAll({
-    where: scopedWhere(req),
+    where: scopedTenantWhere(req),
     order: [['measured_at', 'DESC']],
     limit: Number(req.query.limit || 30),
   });
@@ -373,20 +841,20 @@ const getStorageUsage = async (req) => {
 
 const getPlatformHealth = async (req) => {
   const latestAggregate = await DashboardAggregate.findOne({
-    where: scopedWhere(req),
+    where: scopedTenantWhere(req),
     order: [['aggregate_date', 'DESC']],
   });
 
   const [alerts, sensorsFaulty] = await Promise.all([
     Alert.count({
       where: {
-        ...scopedWhere(req),
+        ...scopedFacilityWhere(req),
         status: 'open',
       },
     }),
     SensorDevice.count({
       where: {
-        ...scopedWhere(req),
+        ...scopedFacilityWhere(req),
         status: 'faulty',
       },
     }),
@@ -403,7 +871,7 @@ const getPlatformHealth = async (req) => {
 const getContractorPerformance = async (req) => {
   // Contractor mapping is not a first-class table yet; derive from facility metadata.
   const facilities = await Facility.findAll({
-    where: scopedWhere(req),
+    where: scopedFacilityEntityWhere(req),
     attributes: ['id', 'metadata'],
   });
   const byContractor = {};

@@ -1,4 +1,3 @@
-const { Op } = require('sequelize');
 const {
   Inspection,
   AiAnalysisResult,
@@ -6,9 +5,28 @@ const {
   Facility,
   Complaint,
 } = require('../../models');
+const {
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
-const scopedWhere = (req) =>
-  req.user.isSuperAdmin ? {} : { tenant_id: req.user.tenantId };
+const scopedWhere = (req) => {
+  const where = applyScopeToQuery(
+    {},
+    buildAccessContextFromUser(req?.user || {}),
+    'report',
+    { tenantKey: 'tenant_id', facilityKey: 'facility_id' },
+  );
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      where.facility_id = '00000000-0000-0000-0000-000000000000';
+    } else {
+      where.facility_id = req.query.facilityId;
+    }
+  }
+  return where;
+};
 
 const getInspectionReport = async (req) => {
   const rows = await Inspection.findAll({

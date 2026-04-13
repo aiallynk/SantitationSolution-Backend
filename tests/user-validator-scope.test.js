@@ -49,3 +49,24 @@ test('validatePatchUser checks scoped role errors when roleCodes are supplied', 
     true,
   );
 });
+
+test('validatePatchUser validates email format when provided', () => {
+  const errors = validatePatchUser({
+    body: {
+      email: 'invalid-email',
+    },
+  });
+  assert.equal(errors.includes('email must be a valid email address'), true);
+});
+
+test('validateCreateUser validates email format', () => {
+  const errors = validateCreateUser({
+    body: {
+      fullName: 'User One',
+      email: 'bad-email-format',
+      password: 'Password@123',
+      roleCodes: ['field_worker'],
+    },
+  });
+  assert.equal(errors.includes('email must be a valid email address'), true);
+});

@@ -9,6 +9,11 @@ const {
 const { normalizePagination } = require('../../utils/validators');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { createAuditLog } = require('../audit/audit.service');
+const {
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
 const THRESHOLDS = {
   odor_ppm: Number(process.env.ALERT_ODOR_PPM_THRESHOLD || 70),
@@ -24,6 +29,12 @@ const parseNumeric = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+
+const scopedWhere = (req, where = {}, domainType = 'sensor') =>
+  applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), domainType, {
+    tenantKey: 'tenant_id',
+    facilityKey: 'facility_id',
+  });
 
 const mapReading = (row) => ({
   id: row.id,
@@ -102,6 +113,9 @@ const ingestSensorReading = async (req) => {
   if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
     throw new AppError('Sensor device out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, device.facility_id || null)) {
+    throw new AppError('Sensor device out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
 
   const timestamp = req.body.timestamp ? new Date(req.body.timestamp) : new Date();
   const reading = await SensorReading.create({
@@ -147,16 +161,14 @@ const ingestSensorReading = async (req) => {
 
 const listSensors = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  const where = {};
-  if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
-  } else if (req.query.tenantId) {
-    where.tenant_id = req.query.tenantId;
-  }
+  let where = scopedWhere(req, {}, 'sensor');
   if (req.query.status) {
     where.status = req.query.status;
   }
   if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
     where.facility_id = req.query.facilityId;
   }
 
@@ -193,6 +205,9 @@ const listSensorReadings = async (req) => {
   if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
     throw new AppError('Sensor out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (!isFacilityInScope(req, device.facility_id || null)) {
+    throw new AppError('Sensor out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
   const { page, limit, offset } = normalizePagination(req.query);
   const { rows, count } = await SensorReading.findAndCountAll({
     where: { device_id: device.id },
@@ -213,6 +228,9 @@ const getFacilityLiveMetrics = async (req) => {
     throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
   }
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, facility.id)) {
     throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
 
@@ -257,15 +275,20 @@ const getFacilityLiveMetrics = async (req) => {
 };
 
 const getLiveAlerts = async (req) => {
-  const where = {
+  let where = scopedWhere(
+    req,
+    {
     status: {
       [Op.in]: ['open', 'acknowledged'],
     },
-  };
-  if (!req.user.isSuperAdmin) {
-    where.tenant_id = req.user.tenantId;
-  } else if (req.query.tenantId) {
-    where.tenant_id = req.query.tenantId;
+    },
+    'alert',
+  );
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.facility_id = req.query.facilityId;
   }
 
   const alerts = await Alert.findAll({

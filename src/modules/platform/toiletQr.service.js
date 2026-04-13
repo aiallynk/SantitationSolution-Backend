@@ -66,6 +66,18 @@ const resolvePublicFeedbackBaseUrl = () => {
     return explicit;
   }
 
+  // Render exposes the externally routable service URL via this env var.
+  const renderExternalUrl = normalizeBaseUrl(process.env.RENDER_EXTERNAL_URL);
+  if (renderExternalUrl) {
+    return renderExternalUrl;
+  }
+
+  // Optional generic override for other platforms.
+  const apiPublicBaseUrl = normalizeBaseUrl(process.env.API_PUBLIC_BASE_URL);
+  if (apiPublicBaseUrl) {
+    return apiPublicBaseUrl;
+  }
+
   const protocol =
     String(process.env.PUBLIC_FEEDBACK_PROTOCOL || 'http').trim().toLowerCase() ===
     'https'

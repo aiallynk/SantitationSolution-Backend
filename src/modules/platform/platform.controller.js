@@ -38,10 +38,37 @@ const getGeographiesTree = async (req, res, next) => {
   }
 };
 
+const getGeographyOptions = async (req, res, next) => {
+  try {
+    const data = await platformService.listGeographyOptions(req);
+    return sendSuccess(res, { message: 'Geography options fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postGeography = async (req, res, next) => {
   try {
     const row = await platformService.createGeography(req);
     return sendSuccess(res, { statusCode: 201, message: 'Geography created successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const patchGeography = async (req, res, next) => {
+  try {
+    const row = await platformService.patchGeography(req);
+    return sendSuccess(res, { message: 'Geography updated successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deleteGeography = async (req, res, next) => {
+  try {
+    const row = await platformService.removeGeography(req);
+    return sendSuccess(res, { message: 'Geography deleted successfully', data: row });
   } catch (error) {
     return next(error);
   }
@@ -87,6 +114,15 @@ const patchFacility = async (req, res, next) => {
   }
 };
 
+const deleteFacility = async (req, res, next) => {
+  try {
+    const row = await platformService.removeFacility(req);
+    return sendSuccess(res, { message: 'Facility deleted successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getToiletBlocks = async (req, res, next) => {
   try {
     const data = await platformService.listBlocks(req);
@@ -117,7 +153,22 @@ const getToiletUnits = async (req, res, next) => {
 const getToiletUnitByQr = async (req, res, next) => {
   try {
     const data = await platformService.resolveUnitByQr(req);
-    return sendSuccess(res, { message: 'Toilet unit resolved successfully', data });
+    return sendSuccess(res, {
+      message: data?.message || 'Toilet unit resolved successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const postToiletUnitByQr = async (req, res, next) => {
+  try {
+    const data = await platformService.resolveUnitByQrDetailed(req);
+    return sendSuccess(res, {
+      message: data?.message || 'QR resolution completed',
+      data,
+    });
   } catch (error) {
     return next(error);
   }
@@ -190,15 +241,20 @@ module.exports = {
   postTenant,
   patchTenant,
   getGeographiesTree,
+  getGeographyOptions,
   postGeography,
+  patchGeography,
+  deleteGeography,
   getFacilities,
   postFacility,
   getFacilityById,
   patchFacility,
+  deleteFacility,
   getToiletBlocks,
   postToiletBlock,
   getToiletUnits,
   getToiletUnitByQr,
+  postToiletUnitByQr,
   postToiletUnit,
   getToiletInspections,
   getToiletDetails,

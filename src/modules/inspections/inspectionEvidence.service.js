@@ -24,6 +24,8 @@ const {
   normalizeMediaUrl,
   resolveMediaPairUrls,
 } = require('../media/mediaUrl.service');
+const { applyTenantScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const { IMAGE_PROCESSING_STATES } = require('./imageLifecycle.constants');
 
 const REVIEW_CONFIDENCE_THRESHOLD = Number(
   process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7
@@ -55,6 +57,63 @@ const scoreLabel = (score) => {
   if (value <= 70) return 'Moderate';
   if (value <= 85) return 'Clean';
   return 'Very Clean';
+};
+
+const canViewAdminDiagnostics = (req) => {
+  if (req?.user?.isSuperAdmin) return true;
+  const permissions = new Set(
+    (Array.isArray(req?.user?.permissionCodes) ? req.user.permissionCodes : [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (permissions.has('inspection.review') || permissions.has('task.manage')) {
+    return true;
+  }
+  const roleCodes = new Set(
+    (Array.isArray(req?.user?.roleCodes) ? req.user.roleCodes : [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  return (
+    roleCodes.has('tenant_admin') ||
+    roleCodes.has('supervisor') ||
+    roleCodes.has('facility_manager') ||
+    roleCodes.has('platform_ops')
+  );
+};
+
+const workerSafeStatusMessage = ({ processingState, validationStatus, validationReason }) => {
+  const state = String(processingState || '').trim().toLowerCase();
+  const validation = String(validationStatus || '').trim().toUpperCase();
+  if (state === IMAGE_PROCESSING_STATES.AI_COMPLETED) return 'Done';
+  if (state === IMAGE_PROCESSING_STATES.AI_RETRYING) return 'Retry in progress';
+  if (state === IMAGE_PROCESSING_STATES.AI_PROCESSING) return 'Processing';
+  if (state === IMAGE_PROCESSING_STATES.QUEUED_FOR_AI) return 'Queued for processing';
+  if (state === IMAGE_PROCESSING_STATES.STORAGE_VERIFIED || state === IMAGE_PROCESSING_STATES.UPLOADED) {
+    return 'Uploaded';
+  }
+  if (state === IMAGE_PROCESSING_STATES.UPLOADING || state === IMAGE_PROCESSING_STATES.QUEUED_FOR_UPLOAD) {
+    return 'Uploading';
+  }
+  if (
+    state === IMAGE_PROCESSING_STATES.AI_FAILED_TRANSIENT ||
+    validation === 'PENDING'
+  ) {
+    return 'Processing delayed, retry in progress';
+  }
+  if (
+    state === IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED ||
+    state === IMAGE_PROCESSING_STATES.AI_FAILED_PERMANENT ||
+    state === IMAGE_PROCESSING_STATES.UPLOAD_FAILED_PERMANENT
+  ) {
+    return 'Needs review';
+  }
+  if (validation.startsWith('FAILED')) {
+    return validationReason
+      ? `Needs review: ${String(validationReason).slice(0, 140)}`
+      : 'Needs review';
+  }
+  return 'Saved';
 };
 
 const normalizeIssueTag = (value) =>
@@ -236,6 +295,7 @@ const dedupeInspectionMediaRows = (rows = []) => {
 
 const mapMediaEvidence = async (row, options = {}) => {
   const mediaUrlCache = options.mediaUrlCache || null;
+  const includeAdminDiagnostics = Boolean(options.includeAdminDiagnostics);
   const overallScore = toNumber(row.overall_score, null);
   const confidence = toNumber(row.confidence_score, null);
   const garbageScore = toNumber(row.garbage_score, null);
@@ -244,16 +304,22 @@ const mapMediaEvidence = async (row, options = {}) => {
   const issueTags = Array.isArray(row.issue_tags) ? row.issue_tags : [];
   const similarityScore = toNumber(row.similarity_score, null);
   const validationStatus = row.validation_status || null;
+  const validationReason = row.validation_reason || null;
   const suspiciousFlags = [];
   if (similarityScore !== null && similarityScore >= Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92)) {
     suspiciousFlags.push('possible_fake_cleaning_similar_images');
   }
-  if (String(validationStatus || '').toUpperCase().startsWith('FAILED')) {
-    suspiciousFlags.push('validation_failed');
-  }
-  if (String(validationStatus || '').toUpperCase() === 'REJECTED_LOW_CONFIDENCE') {
-    suspiciousFlags.push('low_confidence_rejected');
-  }
+  const operationalStatus =
+    String(validationStatus || '').toUpperCase().startsWith('FAILED') ||
+    String(validationStatus || '').toUpperCase() === 'REJECTED_LOW_CONFIDENCE'
+      ? 'processing_failure'
+      : 'ok';
+  const processingState = row.processing_state || null;
+  const workerMessage = workerSafeStatusMessage({
+    processingState,
+    validationStatus,
+    validationReason,
+  });
 
   const urls = await resolveMediaPairUrls(
     {
@@ -283,11 +349,12 @@ const mapMediaEvidence = async (row, options = {}) => {
     gpsLng: toNumber(row.gps_lng, null),
     deviceId: row.device_id || null,
     uploadStatus: row.upload_status || null,
+    processingState,
     aiStatus: row.ai_status || null,
     imageQualityStatus: row.image_quality_status || null,
     imageQualityScore: toNumber(row.image_quality_score, null),
     validationStatus,
-    validationReason: row.validation_reason || null,
+    validationReason,
     toiletDetected:
       row.toilet_detected !== null && row.toilet_detected !== undefined
         ? Boolean(row.toilet_detected)
@@ -313,9 +380,18 @@ const mapMediaEvidence = async (row, options = {}) => {
     scoringVersion: row.scoring_version || null,
     aiProcessedAt: row.ai_processed_at || null,
     aiError: row.ai_error || null,
+    retryCount: Number(row.retry_count || 0),
+    aiAttemptCount: Number(row.ai_attempt_count || 0),
+    nextRetryAt: row.next_retry_at || null,
+    lastRetryAt: row.last_retry_at || null,
+    storageVerifiedAt: row.storage_verified_at || null,
+    lastErrorCode: includeAdminDiagnostics ? row.last_error_code || null : null,
+    lastErrorMessage: includeAdminDiagnostics ? row.last_error_message || null : null,
+    workerStatusMessage: workerMessage,
     scoringRejected: Boolean(row.scoring_rejected),
     similarityScore,
     suspiciousFlags,
+    operationalStatus,
     explanationSummary: row.explanation_summary || null,
     watermarkMeta: row.watermark_meta || null,
     metadata: row.metadata || null,
@@ -323,8 +399,8 @@ const mapMediaEvidence = async (row, options = {}) => {
 };
 
 const scopedInspectionWhere = (req, where = {}) => {
-  if (!req?.user || req.user.isSuperAdmin) return where;
-  return { ...where, tenant_id: req.user.tenantId };
+  if (!req?.user) return where;
+  return applyTenantScope(where, req);
 };
 
 const assertInspectionScope = async (inspectionId, req, options = {}) => {
@@ -334,6 +410,9 @@ const assertInspectionScope = async (inspectionId, req, options = {}) => {
   });
   if (!inspection) {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
+  }
+  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return inspection;
 };
@@ -349,6 +428,9 @@ const assertToiletScope = async (toiletId, req) => {
     throw new AppError('Toilet not found', 404, { code: 'TOILET_NOT_FOUND' });
   }
   if (!req?.user?.isSuperAdmin && req?.user?.tenantId !== unit.Facility?.tenant_id) {
+    throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, unit.facility_id || unit.Facility?.id || null)) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return unit;
@@ -652,9 +734,15 @@ const requeueStaleImageAnalysis = async ({ inspection, rows = [], req }) => {
   for (const row of selected) {
     await row.update({
       ai_status: 'AI_QUEUED',
+      processing_state: IMAGE_PROCESSING_STATES.AI_RETRYING,
+      retry_count: Number(row.retry_count || 0) + 1,
+      last_retry_at: new Date(),
+      next_retry_at: null,
       ai_error: null,
       validation_status: 'PENDING',
       validation_reason: null,
+      last_error_code: 'AI_STALE_REQUEUE',
+      last_error_message: 'Image AI status was stale and requeued',
       updated_at: new Date(),
     });
 
@@ -744,19 +832,41 @@ const recomputeToiletDailyAggregates = async (toiletId, { transaction = null } =
   );
 
   for (const row of dailyRows) {
-    await ToiletScoreDaily.upsert(
-      {
+    const date = String(row.date || '').slice(0, 10);
+    if (!date) {
+      continue;
+    }
+
+    const values = {
+      avg_before_score: round2(toNumber(row.avg_before_score, null)),
+      avg_after_score: round2(toNumber(row.avg_after_score, null)),
+      inspection_count: Number(row.inspection_count || 0),
+      dirty_count: Number(row.dirty_count || 0),
+      cleaned_count: Number(row.cleaned_count || 0),
+      avg_improvement: round2(toNumber(row.avg_improvement, null)),
+      updated_at: new Date(),
+    };
+
+    const existing = await ToiletScoreDaily.findOne({
+      where: {
         toilet_id: toiletId,
-        date: row.date,
-        avg_before_score: round2(toNumber(row.avg_before_score, null)),
-        avg_after_score: round2(toNumber(row.avg_after_score, null)),
-        inspection_count: Number(row.inspection_count || 0),
-        dirty_count: Number(row.dirty_count || 0),
-        cleaned_count: Number(row.cleaned_count || 0),
-        avg_improvement: round2(toNumber(row.avg_improvement, null)),
+        date,
       },
-      { transaction }
-    );
+      transaction,
+    });
+
+    if (existing) {
+      await existing.update(values, { transaction });
+    } else {
+      await ToiletScoreDaily.create(
+        {
+          toilet_id: toiletId,
+          date,
+          ...values,
+        },
+        { transaction }
+      );
+    }
   }
 };
 
@@ -959,15 +1069,51 @@ const recomputeInspectionAggregates = async (
     noMeaningfulImprovement;
 
   const completedImages = evidenceRows.filter(
-    (row) => String(row.ai_status || '').toUpperCase() === 'AI_COMPLETED'
+    (row) =>
+      String(row.processing_state || '').toLowerCase() === 'ai_completed' ||
+      String(row.ai_status || '').toUpperCase() === 'AI_COMPLETED'
   ).length;
   const processingImages = evidenceRows.filter(
-    (row) => String(row.ai_status || '').toUpperCase() === 'AI_PROCESSING'
+    (row) =>
+      ['ai_processing', 'queued_for_ai', 'ai_retrying'].includes(
+        String(row.processing_state || '').toLowerCase()
+      ) ||
+      ['AI_PROCESSING', 'AI_QUEUED'].includes(
+        String(row.ai_status || '').toUpperCase()
+      )
+  ).length;
+  const retryingImages = evidenceRows.filter(
+    (row) => String(row.processing_state || '').toLowerCase() === 'ai_retrying'
+  ).length;
+  const failedTransientImages = evidenceRows.filter(
+    (row) => String(row.processing_state || '').toLowerCase() === 'ai_failed_transient'
+  ).length;
+  const failedPermanentImages = evidenceRows.filter(
+    (row) =>
+      ['ai_failed_permanent', 'upload_failed_permanent'].includes(
+        String(row.processing_state || '').toLowerCase()
+      )
+  ).length;
+  const manualReviewImages = evidenceRows.filter(
+    (row) => String(row.processing_state || '').toLowerCase() === 'manual_review_required'
   ).length;
   const failedImages = evidenceRows.filter(
-    (row) => String(row.ai_status || '').toUpperCase() === 'AI_FAILED'
+    (row) =>
+      ['AI_FAILED'].includes(String(row.ai_status || '').toUpperCase()) ||
+      ['ai_failed_permanent', 'manual_review_required', 'upload_failed_permanent'].includes(
+        String(row.processing_state || '').toLowerCase()
+      )
   ).length;
   const totalImages = evidenceRows.length;
+  const lifecycleCounters = {
+    valid_scored: completedImages,
+    processing: processingImages,
+    retrying: retryingImages,
+    failed_transient: failedTransientImages,
+    failed_permanent: failedPermanentImages,
+    manual_review: manualReviewImages,
+    total: totalImages,
+  };
 
   const status = resolveInspectionStatus({
     inspection,
@@ -1002,6 +1148,7 @@ const recomputeInspectionAggregates = async (
       suspicious_reasons: suspiciousReasons,
       validation_failed_count: validationFailedCount,
       rejected_image_count: rejectedImageCount,
+      pipeline_counters: lifecycleCounters,
       last_scored_at: completedImages > 0 ? new Date() : inspection.last_scored_at,
       pipeline_status: resolvePipelineStatus(status),
       processing_status: resolveProcessingStatus(status),
@@ -1035,11 +1182,13 @@ const recomputeInspectionAggregates = async (
     suspiciousReasons,
     validationFailedCount,
     rejectedImageCount,
+    pipelineCounters: lifecycleCounters,
   };
 };
 
 const listInspectionImages = async (inspectionId, req) => {
   const inspection = await assertInspectionScope(inspectionId, req);
+  const includeAdminDiagnostics = canViewAdminDiagnostics(req);
   let rows = await InspectionMedia.findAll({
     where: { inspection_id: inspectionId },
     order: [
@@ -1057,7 +1206,7 @@ const listInspectionImages = async (inspectionId, req) => {
   const mediaUrlCache = new Map();
   const mapped = await Promise.all(
     dedupeInspectionMediaRows(rows).map((row) =>
-      mapMediaEvidence(row, { mediaUrlCache })
+      mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
     )
   );
   return {
@@ -1065,6 +1214,95 @@ const listInspectionImages = async (inspectionId, req) => {
     beforeImages: mapped.filter((item) => item.stage === 'BEFORE'),
     afterImages: mapped.filter((item) => item.stage === 'AFTER'),
     images: mapped,
+  };
+};
+
+const summarizeLifecycleCountersFromImages = (images = []) => {
+  const counters = {
+    valid_scored: 0,
+    processing: 0,
+    retrying: 0,
+    failed_transient: 0,
+    failed_permanent: 0,
+    manual_review: 0,
+    total: Array.isArray(images) ? images.length : 0,
+  };
+  for (const image of Array.isArray(images) ? images : []) {
+    const state = String(image.processingState || '').trim().toLowerCase();
+    if (state === IMAGE_PROCESSING_STATES.AI_COMPLETED) counters.valid_scored += 1;
+    if (
+      state === IMAGE_PROCESSING_STATES.QUEUED_FOR_AI ||
+      state === IMAGE_PROCESSING_STATES.AI_PROCESSING
+    ) {
+      counters.processing += 1;
+    }
+    if (state === IMAGE_PROCESSING_STATES.AI_RETRYING) counters.retrying += 1;
+    if (state === IMAGE_PROCESSING_STATES.AI_FAILED_TRANSIENT) counters.failed_transient += 1;
+    if (state === IMAGE_PROCESSING_STATES.AI_FAILED_PERMANENT) counters.failed_permanent += 1;
+    if (state === IMAGE_PROCESSING_STATES.UPLOAD_FAILED_PERMANENT) counters.failed_permanent += 1;
+    if (state === IMAGE_PROCESSING_STATES.MANUAL_REVIEW_REQUIRED) counters.manual_review += 1;
+  }
+  return counters;
+};
+
+const listInspectionImageJobs = async (inspectionId, req) => {
+  const inspection = await assertInspectionScope(inspectionId, req);
+  const includeAdminDiagnostics = canViewAdminDiagnostics(req);
+  let rows = await InspectionMedia.findAll({
+    where: { inspection_id: inspectionId },
+    order: [
+      ['capture_stage', 'ASC'],
+      ['ordinal', 'ASC'],
+      ['captured_at', 'ASC'],
+      ['created_at', 'ASC'],
+    ],
+  });
+  rows = await requeueStaleImageAnalysis({
+    inspection,
+    rows,
+    req,
+  });
+
+  const mediaUrlCache = new Map();
+  const mapped = await Promise.all(
+    dedupeInspectionMediaRows(rows).map((row) =>
+      mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+    )
+  );
+  const pipelineCounters =
+    inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+      ? inspection.pipeline_counters
+      : summarizeLifecycleCountersFromImages(mapped);
+
+  const jobs = mapped.map((image) => ({
+    imageId: image.id,
+    clientImageId: image.clientImageId,
+    stage: image.stage,
+    capturedAt: image.capturedAt,
+    uploadStatus: image.uploadStatus,
+    storageStatus: image.storageVerifiedAt ? 'verified' : image.uploadStatus || 'pending',
+    processingState: image.processingState,
+    aiStatus: image.aiStatus,
+    retryCount: image.retryCount,
+    aiAttemptCount: image.aiAttemptCount,
+    nextRetryAt: image.nextRetryAt,
+    lastRetryAt: image.lastRetryAt,
+    score: image.score,
+    validationStatus: image.validationStatus,
+    validationReason: image.validationReason,
+    workerStatusMessage: image.workerStatusMessage,
+    ...(includeAdminDiagnostics
+      ? {
+          lastErrorCode: image.lastErrorCode,
+          lastErrorMessage: image.lastErrorMessage,
+        }
+      : {}),
+  }));
+
+  return {
+    inspectionId,
+    pipelineCounters,
+    jobs,
   };
 };
 
@@ -1078,7 +1316,9 @@ const getInspectionImage = async (imageId, req) => {
   if (!req.user.isSuperAdmin && row.Inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection image out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  return mapMediaEvidence(row);
+  return mapMediaEvidence(row, {
+    includeAdminDiagnostics: canViewAdminDiagnostics(req),
+  });
 };
 
 const triggerInspectionImageAi = async (imageId, req) => {
@@ -1095,10 +1335,14 @@ const triggerInspectionImageAi = async (imageId, req) => {
 
   await row.update({
     ai_status: 'AI_QUEUED',
+    processing_state: IMAGE_PROCESSING_STATES.QUEUED_FOR_AI,
     ai_error: null,
     validation_status: 'PENDING',
     validation_reason: null,
     scoring_rejected: false,
+    last_error_code: null,
+    last_error_message: null,
+    next_retry_at: null,
     updated_at: new Date(),
   });
 
@@ -1240,6 +1484,7 @@ const getInspectionComparison = async (inspectionId, req) => {
   const inspection = await assertInspectionScope(inspectionId, req, {
     include: [{ model: InspectionMedia }],
   });
+  const includeAdminDiagnostics = canViewAdminDiagnostics(req);
 
   const refreshedRows = await requeueStaleImageAnalysis({
     inspection,
@@ -1252,10 +1497,14 @@ const getInspectionComparison = async (inspectionId, req) => {
   const mediaUrlCache = new Map();
   const [beforeImages, afterImages] = await Promise.all([
     Promise.all(
-      beforeRows.map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+      beforeRows.map((row) =>
+        mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+      )
     ),
     Promise.all(
-      afterRows.map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+      afterRows.map((row) =>
+        mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+      )
     ),
   ]);
 
@@ -1327,6 +1576,7 @@ const getInspectionComparison = async (inspectionId, req) => {
 
 const getToiletLatestInspection = async (toiletId, req) => {
   await assertToiletScope(toiletId, req);
+  const includeAdminDiagnostics = canViewAdminDiagnostics(req);
   const latest = await Inspection.findOne({
     where: { toilet_unit_id: toiletId },
     include: [
@@ -1379,12 +1629,16 @@ const getToiletLatestInspection = async (toiletId, req) => {
     Promise.all(
       media
         .filter((item) => stageOf(item) === 'before')
-        .map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+        .map((row) =>
+          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+        )
     ),
     Promise.all(
       media
         .filter((item) => stageOf(item) === 'after')
-        .map((row) => mapMediaEvidence(row, { mediaUrlCache }))
+        .map((row) =>
+          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+        )
     ),
   ]);
 
@@ -1781,6 +2035,7 @@ module.exports = {
   recomputeInspectionAggregates,
   recomputeToiletAggregates,
   listInspectionImages,
+  listInspectionImageJobs,
   getInspectionImage,
   triggerInspectionImageAi,
   listToiletInspections,

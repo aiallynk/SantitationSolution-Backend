@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
 const AppError = require('../errors/AppError');
-const { PlatformUser, Role, Permission } = require('../../models');
+const { PlatformUser, Role, Permission, WorkerAssignment } = require('../../models');
+const { resolveRoleProfile } = require('../rbac/accessProfiles');
+const { resolveEffectiveScope, uniqueIds } = require('../rbac/scopeResolver');
 
 const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET || 'change-me-access-secret';
 // Legacy compatibility note:
@@ -29,6 +31,22 @@ const fetchUserWithRoles = async (userId) => {
           attributes: ['tenant_id', 'geography_id'],
         },
         include: [{ model: Permission }],
+      },
+      {
+        model: WorkerAssignment,
+        as: 'assignments',
+        required: false,
+        where: { status: 'active' },
+        attributes: [
+          'id',
+          'tenant_id',
+          'geography_id',
+          'facility_id',
+          'toilet_unit_id',
+          'assignment_level',
+          'assignment_role',
+          'status',
+        ],
       },
     ],
   });
@@ -72,7 +90,7 @@ const pickActiveTenantId = (req, user, memberships) => {
   return requested;
 };
 
-const buildAuthContext = ({ req, user }) => {
+const buildAuthContext = async ({ req, user }) => {
   const allRoleCodes = [...new Set((user.Roles || []).map((role) => role.code))];
   const memberships = normalizeMemberships(user);
   const isSuperAdmin = allRoleCodes.includes('super_admin');
@@ -85,7 +103,14 @@ const buildAuthContext = ({ req, user }) => {
   });
 
   const roleCodes = [...new Set(activeMemberships.map((item) => item.roleCode))];
+  const roleProfile = resolveRoleProfile({ roleCodes });
+  const defaultPermissionCodes = Array.isArray(roleProfile.permissionCodes)
+    ? roleProfile.permissionCodes
+    : [];
   const permissionCodes = new Set();
+  for (const permissionCode of defaultPermissionCodes) {
+    permissionCodes.add(permissionCode);
+  }
   for (const role of user.Roles || []) {
     const roleTenantId = role?.UserRole?.tenant_id || user.tenant_id || null;
     const roleIsGlobal = GLOBAL_ROLE_CODES.has(role.code);
@@ -96,6 +121,25 @@ const buildAuthContext = ({ req, user }) => {
     }
   }
 
+  const activeAssignments = (Array.isArray(user.assignments) ? user.assignments : []).filter(
+    (row) => row.status === 'active',
+  );
+  const assignmentFacilityIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.facility_id || assignment.facilityId || null),
+  );
+  const assignmentGeographyIds = uniqueIds(
+    activeAssignments.map((assignment) => assignment.geography_id || assignment.geographyId || null),
+  );
+  const scope = await resolveEffectiveScope({
+    roleCode: roleProfile.role || null,
+    roleProfile,
+    memberships: activeMemberships,
+    assignments: activeAssignments,
+    activeTenantId,
+    userId: user.id,
+    fallbackGeographyId: user.geography_id || null,
+  });
+
   return {
     id: user.id,
     tenantId: activeTenantId,
@@ -105,13 +149,41 @@ const buildAuthContext = ({ req, user }) => {
     fullName: user.full_name,
     employeeCode: user.employee_code || null,
     status: user.status,
+    role: roleProfile.role || null,
     allRoleCodes,
     roleCodes,
     permissionCodes: [...permissionCodes],
+    permissions: [...permissionCodes],
     memberships,
     activeMemberships,
     activeTenantId,
     isSuperAdmin,
+    roleType: roleProfile.roleType,
+    personaFamily: roleProfile.personaFamily,
+    hierarchyLevel: roleProfile.hierarchyLevel,
+    surfaceType: roleProfile.surfaceType,
+    scopeType: roleProfile.scopeType,
+    managementLevel: roleProfile.managementLevel,
+    defaultRoute: roleProfile.defaultRoute,
+    allowedRoutes: roleProfile.allowedRoutes,
+    allowedActions: roleProfile.allowedActions,
+    routeKeys: roleProfile.routeKeys,
+    actionKeys: roleProfile.actionKeys,
+    widgetKeys: roleProfile.widgetKeys,
+    allowedDataDomains: roleProfile.allowedDataDomains,
+    readOnly: Boolean(roleProfile.readOnly),
+    webEnabled: roleProfile.webEnabled,
+    mobileOnly: roleProfile.mobileOnly,
+    canAccessWeb: roleProfile.canAccessWeb,
+    canAccessMobile: roleProfile.canAccessMobile,
+    organizationId: activeTenantId,
+    scopeLevel: scope.scopeLevel,
+    scopeId: scope.scopeId,
+    scopeIds: scope.scopeIds,
+    scopeGeographyIds: scope.scopeGeographyIds,
+    scopeFacilityIds: scope.scopeFacilityIds,
+    assignmentFacilityIds,
+    assignmentGeographyIds,
   };
 };
 
@@ -161,6 +233,9 @@ const requireRoles = (...roleCodes) => {
     if (!req.user) {
       return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
     }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
     const hasRole = req.user.roleCodes.some((roleCode) => roleCodes.includes(roleCode));
     if (!hasRole) {
       return next(new AppError('Insufficient role permissions', 403, { code: 'ROLE_FORBIDDEN' }));
@@ -196,6 +271,101 @@ const requireAnyPermissions = (...permissionCodes) => {
     if (!hasAny) {
       return next(new AppError('Insufficient permission scope', 403, { code: 'PERMISSION_FORBIDDEN' }));
     }
+    return next();
+  };
+};
+
+const requireAction = (actionCode) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (!actionCode || req.user.isSuperAdmin) {
+      return next();
+    }
+    const allowedActions = new Set(req.user.allowedActions || []);
+    if (!allowedActions.has(actionCode)) {
+      return next(new AppError('Insufficient action scope', 403, { code: 'ACTION_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
+const requireRouteKey = (...routeKeys) => {
+  const requiredRouteKeys = [...new Set(routeKeys.map((value) => String(value || '').trim()).filter(Boolean))];
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
+    if (requiredRouteKeys.length === 0) {
+      return next();
+    }
+
+    const grantedRouteKeys = new Set(
+      (Array.isArray(req.user.routeKeys) ? req.user.routeKeys : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
+    const hasAccess = requiredRouteKeys.some((routeKey) => grantedRouteKeys.has(routeKey));
+    if (!hasAccess) {
+      return next(new AppError('Insufficient route scope', 403, { code: 'ROUTE_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
+const requireSurface = (...surfaceTypes) => {
+  const requiredSurfaceTypes = [...new Set(surfaceTypes.map((value) => String(value || '').trim()).filter(Boolean))];
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
+    if (requiredSurfaceTypes.length === 0) {
+      return next();
+    }
+    const surfaceType = String(req.user.surfaceType || '').trim();
+    if (!requiredSurfaceTypes.includes(surfaceType)) {
+      return next(new AppError('Insufficient surface scope', 403, { code: 'SURFACE_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
+const requireScope = ({ scopeTypes = [], managementLevels = [] } = {}) => {
+  const requiredScopeTypes = [...new Set((Array.isArray(scopeTypes) ? scopeTypes : []).map((value) => String(value || '').trim()).filter(Boolean))];
+  const requiredManagementLevels = [...new Set((Array.isArray(managementLevels) ? managementLevels : []).map((value) => String(value || '').trim()).filter(Boolean))];
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
+
+    if (requiredScopeTypes.length > 0) {
+      const scopeType = String(req.user.scopeType || '').trim();
+      if (!requiredScopeTypes.includes(scopeType)) {
+        return next(new AppError('Insufficient scope type', 403, { code: 'SCOPE_FORBIDDEN' }));
+      }
+    }
+
+    if (requiredManagementLevels.length > 0) {
+      const managementLevel = String(req.user.managementLevel || '').trim();
+      if (!requiredManagementLevels.includes(managementLevel)) {
+        return next(
+          new AppError('Insufficient management scope', 403, {
+            code: 'MANAGEMENT_SCOPE_FORBIDDEN',
+          })
+        );
+      }
+    }
+
     return next();
   };
 };
@@ -244,6 +414,10 @@ module.exports = {
   requireRoles,
   requirePermissions,
   requireAnyPermissions,
+  requireAction,
+  requireRouteKey,
+  requireSurface,
+  requireScope,
   requireTenantContext,
   applyTenantFilter,
   tenantScoped,

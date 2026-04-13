@@ -6,9 +6,21 @@ const { startHeartbeat } = require('./core/live/sseBroker');
 const { startWebSocketServer, closeWebSocketServer } = require('./core/live/wsBroker');
 const { startLiveRedisBridge, closeLiveRedisBridge } = require('./core/live/liveRedisBridge');
 const { broadcastLocal } = require('./core/live/registerLiveForwarders');
-const { closeQueues, isRedisEnabled } = require('./core/queue/queueManager');
+const {
+  closeQueues,
+  isRedisEnabled,
+  assertQueueRuntimePolicy,
+} = require('./core/queue/queueManager');
 const { ensureQrImagesForToilets } = require('./modules/platform/toiletQr.service');
-const { assertOpenAiAnalysisConfigured } = require('./modules/analysis/openaiAnalysis.service');
+const { getOpenAiAnalysisConfigState } = require('./modules/analysis/openaiAnalysis.service');
+const {
+  startAnalysisJobWatchdog,
+  stopAnalysisJobWatchdog,
+} = require('./modules/analysis/analysisJobWatchdog.service');
+const {
+  startImageSessionReconciler,
+  stopImageSessionReconciler,
+} = require('./modules/inspections/imageSessionReconciler.service');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -253,19 +265,60 @@ const shouldAutoBackfillQrOnBoot = () => {
   return true;
 };
 
+const shouldFailOnAnalysisConfigError = () => {
+  const configured = String(process.env.ANALYSIS_BOOT_STRICT || '').trim().toLowerCase();
+  if (configured === 'true') return true;
+  if (configured === 'false') return false;
+  return false;
+};
+
+const isAnalysisTriggerOnUploadEnabled = () =>
+  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').trim().toLowerCase() === 'true';
+
+const validateAnalysisConfigAtBoot = () => {
+  const state = getOpenAiAnalysisConfigState();
+  if (state.ok) {
+    return;
+  }
+
+  const strictMode = shouldFailOnAnalysisConfigError();
+  const message =
+    `AI analysis configuration is invalid (${state.code || 'UNKNOWN'}): ${state.reason || 'Unknown reason'}.`;
+
+  if (strictMode) {
+    const error = new Error(`${message} Set ANALYSIS_BOOT_STRICT=false to continue boot without AI analysis.`);
+    error.code = state.code || 'AI_BOOT_CONFIG_INVALID';
+    throw error;
+  }
+
+  // eslint-disable-next-line no-console
+  console.warn(`${message} Continuing boot with AI analysis disabled.`);
+
+  if (isAnalysisTriggerOnUploadEnabled()) {
+    process.env.ANALYSIS_TRIGGER_ON_UPLOAD = 'false';
+    // eslint-disable-next-line no-console
+    console.warn('ANALYSIS_TRIGGER_ON_UPLOAD has been forced to false for this process.');
+  }
+};
+
 const backfillToiletQrOnBoot = async () => {
   if (!shouldAutoBackfillQrOnBoot()) {
     return;
   }
 
   try {
+    const forceRegenerate =
+      String(process.env.QR_FORCE_REGENERATE_ON_BOOT || 'false').trim().toLowerCase() ===
+      'true';
     const units = await ToiletUnit.findAll({
       attributes: ['id', 'code', 'qr_code'],
     });
-    const result = await ensureQrImagesForToilets(units);
+    const result = await ensureQrImagesForToilets(units, {
+      forceRegenerate,
+    });
     // eslint-disable-next-line no-console
     console.log(
-      `Toilet QR bootstrap completed: total=${result.total} generated=${result.generated} skipped=${result.skipped} failed=${result.failed}`
+      `Toilet QR bootstrap completed: total=${result.total} generated=${result.generated} skipped=${result.skipped} failed=${result.failed} forceRegenerate=${forceRegenerate}`
     );
   } catch (error) {
     // eslint-disable-next-line no-console
@@ -275,7 +328,7 @@ const backfillToiletQrOnBoot = async () => {
 
 const bootstrap = async () => {
   try {
-    assertOpenAiAnalysisConfigured();
+    validateAnalysisConfigAtBoot();
     await runPendingMigrations();
     await runWithTransientDbRetry('Database connection', async () => {
       await sequelize.authenticate();
@@ -284,6 +337,7 @@ const bootstrap = async () => {
     console.log('Database connection established');
     await backfillToiletQrOnBoot();
     await probeRedisConnectivity();
+    assertQueueRuntimePolicy();
 
     registerLiveForwarders();
     startHeartbeat();
@@ -308,9 +362,16 @@ const bootstrap = async () => {
       // eslint-disable-next-line no-console
       console.log('Analysis worker is expected to run as a separate process');
     } else {
+      if (String(process.env.REDIS_REQUIRED_IN_PROD || 'false').toLowerCase() === 'true' &&
+          String(process.env.NODE_ENV || 'development').toLowerCase() === 'production') {
+        throw new Error('Redis queue is mandatory in production and is currently unavailable');
+      }
       // eslint-disable-next-line no-console
       console.warn('Redis disabled: analysis queue running in inline fallback mode');
     }
+
+    startAnalysisJobWatchdog();
+    startImageSessionReconciler();
 
     server = app.listen(PORT, () => {
       // eslint-disable-next-line no-console
@@ -335,6 +396,8 @@ const gracefulShutdown = async (signal) => {
     }
     await closeWebSocketServer();
     await closeLiveRedisBridge();
+    stopAnalysisJobWatchdog();
+    stopImageSessionReconciler();
     await closeQueues();
     await sequelize.close();
     // eslint-disable-next-line no-console

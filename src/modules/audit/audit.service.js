@@ -11,6 +11,10 @@ const {
   SuperAdminSupportTicket,
 } = require('../../models');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const {
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+} = require('../../core/rbac/scopeWhere');
 
 const ACTION_LABELS = {
   'auth.login': 'User Logged In',
@@ -271,11 +275,16 @@ const createAuditLog = async ({
 
 const listAuditLogs = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  const where = {};
+  const where = applyScopeToQuery(
+    {},
+    buildAccessContextFromUser(req?.user || {}),
+    'tenant',
+    {
+      tenantKey: 'tenant_id',
+    },
+  );
 
-  if (!req.user?.isSuperAdmin) {
-    where.tenant_id = req.user?.tenantId || null;
-  } else if (req.query.tenantId) {
+  if (req.user?.isSuperAdmin && req.query.tenantId) {
     where.tenant_id = req.query.tenantId;
   }
 

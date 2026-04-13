@@ -215,6 +215,18 @@ const getInspectionImages = async (req, res, next) => {
   }
 };
 
+const getInspectionImageJobs = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getInspectionImageJobs(req);
+    return sendSuccess(res, {
+      message: 'Inspection image jobs fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getInspectionImageById = async (req, res, next) => {
   try {
     const data = await inspectionService.getInspectionImageById(req);
@@ -314,6 +326,7 @@ module.exports = {
   postSubmitInspection,
   getInspectionById,
   getInspectionImages,
+  getInspectionImageJobs,
   getInspectionImageById,
   getInspectionTrend,
   getMyInspections,

@@ -1,15 +1,39 @@
 const express = require('express');
 const alertController = require('./alert.controller');
-const { protect, requirePermissions } = require('../../core/middleware/auth');
+const {
+  protect,
+  requirePermissions,
+  requireAnyPermissions,
+  requireAction,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
+} = require('../../core/middleware/auth');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
 router.use(protect);
+router.use(
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
-router.get('/alerts', requirePermissions('alerts.manage'), alertController.getAlerts);
-router.get('/alerts/summary', requirePermissions('alerts.manage'), alertController.getAlertSummary);
-router.get('/alerts/:id', requirePermissions('alerts.manage'), alertController.getAlertById);
-router.patch('/alerts/:id/acknowledge', requirePermissions('alerts.manage'), alertController.patchAcknowledge);
-router.patch('/alerts/:id/resolve', requirePermissions('alerts.manage'), alertController.patchResolve);
+router.get('/alerts', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlerts);
+router.get('/alerts/summary', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlertSummary);
+router.get('/alerts/:id', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlertById);
+router.patch(
+  '/alerts/:id/acknowledge',
+  requirePermissions('alerts.manage'),
+  requireAction('alert.manage'),
+  alertController.patchAcknowledge
+);
+router.patch(
+  '/alerts/:id/resolve',
+  requirePermissions('alerts.manage'),
+  requireAction('alert.manage'),
+  alertController.patchResolve
+);
 
 module.exports = router;

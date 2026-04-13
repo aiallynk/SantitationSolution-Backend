@@ -1,19 +1,51 @@
 const { isBlank } = require('../../utils/validators');
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
+const allowedScopeLevels = new Set(['country', 'state', 'district', 'city', 'zone']);
+const allowedGeographyLevels = new Set(['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster']);
+const scopeRequiredFields = {
+  country: ['countryName'],
+  state: ['countryName', 'stateName'],
+  district: ['countryName', 'stateName', 'districtName'],
+  city: ['countryName', 'stateName', 'cityName'],
+  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+};
 
 const validateTenantCreate = (req) => {
   const errors = [];
   if (isBlank(req.body.name)) errors.push('name is required');
-  if (isBlank(req.body.code)) errors.push('code is required');
+  if (req.body.code !== undefined && isBlank(req.body.code)) errors.push('code cannot be blank when provided');
+  if (req.body.contactEmail !== undefined && !isBlank(req.body.contactEmail) && !isLikelyEmail(req.body.contactEmail)) {
+    errors.push('contactEmail must be a valid email');
+  }
+  if (req.body.scopeLevel !== undefined && !allowedScopeLevels.has(String(req.body.scopeLevel).trim().toLowerCase())) {
+    errors.push('scopeLevel must be one of country|state|district|city|zone');
+  }
+  const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
+  const requiredFields = scopeRequiredFields[scopeLevel] || [];
+  requiredFields.forEach((field) => {
+    if (isBlank(req.body[field])) {
+      errors.push(`${field} is required for ${scopeLevel} scope`);
+    }
+  });
   return errors;
 };
 
 const validateGeographyCreate = (req) => {
   const errors = [];
   if (isBlank(req.body.level)) errors.push('level is required');
-  if (isBlank(req.body.code)) errors.push('code is required');
+  if (!isBlank(req.body.level) && !allowedGeographyLevels.has(String(req.body.level).trim().toLowerCase())) {
+    errors.push('level is invalid');
+  }
+  if (req.body.code !== undefined && isBlank(req.body.code)) errors.push('code cannot be blank when provided');
   if (isBlank(req.body.name)) errors.push('name is required');
   if (isBlank(req.body.tenantId) && !req.user?.tenantId) {
     errors.push('tenantId is required');
+  }
+  if (req.body.geometryType !== undefined) {
+    const geometryType = String(req.body.geometryType || '').trim().toLowerCase();
+    if (geometryType && !['polygon', 'circle'].includes(geometryType)) {
+      errors.push('geometryType must be polygon or circle');
+    }
   }
   return errors;
 };
@@ -54,10 +86,38 @@ const validateUnitCreate = (req) => {
   return errors;
 };
 
+const validateQrResolve = (req) => {
+  const errors = [];
+  const value = req.body?.rawQrValue;
+  if (isBlank(value)) {
+    errors.push('rawQrValue is required');
+  }
+  if (value != null && typeof value !== 'string') {
+    errors.push('rawQrValue must be a string');
+  }
+  if (req.body?.normalizedQrValue != null && typeof req.body.normalizedQrValue !== 'string') {
+    errors.push('normalizedQrValue must be a string when provided');
+  }
+  if (req.body?.workerId != null && typeof req.body.workerId !== 'string') {
+    errors.push('workerId must be a string when provided');
+  }
+  if (req.body?.tenantId != null && typeof req.body.tenantId !== 'string') {
+    errors.push('tenantId must be a string when provided');
+  }
+  if (req.body?.siteId != null && typeof req.body.siteId !== 'string') {
+    errors.push('siteId must be a string when provided');
+  }
+  if (req.body?.scannedAt != null && Number.isNaN(Date.parse(String(req.body.scannedAt)))) {
+    errors.push('scannedAt must be an ISO datetime when provided');
+  }
+  return errors;
+};
+
 module.exports = {
   validateTenantCreate,
   validateGeographyCreate,
   validateFacilityCreate,
   validateBlockCreate,
   validateUnitCreate,
+  validateQrResolve,
 };

@@ -62,10 +62,36 @@ const normalizePathBucketPrefix = (pathValue) => {
   return pathValue;
 };
 
+const deriveObjectKeyFromS3Locator = (rawUrl) => {
+  const value = String(rawUrl || '').trim();
+  if (!value.toLowerCase().startsWith('s3://')) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(value);
+    const bucket = String(parsed.hostname || '').trim().toLowerCase();
+    const objectKey = stripLeadingSlashes(decodePath(parsed.pathname || ''));
+    if (!objectKey) return null;
+
+    if (S3_BUCKET_NAME && bucket && bucket !== S3_BUCKET_NAME) {
+      return null;
+    }
+    return objectKey;
+  } catch (_) {
+    return null;
+  }
+};
+
 const deriveObjectKeyFromUrl = (rawUrl) => {
   const normalizedUrl = String(rawUrl || '').trim();
   if (!normalizedUrl || normalizedUrl.startsWith('/static/') || normalizedUrl.startsWith('data:')) {
     return null;
+  }
+
+  const fromLocator = deriveObjectKeyFromS3Locator(normalizedUrl);
+  if (fromLocator) {
+    return fromLocator;
   }
 
   let parsed;
@@ -184,6 +210,7 @@ const resolveMediaPairUrls = async (
 
 module.exports = {
   normalizeMediaUrl,
+  deriveObjectKeyFromUrl,
   resolveMediaUrl,
   resolveMediaPairUrls,
 };

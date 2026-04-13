@@ -9,17 +9,31 @@ const {
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const normalizeBool = (value) => String(value || '').toLowerCase() === 'true';
+const normalizeText = (value) => String(value || '').trim();
+
+const PUBLIC_ACLS = new Set([
+  'public-read',
+  'public-read-write',
+  'authenticated-read',
+  'aws-exec-read',
+]);
+const ALLOWED_SERVER_SIDE_ENCRYPTION = new Set(['AES256', 'aws:kms']);
 
 const s3Config = {
-  region: String(process.env.AWS_REGION || '').trim(),
-  bucket: String(process.env.AWS_S3_BUCKET || '').trim(),
-  accessKeyId: String(process.env.AWS_ACCESS_KEY_ID || '').trim(),
-  secretAccessKey: String(process.env.AWS_SECRET_ACCESS_KEY || '').trim(),
-  sessionToken: String(process.env.AWS_SESSION_TOKEN || '').trim(),
-  endpoint: String(process.env.AWS_S3_ENDPOINT || '').trim(),
+  region: normalizeText(process.env.AWS_REGION),
+  bucket: normalizeText(process.env.AWS_S3_BUCKET),
+  accessKeyId: normalizeText(process.env.AWS_ACCESS_KEY_ID),
+  secretAccessKey: normalizeText(process.env.AWS_SECRET_ACCESS_KEY),
+  sessionToken: normalizeText(process.env.AWS_SESSION_TOKEN),
+  endpoint: normalizeText(process.env.AWS_S3_ENDPOINT),
   forcePathStyle: normalizeBool(process.env.AWS_S3_FORCE_PATH_STYLE),
-  publicBaseUrl: String(process.env.AWS_S3_PUBLIC_BASE_URL || '').trim(),
-  objectAcl: String(process.env.AWS_S3_OBJECT_ACL || '').trim(),
+  publicBaseUrl: normalizeText(process.env.AWS_S3_PUBLIC_BASE_URL),
+  objectAcl: normalizeText(process.env.AWS_S3_OBJECT_ACL),
+  mediaUrlMode: normalizeText(process.env.S3_MEDIA_URL_MODE || 'locator').toLowerCase(),
+  enforcePrivateAcl: normalizeBool(process.env.S3_ENFORCE_PRIVATE_ACL || 'true'),
+  serverSideEncryption: normalizeText(process.env.AWS_S3_SERVER_SIDE_ENCRYPTION || 'AES256'),
+  kmsKeyId: normalizeText(process.env.AWS_S3_KMS_KEY_ID),
+  bucketKeyEnabled: normalizeBool(process.env.AWS_S3_BUCKET_KEY_ENABLED || 'true'),
 };
 
 const isTemplateSecret = (value) => {
@@ -42,12 +56,118 @@ const isS3Enabled = () =>
 
 let cachedS3Client = null;
 
+const normalizeObjectKey = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/^\/+/, '');
+
 const encodeObjectKey = (key) =>
-  String(key || '')
+  normalizeObjectKey(key)
     .split('/')
     .filter(Boolean)
     .map((segment) => encodeURIComponent(segment))
     .join('/');
+
+const resolveObjectAcl = () => {
+  const acl = normalizeText(s3Config.objectAcl).toLowerCase();
+  if (!acl) return null;
+  if (s3Config.enforcePrivateAcl && PUBLIC_ACLS.has(acl)) {
+    throw new Error(
+      `Refusing insecure AWS_S3_OBJECT_ACL=${acl}. Use private ACL or leave it empty.`
+    );
+  }
+  return acl;
+};
+
+const resolveS3EncryptionOptions = () => {
+  const configured = normalizeText(s3Config.serverSideEncryption);
+  if (!configured) return {};
+
+  const normalized =
+    configured.toUpperCase() === 'AES256' ? 'AES256' : configured.toLowerCase() === 'aws:kms' ? 'aws:kms' : null;
+  if (!normalized || !ALLOWED_SERVER_SIDE_ENCRYPTION.has(normalized)) {
+    throw new Error(
+      `Unsupported AWS_S3_SERVER_SIDE_ENCRYPTION value: ${configured}`
+    );
+  }
+
+  if (normalized === 'aws:kms') {
+    return {
+      ServerSideEncryption: 'aws:kms',
+      ...(s3Config.kmsKeyId ? { SSEKMSKeyId: s3Config.kmsKeyId } : {}),
+      BucketKeyEnabled: s3Config.bucketKeyEnabled,
+    };
+  }
+
+  return {
+    ServerSideEncryption: 'AES256',
+  };
+};
+
+const S3_OBJECT_ACL = resolveObjectAcl();
+const S3_ENCRYPTION_OPTIONS = resolveS3EncryptionOptions();
+
+const getS3EncryptionPolicy = () => ({
+  enabled: Boolean(S3_ENCRYPTION_OPTIONS.ServerSideEncryption),
+  algorithm: S3_ENCRYPTION_OPTIONS.ServerSideEncryption || null,
+  kmsKeyId: S3_ENCRYPTION_OPTIONS.SSEKMSKeyId || null,
+  bucketKeyEnabled:
+    S3_ENCRYPTION_OPTIONS.BucketKeyEnabled !== undefined
+      ? Boolean(S3_ENCRYPTION_OPTIONS.BucketKeyEnabled)
+      : null,
+});
+
+const getPresignedEncryptionHeaders = () => {
+  if (!S3_ENCRYPTION_OPTIONS.ServerSideEncryption) {
+    return {};
+  }
+  return {
+    'x-amz-server-side-encryption': S3_ENCRYPTION_OPTIONS.ServerSideEncryption,
+    ...(S3_ENCRYPTION_OPTIONS.SSEKMSKeyId
+      ? { 'x-amz-server-side-encryption-aws-kms-key-id': S3_ENCRYPTION_OPTIONS.SSEKMSKeyId }
+      : {}),
+    ...(S3_ENCRYPTION_OPTIONS.BucketKeyEnabled !== undefined
+      ? {
+          'x-amz-server-side-encryption-bucket-key-enabled': String(
+            Boolean(S3_ENCRYPTION_OPTIONS.BucketKeyEnabled)
+          ),
+        }
+      : {}),
+  };
+};
+
+const extractSignedHeadersFromPresignedUrl = (presignedUrl) => {
+  try {
+    const url = new URL(String(presignedUrl || ''));
+    const raw =
+      url.searchParams.get('X-Amz-SignedHeaders') ||
+      url.searchParams.get('x-amz-signedheaders') ||
+      '';
+    return new Set(
+      String(raw)
+        .split(';')
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean)
+    );
+  } catch (_) {
+    return new Set();
+  }
+};
+
+const filterUnsignedAmzHeaders = (headers, signedHeaders) =>
+  Object.fromEntries(
+    Object.entries(headers || {}).filter(([key, value]) => {
+      if (value === undefined || value === null || String(value).length === 0) {
+        return false;
+      }
+
+      const normalizedKey = String(key).trim().toLowerCase();
+      if (!normalizedKey.startsWith('x-amz-')) {
+        return true;
+      }
+      return signedHeaders.has(normalizedKey);
+    })
+  );
 
 const resolveMimeType = (filePath) => {
   const ext = path.extname(filePath || '').toLowerCase();
@@ -86,6 +206,15 @@ const getS3Client = () => {
 };
 
 const buildObjectUrl = (objectKey) => {
+  const normalizedObjectKey = normalizeObjectKey(objectKey);
+  if (!normalizedObjectKey) {
+    return null;
+  }
+
+  if (s3Config.mediaUrlMode !== 'public') {
+    return `s3://${s3Config.bucket}/${normalizedObjectKey}`;
+  }
+
   const encodedKey = encodeObjectKey(objectKey);
   if (s3Config.publicBaseUrl) {
     return `${s3Config.publicBaseUrl.replace(/\/+$/, '')}/${encodedKey}`;
@@ -116,7 +245,8 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
     Key: objectKey,
     Body: body,
     ContentType: contentType,
-    ...(s3Config.objectAcl ? { ACL: s3Config.objectAcl } : {}),
+    ...(S3_OBJECT_ACL ? { ACL: S3_OBJECT_ACL } : {}),
+    ...S3_ENCRYPTION_OPTIONS,
   });
 
   const response = await client.send(command);
@@ -152,28 +282,33 @@ const getPresignedPutObjectUrl = async ({
       ? { ContentLength: Number(contentLength) }
       : {}),
     ...(metadata && typeof metadata === 'object' ? { Metadata: metadata } : {}),
-    ...(s3Config.objectAcl ? { ACL: s3Config.objectAcl } : {}),
+    ...(S3_OBJECT_ACL ? { ACL: S3_OBJECT_ACL } : {}),
+    ...S3_ENCRYPTION_OPTIONS,
   });
 
   const safeExpires = Math.min(Math.max(Number(expiresInSeconds || 900), 60), 3600);
   const uploadUrl = await getSignedUrl(client, command, {
     expiresIn: safeExpires,
   });
+  const signedHeaders = extractSignedHeadersFromPresignedUrl(uploadUrl);
+  const requestedHeaders = {
+    'Content-Type': contentType,
+    ...(S3_OBJECT_ACL ? { 'x-amz-acl': S3_OBJECT_ACL } : {}),
+    ...getPresignedEncryptionHeaders(),
+    ...(metadata && typeof metadata === 'object'
+      ? Object.fromEntries(
+          Object.entries(metadata).map(([key, value]) => [
+            `x-amz-meta-${String(key).toLowerCase()}`,
+            String(value),
+          ])
+        )
+      : {}),
+  };
 
   return {
     uploadUrl,
     expiresAt: new Date(Date.now() + safeExpires * 1000).toISOString(),
-    headers: {
-      'Content-Type': contentType,
-      ...(metadata && typeof metadata === 'object'
-        ? Object.fromEntries(
-            Object.entries(metadata).map(([key, value]) => [
-              `x-amz-meta-${String(key).toLowerCase()}`,
-              String(value),
-            ])
-          )
-        : {}),
-    },
+    headers: filterUnsignedAmzHeaders(requestedHeaders, signedHeaders),
   };
 };
 
@@ -244,6 +379,35 @@ const getObjectDataUrlFromS3 = async (storageKey) => {
   }
 };
 
+const getObjectBufferFromS3 = async (storageKey) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  const objectKey = normalizeS3ObjectKey(storageKey);
+  if (!objectKey) return null;
+
+  try {
+    const response = await client.send(
+      new GetObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: objectKey,
+      })
+    );
+    const bodyBuffer = await streamToBuffer(response.Body);
+    if (!bodyBuffer || bodyBuffer.length === 0) return null;
+    return {
+      buffer: bodyBuffer,
+      objectKey,
+      bucket: s3Config.bucket,
+      contentType: String(response.ContentType || resolveMimeType(objectKey)),
+      contentLength: Number(response.ContentLength || bodyBuffer.length || 0),
+      metadata: response.Metadata || null,
+    };
+  } catch (_) {
+    return null;
+  }
+};
+
 const headObjectFromS3 = async (storageKey) => {
   const client = getS3Client();
   if (!client) return null;
@@ -267,6 +431,12 @@ const headObjectFromS3 = async (storageKey) => {
       contentType: response.ContentType || null,
       lastModified: response.LastModified || null,
       metadata: response.Metadata || null,
+      serverSideEncryption: response.ServerSideEncryption || null,
+      sseKmsKeyId: response.SSEKMSKeyId || null,
+      bucketKeyEnabled:
+        response.BucketKeyEnabled !== undefined
+          ? Boolean(response.BucketKeyEnabled)
+          : null,
       fileUrl: buildObjectUrl(objectKey),
     };
   } catch (error) {
@@ -280,7 +450,9 @@ module.exports = {
   getPresignedPutObjectUrl,
   getPresignedGetObjectUrl,
   getObjectDataUrlFromS3,
+  getObjectBufferFromS3,
   headObjectFromS3,
   normalizeS3ObjectKey,
   buildObjectUrl,
+  getS3EncryptionPolicy,
 };

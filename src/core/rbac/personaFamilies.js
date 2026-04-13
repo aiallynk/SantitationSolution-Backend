@@ -47,6 +47,11 @@ const GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES = new Set([
   ROLE_CODES.CITY_ADMIN,
   ROLE_CODES.ZONE_ADMIN,
 ]);
+const FACILITY_SCOPED_ROLE_CODES = new Set([
+  ROLE_CODES.FACILITY_MANAGER,
+  ROLE_CODES.SUPERVISOR,
+  ROLE_CODES.FIELD_WORKER,
+]);
 const FACILITY_SCOPED_ADMIN_ROLE_CODES = new Set([ROLE_CODES.FACILITY_MANAGER]);
 
 const normalizeRoleCode = (roleCode) => String(roleCode || '').trim().toLowerCase();
@@ -73,7 +78,7 @@ const isLegacyCompatRole = (roleCode) => getPersonaFamily(roleCode) === PersonaF
 const getRequiredScopeType = (roleCode) => {
   const normalizedRoleCode = normalizeRoleCode(roleCode);
   if (GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES.has(normalizedRoleCode)) return 'geography';
-  if (FACILITY_SCOPED_ADMIN_ROLE_CODES.has(normalizedRoleCode)) return 'facility';
+  if (FACILITY_SCOPED_ROLE_CODES.has(normalizedRoleCode)) return 'facility';
   return 'none';
 };
 
@@ -87,6 +92,7 @@ module.exports = {
   FIELD_WORKER_ROLE_CODES,
   LEGACY_COMPAT_ROLE_CODES,
   GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES,
+  FACILITY_SCOPED_ROLE_CODES,
   FACILITY_SCOPED_ADMIN_ROLE_CODES,
   normalizeRoleCode,
   getPersonaFamily,

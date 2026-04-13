@@ -1,4 +1,13 @@
 const { isBlank, inEnum, parsePositiveInteger } = require('../../utils/validators');
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
+const VALID_SCOPE_LEVELS = ['country', 'state', 'district', 'city', 'zone'];
+const SCOPE_REQUIRED_FIELDS = {
+  country: ['countryName'],
+  state: ['countryName', 'stateName'],
+  district: ['countryName', 'stateName', 'districtName'],
+  city: ['countryName', 'stateName', 'cityName'],
+  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+};
 
 const validateTenantProvision = (req) => {
   const errors = [];
@@ -7,6 +16,19 @@ const validateTenantProvision = (req) => {
   if (req.body.countryCode !== undefined && !isBlank(req.body.countryCode) && String(req.body.countryCode).length > 10) {
     errors.push('countryCode must be 10 characters or fewer');
   }
+  if (req.body.contactEmail !== undefined && !isBlank(req.body.contactEmail) && !isLikelyEmail(req.body.contactEmail)) {
+    errors.push('contactEmail must be a valid email');
+  }
+  if (req.body.scopeLevel !== undefined && !isBlank(req.body.scopeLevel) && !inEnum(req.body.scopeLevel, VALID_SCOPE_LEVELS)) {
+    errors.push('scopeLevel is invalid');
+  }
+  const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
+  const requiredFields = SCOPE_REQUIRED_FIELDS[scopeLevel] || [];
+  requiredFields.forEach((field) => {
+    if (isBlank(req.body[field])) {
+      errors.push(`${field} is required for ${scopeLevel} scope`);
+    }
+  });
   if (req.body.metadata !== undefined && (typeof req.body.metadata !== 'object' || Array.isArray(req.body.metadata))) {
     errors.push('metadata must be an object when provided');
   }
@@ -41,6 +63,12 @@ const validateTenantPatch = (req) => {
   }
   if (req.body.countryCode !== undefined && !isBlank(req.body.countryCode) && String(req.body.countryCode).length > 10) {
     errors.push('countryCode must be 10 characters or fewer');
+  }
+  if (req.body.contactEmail !== undefined && !isBlank(req.body.contactEmail) && !isLikelyEmail(req.body.contactEmail)) {
+    errors.push('contactEmail must be a valid email');
+  }
+  if (req.body.scopeLevel !== undefined && !isBlank(req.body.scopeLevel) && !inEnum(req.body.scopeLevel, VALID_SCOPE_LEVELS)) {
+    errors.push('scopeLevel is invalid');
   }
   if (req.body.metadata !== undefined && (typeof req.body.metadata !== 'object' || Array.isArray(req.body.metadata))) {
     errors.push('metadata must be an object when provided');
