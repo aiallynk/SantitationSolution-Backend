@@ -10,8 +10,8 @@ const { normalizePagination } = require('../../utils/validators');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { createAuditLog } = require('../audit/audit.service');
 const {
-  applyTenantScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 
@@ -29,6 +29,12 @@ const parseNumeric = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+
+const scopedWhere = (req, where = {}, domainType = 'sensor') =>
+  applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), domainType, {
+    tenantKey: 'tenant_id',
+    facilityKey: 'facility_id',
+  });
 
 const mapReading = (row) => ({
   id: row.id,
@@ -155,9 +161,7 @@ const ingestSensorReading = async (req) => {
 
 const listSensors = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  let where = {};
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
+  let where = scopedWhere(req, {}, 'sensor');
   if (req.query.status) {
     where.status = req.query.status;
   }
@@ -271,13 +275,15 @@ const getFacilityLiveMetrics = async (req) => {
 };
 
 const getLiveAlerts = async (req) => {
-  let where = {
+  let where = scopedWhere(
+    req,
+    {
     status: {
       [Op.in]: ['open', 'acknowledged'],
     },
-  };
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
+    },
+    'alert',
+  );
   if (req.query.facilityId) {
     if (!isFacilityInScope(req, req.query.facilityId)) {
       throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });

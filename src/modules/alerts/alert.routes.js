@@ -5,11 +5,20 @@ const {
   requirePermissions,
   requireAnyPermissions,
   requireAction,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
 } = require('../../core/middleware/auth');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
 router.use(protect);
+router.use(
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
 router.get('/alerts', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlerts);
 router.get('/alerts/summary', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlertSummary);

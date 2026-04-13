@@ -1,19 +1,51 @@
 const { isBlank } = require('../../utils/validators');
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
+const allowedScopeLevels = new Set(['country', 'state', 'district', 'city', 'zone']);
+const allowedGeographyLevels = new Set(['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster']);
+const scopeRequiredFields = {
+  country: ['countryName'],
+  state: ['countryName', 'stateName'],
+  district: ['countryName', 'stateName', 'districtName'],
+  city: ['countryName', 'stateName', 'cityName'],
+  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+};
 
 const validateTenantCreate = (req) => {
   const errors = [];
   if (isBlank(req.body.name)) errors.push('name is required');
-  if (isBlank(req.body.code)) errors.push('code is required');
+  if (req.body.code !== undefined && isBlank(req.body.code)) errors.push('code cannot be blank when provided');
+  if (req.body.contactEmail !== undefined && !isBlank(req.body.contactEmail) && !isLikelyEmail(req.body.contactEmail)) {
+    errors.push('contactEmail must be a valid email');
+  }
+  if (req.body.scopeLevel !== undefined && !allowedScopeLevels.has(String(req.body.scopeLevel).trim().toLowerCase())) {
+    errors.push('scopeLevel must be one of country|state|district|city|zone');
+  }
+  const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
+  const requiredFields = scopeRequiredFields[scopeLevel] || [];
+  requiredFields.forEach((field) => {
+    if (isBlank(req.body[field])) {
+      errors.push(`${field} is required for ${scopeLevel} scope`);
+    }
+  });
   return errors;
 };
 
 const validateGeographyCreate = (req) => {
   const errors = [];
   if (isBlank(req.body.level)) errors.push('level is required');
-  if (isBlank(req.body.code)) errors.push('code is required');
+  if (!isBlank(req.body.level) && !allowedGeographyLevels.has(String(req.body.level).trim().toLowerCase())) {
+    errors.push('level is invalid');
+  }
+  if (req.body.code !== undefined && isBlank(req.body.code)) errors.push('code cannot be blank when provided');
   if (isBlank(req.body.name)) errors.push('name is required');
   if (isBlank(req.body.tenantId) && !req.user?.tenantId) {
     errors.push('tenantId is required');
+  }
+  if (req.body.geometryType !== undefined) {
+    const geometryType = String(req.body.geometryType || '').trim().toLowerCase();
+    if (geometryType && !['polygon', 'circle'].includes(geometryType)) {
+      errors.push('geometryType must be polygon or circle');
+    }
   }
   return errors;
 };

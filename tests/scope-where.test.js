@@ -6,6 +6,8 @@ const {
   applyTenantScope,
   applyFacilityScope,
   isFacilityInScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
 } = require('../src/core/rbac/scopeWhere');
 
 test('applyTenantScope applies authenticated tenant for non-super-admin users', () => {
@@ -25,4 +27,33 @@ test('isFacilityInScope returns false for out-of-scope facility ids', () => {
   const req = { user: { isSuperAdmin: false, scopeFacilityIds: ['fac-1'], scopeLevel: 'facility' } };
   assert.equal(isFacilityInScope(req, 'fac-2'), false);
   assert.equal(isFacilityInScope(req, 'fac-1'), true);
+});
+
+test('applyScopeToQuery enforces facility scope for supervisor access context', () => {
+  const accessContext = buildAccessContextFromUser({
+    role: 'supervisor',
+    roleCodes: ['supervisor'],
+    tenantId: 'tenant-1',
+    scopeLevel: 'facility',
+    scopeFacilityIds: ['fac-1'],
+    permissions: ['dashboard.read'],
+  });
+
+  const scoped = applyScopeToQuery({}, accessContext, 'dashboard');
+  assert.equal(scoped.tenant_id, 'tenant-1');
+  assert.deepEqual(scoped.facility_id, { [Op.in]: ['fac-1'] });
+});
+
+test('applyScopeToQuery blocks facility-scoped actors without facility assignments', () => {
+  const accessContext = buildAccessContextFromUser({
+    role: 'supervisor',
+    roleCodes: ['supervisor'],
+    tenantId: 'tenant-1',
+    scopeLevel: 'facility',
+    scopeFacilityIds: [],
+  });
+
+  const scoped = applyScopeToQuery({}, accessContext, 'task');
+  assert.equal(scoped.tenant_id, 'tenant-1');
+  assert.equal(scoped.facility_id, '00000000-0000-0000-0000-000000000000');
 });

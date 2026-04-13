@@ -92,6 +92,19 @@ const getPermissions = async (req, res, next) => {
   }
 };
 
+const getSupervisors = async (req, res, next) => {
+  try {
+    const payload = await userService.listSupervisors(req);
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'Supervisors fetched successfully',
+      data: payload,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   getUsers,
   getUserById,
@@ -100,4 +113,5 @@ module.exports = {
   deleteUser,
   getRoles,
   getPermissions,
+  getSupervisors,
 };

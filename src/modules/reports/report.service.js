@@ -6,15 +6,18 @@ const {
   Complaint,
 } = require('../../models');
 const {
-  applyTenantScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 
 const scopedWhere = (req) => {
-  let where = {};
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
+  const where = applyScopeToQuery(
+    {},
+    buildAccessContextFromUser(req?.user || {}),
+    'report',
+    { tenantKey: 'tenant_id', facilityKey: 'facility_id' },
+  );
   if (req.query.facilityId) {
     if (!isFacilityInScope(req, req.query.facilityId)) {
       where.facility_id = '00000000-0000-0000-0000-000000000000';

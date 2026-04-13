@@ -5,13 +5,26 @@ const {
   requirePermissions,
   requireAnyPermissions,
   requireAction,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
 } = require('../../core/middleware/auth');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
 const { validateTaskCreate } = require('./task.validator');
 
 const router = express.Router();
 
 router.use(protect);
+router.use(
+  requireSurface(
+    SurfaceTypes.OPS_WEB,
+    SurfaceTypes.OPS_WEB_AND_MOBILE,
+    SurfaceTypes.MOBILE_ONLY,
+  ),
+  requireRouteKey(RouteKeys.OPS_TASKS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
 router.get(
   '/tasks',

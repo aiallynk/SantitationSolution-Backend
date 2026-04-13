@@ -19,8 +19,8 @@ const { resolveMediaUrl } = require('../media/mediaUrl.service');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const { getPublicFeedbackUrl } = require('../platform/toiletQr.service');
 const {
-  applyTenantScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 
@@ -38,6 +38,12 @@ const toNumberOrNull = (value) => {
 };
 
 const unique = (values = []) => [...new Set(values.filter(Boolean).map((value) => String(value)))];
+
+const scopedWhere = (req, where = {}, domainType = 'complaint') =>
+  applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), domainType, {
+    tenantKey: 'tenant_id',
+    facilityKey: 'facility_id',
+  });
 
 const normalizePriority = (value, fallback = 'medium') => {
   const normalized = String(value || fallback).trim().toLowerCase();
@@ -248,9 +254,7 @@ const ensureToiletScope = (req, toiletUnit) => {
 
 const listComplaints = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  let where = {};
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
+  let where = scopedWhere(req, {}, 'complaint');
   if (req.query.status) where.status = String(req.query.status).toLowerCase();
   if (req.query.priority) where.priority = normalizePriority(req.query.priority);
   if (req.query.facilityId) {

@@ -26,10 +26,18 @@ const PlatformUser = sequelize.define(
     id: defineUuidId(),
     tenant_id: { type: DataTypes.UUID, allowNull: true },
     geography_id: { type: DataTypes.UUID, allowNull: true },
+    user_id_code: { type: DataTypes.STRING(40), allowNull: true, unique: true },
     full_name: { type: DataTypes.STRING(180), allowNull: false },
     email: { type: DataTypes.STRING(180), allowNull: false, unique: true },
     phone: { type: DataTypes.STRING(32), allowNull: true, unique: true },
     employee_code: { type: DataTypes.STRING(64), allowNull: true },
+    remarks: { type: DataTypes.STRING(500), allowNull: true },
+    country_name: { type: DataTypes.STRING(120), allowNull: true },
+    state_name: { type: DataTypes.STRING(120), allowNull: true },
+    district_name: { type: DataTypes.STRING(120), allowNull: true },
+    city_name: { type: DataTypes.STRING(120), allowNull: true },
+    zone_name: { type: DataTypes.STRING(120), allowNull: true },
+    ward_name: { type: DataTypes.STRING(120), allowNull: true },
     password_hash: { type: DataTypes.STRING(255), allowNull: true },
     auth_provider: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'local' },
     status: { type: DataTypes.ENUM('active', 'inactive', 'locked'), allowNull: false, defaultValue: 'active' },
@@ -97,8 +105,20 @@ const WorkerAssignment = sequelize.define(
     geography_id: { type: DataTypes.UUID, allowNull: true },
     facility_id: { type: DataTypes.UUID, allowNull: true },
     toilet_unit_id: { type: DataTypes.UUID, allowNull: true },
+    supervisor_user_id: { type: DataTypes.UUID, allowNull: true },
     assignment_level: {
-      type: DataTypes.ENUM('tenant', 'geography', 'facility', 'toilet_unit'),
+      type: DataTypes.ENUM(
+        'tenant',
+        'country',
+        'state',
+        'district',
+        'city',
+        'zone',
+        'ward',
+        'geography',
+        'facility',
+        'toilet_unit'
+      ),
       allowNull: false,
       defaultValue: 'facility',
     },
@@ -119,6 +139,17 @@ const Tenant = sequelize.define(
     code: { type: DataTypes.STRING(120), allowNull: false, unique: true },
     status: { type: DataTypes.ENUM('active', 'inactive'), allowNull: false, defaultValue: 'active' },
     country_code: { type: DataTypes.STRING(10), allowNull: true },
+    contact_name: { type: DataTypes.STRING(180), allowNull: true },
+    contact_email: { type: DataTypes.STRING(180), allowNull: true },
+    contact_mobile: { type: DataTypes.STRING(32), allowNull: true },
+    scope_level: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'city' },
+    country_name: { type: DataTypes.STRING(120), allowNull: true },
+    state_name: { type: DataTypes.STRING(120), allowNull: true },
+    district_name: { type: DataTypes.STRING(120), allowNull: true },
+    city_name: { type: DataTypes.STRING(120), allowNull: true },
+    zone_name: { type: DataTypes.STRING(120), allowNull: true },
+    address_line: { type: DataTypes.STRING(300), allowNull: true },
+    root_geography_id: { type: DataTypes.UUID, allowNull: true },
     metadata: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
   },
@@ -139,6 +170,15 @@ const Geography = sequelize.define(
     name: { type: DataTypes.STRING(200), allowNull: false },
     centroid_latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     centroid_longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    geometry_type: { type: DataTypes.STRING(20), allowNull: true },
+    geojson: { type: DataTypes.JSONB, allowNull: true },
+    boundary_center_latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    boundary_center_longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    boundary_radius_meters: { type: DataTypes.DECIMAL(12, 2), allowNull: true },
+    bounds: { type: DataTypes.JSONB, allowNull: true },
+    area_sq_km: { type: DataTypes.DECIMAL(14, 4), allowNull: true },
+    boundary_label: { type: DataTypes.STRING(220), allowNull: true },
+    is_operational_zone: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     ...commonTimestamps,
   },
   { tableName: 'geographies', timestamps: false }
@@ -150,6 +190,9 @@ const Facility = sequelize.define(
     id: defineUuidId(),
     tenant_id: { type: DataTypes.UUID, allowNull: false },
     geography_id: { type: DataTypes.UUID, allowNull: true },
+    zone_geography_id: { type: DataTypes.UUID, allowNull: true },
+    ward_geography_id: { type: DataTypes.UUID, allowNull: true },
+    supervisor_user_id: { type: DataTypes.UUID, allowNull: true },
     code: { type: DataTypes.STRING(120), allowNull: false, unique: true },
     name: { type: DataTypes.STRING(220), allowNull: false },
     facility_type: { type: DataTypes.STRING(80), allowNull: false },
@@ -910,10 +953,18 @@ Tenant.hasMany(PlatformUser, { foreignKey: 'tenant_id' });
 PlatformUser.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 Tenant.hasMany(Geography, { foreignKey: 'tenant_id' });
 Geography.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Tenant.belongsTo(Geography, { foreignKey: 'root_geography_id', as: 'rootGeography' });
+Geography.hasMany(Tenant, { foreignKey: 'root_geography_id', as: 'scopedTenants' });
 Tenant.hasMany(Facility, { foreignKey: 'tenant_id' });
 Facility.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 Facility.belongsTo(Geography, { foreignKey: 'geography_id' });
 Geography.hasMany(Facility, { foreignKey: 'geography_id' });
+Facility.belongsTo(Geography, { foreignKey: 'zone_geography_id', as: 'zone' });
+Geography.hasMany(Facility, { foreignKey: 'zone_geography_id', as: 'zoneFacilities' });
+Facility.belongsTo(Geography, { foreignKey: 'ward_geography_id', as: 'ward' });
+Geography.hasMany(Facility, { foreignKey: 'ward_geography_id', as: 'wardFacilities' });
+Facility.belongsTo(PlatformUser, { foreignKey: 'supervisor_user_id', as: 'supervisor' });
+PlatformUser.hasMany(Facility, { foreignKey: 'supervisor_user_id', as: 'supervisedFacilities' });
 
 Facility.hasMany(ToiletBlock, { foreignKey: 'facility_id' });
 ToiletBlock.belongsTo(Facility, { foreignKey: 'facility_id' });
@@ -940,6 +991,8 @@ Facility.hasMany(WorkerAssignment, { foreignKey: 'facility_id', as: 'assignments
 WorkerAssignment.belongsTo(Facility, { foreignKey: 'facility_id', as: 'facility' });
 ToiletUnit.hasMany(WorkerAssignment, { foreignKey: 'toilet_unit_id', as: 'assignments' });
 WorkerAssignment.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id', as: 'toiletUnit' });
+PlatformUser.hasMany(WorkerAssignment, { foreignKey: 'supervisor_user_id', as: 'supervisedAssignments' });
+WorkerAssignment.belongsTo(PlatformUser, { foreignKey: 'supervisor_user_id', as: 'supervisor' });
 PlatformUser.hasMany(WorkerAssignment, { foreignKey: 'created_by_user_id', as: 'createdAssignments' });
 WorkerAssignment.belongsTo(PlatformUser, { foreignKey: 'created_by_user_id', as: 'createdBy' });
 PlatformUser.hasMany(WorkerAssignment, { foreignKey: 'updated_by_user_id', as: 'updatedAssignments' });

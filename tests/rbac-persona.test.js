@@ -7,6 +7,7 @@ const {
   getRequiredScopeType,
 } = require('../src/core/rbac/personaFamilies');
 const { resolvePrimaryRoleCode } = require('../src/core/rbac/accessProfiles');
+const { resolveRoleAccessProfile, RouteKeys } = require('../src/core/rbac/accessMatrix');
 const { ROLE_PERMISSION_BUNDLES } = require('../src/core/rbac/defaultRoleBundles');
 const { collectRoleScopeValidationErrors } = require('../src/core/rbac/roleScopeRules');
 
@@ -19,14 +20,20 @@ test('maps role codes to persona families', () => {
   assert.equal(getPersonaFamily('platform_ops'), PersonaFamilies.LEGACY_COMPAT);
 });
 
-test('role bundles include scoped admin variants and auditor read-only permissions', () => {
-  const scopedRoles = ['country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin', 'facility_manager'];
+test('role bundles keep geography admins aligned and enforce facility/supervisor hierarchy limits', () => {
+  const scopedRoles = ['country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin'];
   const tenantAdminPermissions = ROLE_PERMISSION_BUNDLES.tenant_admin;
   assert.equal(tenantAdminPermissions.includes('task.manage'), true);
+  assert.equal(tenantAdminPermissions.includes('users.manage'), true);
 
   scopedRoles.forEach((roleCode) => {
     assert.deepEqual(ROLE_PERMISSION_BUNDLES[roleCode], tenantAdminPermissions);
   });
+
+  assert.equal(ROLE_PERMISSION_BUNDLES.facility_manager.includes('users.manage'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.facility_manager.includes('audit.read'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('users.manage'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('audit.read'), false);
 
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('audit.read'), true);
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('task.manage'), false);
@@ -35,6 +42,8 @@ test('role bundles include scoped admin variants and auditor read-only permissio
 test('scope rules enforce scoped role requirements', () => {
   assert.equal(getRequiredScopeType('city_admin'), 'geography');
   assert.equal(getRequiredScopeType('facility_manager'), 'facility');
+  assert.equal(getRequiredScopeType('supervisor'), 'facility');
+  assert.equal(getRequiredScopeType('field_worker'), 'facility');
 
   const missingCityScope = collectRoleScopeValidationErrors({
     roleCodes: ['city_admin'],
@@ -49,6 +58,26 @@ test('scope rules enforce scoped role requirements', () => {
     assignments: [{ assignmentLevel: 'facility', facilityId: 'facility-1' }],
   });
   assert.equal(validFacilityScope.length, 0);
+  const missingSupervisorFacilityScope = collectRoleScopeValidationErrors({
+    roleCodes: ['supervisor'],
+    geographyId: null,
+    assignments: [],
+  });
+  assert.equal(missingSupervisorFacilityScope.length > 0, true);
+});
+
+test('role access profile resolves strict route, widget, and action keys for supervisors', () => {
+  const profile = resolveRoleAccessProfile({
+    roleCodes: ['supervisor'],
+  });
+
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_USERS), false);
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_ADMINOPS), false);
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_SETTINGS), false);
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), true);
+  assert.equal(profile.actionKeys.includes('task.assign'), true);
+  assert.equal(profile.actionKeys.includes('user.manage'), false);
+  assert.equal(profile.widgetKeys.includes('W_WORKER_PRODUCTIVITY'), true);
 });
 
 test('primary role resolution prefers web persona over field_worker when both exist', () => {

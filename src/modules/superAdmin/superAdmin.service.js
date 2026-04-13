@@ -36,10 +36,32 @@ const { getQueueMetrics, isRedisEnabled } = require('../../core/queue/queueManag
 const { ANALYSIS_QUEUE } = require('../analysis/analysis.queue');
 
 const TENANT_ADMIN_ROLE_CODES = ['tenant_admin', 'country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin'];
+const TENANT_SCOPE_LEVELS = new Set(['country', 'state', 'district', 'city', 'zone']);
+const TENANT_SCOPE_REQUIRED_FIELDS = {
+  country: ['countryName'],
+  state: ['countryName', 'stateName'],
+  district: ['countryName', 'stateName', 'districtName'],
+  city: ['countryName', 'stateName', 'cityName'],
+  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+};
 
 const ensureSuperAdmin = (req) => {
   if (!req.user?.isSuperAdmin) {
     throw new AppError('Only super admin can access this endpoint', 403, { code: 'SUPER_ADMIN_ONLY' });
+  }
+};
+
+const assertTenantScopeLocationRequirements = ({ scopeLevel, locationNames = {} }) => {
+  const requiredFields = TENANT_SCOPE_REQUIRED_FIELDS[scopeLevel] || [];
+  for (const field of requiredFields) {
+    const value = String(locationNames[field] || '').trim();
+    if (!value) {
+      throw new AppError(
+        `${field} is required for ${scopeLevel}-level tenant scope`,
+        400,
+        { code: 'TENANT_SCOPE_LOCATION_REQUIRED' }
+      );
+    }
   }
 };
 
@@ -115,6 +137,17 @@ const mapTenant = (tenant, metrics = null) => {
     code: tenant.code,
     status: tenant.status,
     countryCode: tenant.country_code,
+    contactName: tenant.contact_name || null,
+    contactEmail: tenant.contact_email || null,
+    contactMobile: tenant.contact_mobile || null,
+    scopeLevel: tenant.scope_level || 'city',
+    countryName: tenant.country_name || null,
+    stateName: tenant.state_name || null,
+    districtName: tenant.district_name || null,
+    cityName: tenant.city_name || null,
+    zoneName: tenant.zone_name || null,
+    addressLine: tenant.address_line || null,
+    rootGeographyId: tenant.root_geography_id || null,
     plan: metadata.plan || null,
     metadata,
     createdAt: tenant.created_at,
@@ -369,6 +402,23 @@ const postTenantProvision = async (req) => {
   return sequelize.transaction(async (transaction) => {
     const tenantCode = sanitizeText(req.body.code, 120).toUpperCase();
     const tenantName = sanitizeText(req.body.name, 200);
+    const scopeLevelRaw = String(req.body.scopeLevel || 'city').trim().toLowerCase();
+    const scopeLevel = TENANT_SCOPE_LEVELS.has(scopeLevelRaw) ? scopeLevelRaw : 'city';
+    const countryName = req.body.countryName ? sanitizeText(req.body.countryName, 120) : null;
+    const stateName = req.body.stateName ? sanitizeText(req.body.stateName, 120) : null;
+    const districtName = req.body.districtName ? sanitizeText(req.body.districtName, 120) : null;
+    const cityName = req.body.cityName ? sanitizeText(req.body.cityName, 120) : null;
+    const zoneName = req.body.zoneName ? sanitizeText(req.body.zoneName, 120) : null;
+    assertTenantScopeLocationRequirements({
+      scopeLevel,
+      locationNames: {
+        countryName,
+        stateName,
+        districtName,
+        cityName,
+        zoneName,
+      },
+    });
     const existingTenant = await Tenant.findOne({
       where: { code: { [Op.iLike]: tenantCode } },
       transaction,
@@ -391,6 +441,17 @@ const postTenantProvision = async (req) => {
         code: tenantCode,
         status: req.body.status || 'active',
         country_code: req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null,
+        contact_name: req.body.contactName ? sanitizeText(req.body.contactName, 180) : null,
+        contact_email: req.body.contactEmail ? sanitizeText(req.body.contactEmail, 180).toLowerCase() : null,
+        contact_mobile: req.body.contactMobile ? sanitizeText(req.body.contactMobile, 32) : null,
+        scope_level: scopeLevel,
+        country_name: countryName,
+        state_name: stateName,
+        district_name: districtName,
+        city_name: cityName,
+        zone_name: zoneName,
+        address_line: req.body.addressLine ? sanitizeText(req.body.addressLine, 300) : null,
+        root_geography_id: req.body.rootGeographyId || null,
         metadata: Object.keys(metadata).length > 0 ? metadata : null,
       },
       { transaction }
@@ -415,6 +476,7 @@ const postTenantProvision = async (req) => {
       details: {
         code: tenant.code,
         status: tenant.status,
+        scopeLevel: tenant.scope_level,
         plan: metadata.plan || null,
         onboardedAdminUserId: onboardedAdmin?.id || null,
       },
@@ -434,6 +496,54 @@ const patchTenant = async (req) => {
     const tenant = await Tenant.findByPk(req.params.id, { transaction });
     if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
 
+    const nextScopeLevel =
+      req.body.scopeLevel !== undefined
+        ? (() => {
+            const scopeLevelRaw = String(req.body.scopeLevel || '').trim().toLowerCase();
+            return TENANT_SCOPE_LEVELS.has(scopeLevelRaw) ? scopeLevelRaw : tenant.scope_level;
+          })()
+        : tenant.scope_level;
+    const nextCountryName =
+      req.body.countryName !== undefined
+        ? req.body.countryName
+          ? sanitizeText(req.body.countryName, 120)
+          : null
+        : tenant.country_name;
+    const nextStateName =
+      req.body.stateName !== undefined
+        ? req.body.stateName
+          ? sanitizeText(req.body.stateName, 120)
+          : null
+        : tenant.state_name;
+    const nextDistrictName =
+      req.body.districtName !== undefined
+        ? req.body.districtName
+          ? sanitizeText(req.body.districtName, 120)
+          : null
+        : tenant.district_name;
+    const nextCityName =
+      req.body.cityName !== undefined
+        ? req.body.cityName
+          ? sanitizeText(req.body.cityName, 120)
+          : null
+        : tenant.city_name;
+    const nextZoneName =
+      req.body.zoneName !== undefined
+        ? req.body.zoneName
+          ? sanitizeText(req.body.zoneName, 120)
+          : null
+        : tenant.zone_name;
+    assertTenantScopeLocationRequirements({
+      scopeLevel: nextScopeLevel,
+      locationNames: {
+        countryName: nextCountryName,
+        stateName: nextStateName,
+        districtName: nextDistrictName,
+        cityName: nextCityName,
+        zoneName: nextZoneName,
+      },
+    });
+
     const updates = {};
     if (req.body.name !== undefined) {
       updates.name = sanitizeText(req.body.name, 200);
@@ -443,6 +553,39 @@ const patchTenant = async (req) => {
     }
     if (req.body.countryCode !== undefined) {
       updates.country_code = req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null;
+    }
+    if (req.body.contactName !== undefined) {
+      updates.contact_name = req.body.contactName ? sanitizeText(req.body.contactName, 180) : null;
+    }
+    if (req.body.contactEmail !== undefined) {
+      updates.contact_email = req.body.contactEmail ? sanitizeText(req.body.contactEmail, 180).toLowerCase() : null;
+    }
+    if (req.body.contactMobile !== undefined) {
+      updates.contact_mobile = req.body.contactMobile ? sanitizeText(req.body.contactMobile, 32) : null;
+    }
+    if (req.body.scopeLevel !== undefined) {
+      updates.scope_level = nextScopeLevel;
+    }
+    if (req.body.countryName !== undefined) {
+      updates.country_name = nextCountryName;
+    }
+    if (req.body.stateName !== undefined) {
+      updates.state_name = nextStateName;
+    }
+    if (req.body.districtName !== undefined) {
+      updates.district_name = nextDistrictName;
+    }
+    if (req.body.cityName !== undefined) {
+      updates.city_name = nextCityName;
+    }
+    if (req.body.zoneName !== undefined) {
+      updates.zone_name = nextZoneName;
+    }
+    if (req.body.addressLine !== undefined) {
+      updates.address_line = req.body.addressLine ? sanitizeText(req.body.addressLine, 300) : null;
+    }
+    if (req.body.rootGeographyId !== undefined) {
+      updates.root_geography_id = req.body.rootGeographyId || null;
     }
     if (req.body.code !== undefined) {
       const nextCode = sanitizeText(req.body.code, 120).toUpperCase();

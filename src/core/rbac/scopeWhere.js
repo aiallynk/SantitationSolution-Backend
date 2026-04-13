@@ -1,9 +1,17 @@
 const { Op } = require('sequelize');
+const {
+  EMPTY_SCOPE_UUID,
+  uniqueIds,
+  buildAccessContextFromUser,
+  resolveAllowedGeographyIds,
+  resolveAllowedFacilityIds,
+  applyScopeToQuery,
+} = require('./accessContext');
 
-const EMPTY_SCOPE_UUID = '00000000-0000-0000-0000-000000000000';
-
-const uniqueIds = (values = []) =>
-  [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
+const applyDomainScope = (where = {}, req, domainType = 'tenant') => {
+  const accessContext = buildAccessContextFromUser(req?.user || {});
+  return applyScopeToQuery(where, accessContext, domainType);
+};
 
 const applyTenantScope = (where = {}, req, tenantKey = 'tenant_id') => {
   const next = { ...where };
@@ -65,4 +73,9 @@ module.exports = {
   applyFacilityScope,
   isFacilityInScope,
   isGeographyInScope,
+  buildAccessContextFromUser,
+  resolveAllowedGeographyIds,
+  resolveAllowedFacilityIds,
+  applyScopeToQuery,
+  applyDomainScope,
 };

@@ -4,7 +4,14 @@ const express = require('express');
 const multer = require('multer');
 const complaintController = require('./complaint.controller');
 const AppError = require('../../core/errors/AppError');
-const { protect, requirePermissions, requireAction } = require('../../core/middleware/auth');
+const {
+  protect,
+  requirePermissions,
+  requireAction,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
+} = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 const {
   validateComplaintListQuery,
@@ -12,6 +19,7 @@ const {
   validateComplaintAssign,
   validateComplaintDispatch,
 } = require('./complaint.validator');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
@@ -82,6 +90,15 @@ router.post(
 );
 
 router.use(protect);
+router.use(
+  requireSurface(
+    SurfaceTypes.OPS_WEB,
+    SurfaceTypes.OPS_WEB_AND_MOBILE,
+    SurfaceTypes.MOBILE_ONLY,
+  ),
+  requireRouteKey(RouteKeys.OPS_COMPLAINTS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
 router.get(
   '/complaints',

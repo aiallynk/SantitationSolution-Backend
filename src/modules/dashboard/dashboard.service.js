@@ -20,38 +20,32 @@ const {
 } = require('../../models');
 const {
   EMPTY_SCOPE_UUID,
-  applyTenantScope,
-  applyGeographyScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   uniqueIds,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 
 const scopedTenantWhere = (req, where = {}, key = 'tenant_id') => {
-  return applyTenantScope(where, req, key);
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
+    tenantKey: key,
+  });
 };
 
 const scopedFacilityWhere = (req, where = {}, facilityKey = 'facility_id', tenantKey = 'tenant_id') => {
-  let next = scopedTenantWhere(req, where, tenantKey);
-  next = applyFacilityScope(next, req, facilityKey);
-  return next;
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'facility', {
+    tenantKey,
+    facilityKey,
+  });
 };
 
 const scopedFacilityEntityWhere = (req, where = {}) => {
-  let next = scopedTenantWhere(req, where);
-  next = applyGeographyScope(next, req, 'geography_id');
-
-  if (req.user?.isSuperAdmin) return next;
-
-  const facilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
-  if (facilityIds.length > 0) {
-    next.id = { [Op.in]: facilityIds };
-  } else if (req.user?.scopeLevel === 'facility') {
-    next.id = EMPTY_SCOPE_UUID;
-  }
-
-  return next;
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'facility', {
+    tenantKey: 'tenant_id',
+    geographyKey: 'geography_id',
+    facilityKey: 'id',
+  });
 };
 
 const toNumber = (value, fallback = 0) => {
@@ -98,7 +92,12 @@ const getOverview = async (req) => {
   const taskTenantFilter = scopedFacilityWhere(req);
   const complaintTenantFilter = scopedFacilityWhere(req);
   const sensorTenantFilter = scopedFacilityWhere(req);
-  const userScopeFilter = applyGeographyScope({ ...tenantFilter }, req, 'geography_id');
+  const userScopeFilter = applyScopeToQuery(
+    { ...tenantFilter },
+    buildAccessContextFromUser(req?.user || {}),
+    'geography',
+    { tenantKey: 'tenant_id', geographyKey: 'geography_id' },
+  );
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -393,10 +392,15 @@ const getWorkforce = async (req) => {
     raw: true,
   });
 
-  const assignmentScopeWhere = applyGeographyScope(
-    applyFacilityScope(scopedTenantWhere(req, { status: 'active' }), req, 'facility_id'),
-    req,
-    'geography_id'
+  const assignmentScopeWhere = applyScopeToQuery(
+    scopedTenantWhere(req, { status: 'active' }),
+    buildAccessContextFromUser(req?.user || {}),
+    'audit',
+    {
+      tenantKey: 'tenant_id',
+      geographyKey: 'geography_id',
+      facilityKey: 'facility_id',
+    },
   );
   const scopedAssignmentRows = await WorkerAssignment.findAll({
     where: assignmentScopeWhere,

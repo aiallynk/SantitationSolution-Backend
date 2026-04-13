@@ -15,12 +15,28 @@ const {
   validateBackupCreate,
   validateSyncFailurePatch,
 } = require('./superAdmin.validator');
-const { protect, requireRoles } = require('../../core/middleware/auth');
+const {
+  protect,
+  requireRoles,
+  requireRouteKey,
+  requireSurface,
+} = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
+const { RouteKeys, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
-router.use(protect, requireRoles('super_admin'));
+router.use(
+  protect,
+  requireRoles('super_admin'),
+  requireSurface(SurfaceTypes.PLATFORM_WEB),
+  requireRouteKey(
+    RouteKeys.SA_OVERVIEW,
+    RouteKeys.SA_TENANTS,
+    RouteKeys.SA_GLOBAL_USERS,
+    RouteKeys.SA_PLATFORM_HEALTH,
+  ),
+);
 
 router.get('/tenants', superAdminController.getTenants);
 router.get('/tenants/:id', superAdminController.getTenantById);

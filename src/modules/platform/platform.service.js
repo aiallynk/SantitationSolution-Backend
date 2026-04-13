@@ -11,13 +11,15 @@ const {
   ToiletUnit,
   ToiletQrCode,
   WorkerAssignment,
+  PlatformUser,
+  UserRole,
+  Role,
 } = require('../../models');
 const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const {
-  applyTenantScope,
-  applyGeographyScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
   isGeographyInScope,
 } = require('../../core/rbac/scopeWhere');
@@ -38,15 +40,23 @@ const tenantScope = (req, requestedTenantId) => {
 };
 
 const withTenantScope = (req, where = {}, tenantKey = 'tenant_id') => {
-  return applyTenantScope(where, req, tenantKey);
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
+    tenantKey,
+  });
 };
 
 const withGeographyScope = (req, where = {}, geographyKey = 'geography_id') => {
-  return applyGeographyScope(where, req, geographyKey);
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'geography', {
+    tenantKey: 'tenant_id',
+    geographyKey,
+  });
 };
 
 const withFacilityScope = (req, where = {}, facilityKey = 'facility_id') => {
-  return applyFacilityScope(where, req, facilityKey);
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'facility', {
+    tenantKey: 'tenant_id',
+    facilityKey,
+  });
 };
 
 const buildFacilityIncludeScopeWhere = (req) => {
@@ -55,6 +65,360 @@ const buildFacilityIncludeScopeWhere = (req) => {
   where = withGeographyScope(req, where);
   where = withFacilityScope(req, where, 'id');
   return where;
+};
+
+const GEO_LEVEL_SEQUENCE = ['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'];
+const GEO_LEVEL_RANK = new Map(GEO_LEVEL_SEQUENCE.map((level, index) => [level, index]));
+const TENANT_SCOPE_LEVELS = new Set(['country', 'state', 'district', 'city', 'zone']);
+const GEOGRAPHY_ASSIGNMENT_LEVELS = new Set([
+  'country',
+  'state',
+  'district',
+  'city',
+  'zone',
+  'ward',
+  'geography',
+]);
+
+const sanitizeOptionalText = (value, limit = 180) => {
+  if (value === undefined || value === null) return null;
+  const normalized = sanitizeText(value, limit);
+  return normalized || null;
+};
+
+const toFiniteNumber = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeTenantScopeLevel = (value, fallback = 'city') => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return fallback;
+  return TENANT_SCOPE_LEVELS.has(normalized) ? normalized : fallback;
+};
+
+const TENANT_SCOPE_REQUIRED_FIELDS = {
+  country: ['countryName'],
+  state: ['countryName', 'stateName'],
+  district: ['countryName', 'stateName', 'districtName'],
+  city: ['countryName', 'stateName', 'cityName'],
+  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+};
+
+const assertTenantScopeLocationRequirements = ({ scopeLevel, locationNames = {} }) => {
+  const requiredFields = TENANT_SCOPE_REQUIRED_FIELDS[scopeLevel] || [];
+  for (const field of requiredFields) {
+    const value = String(locationNames[field] || '').trim();
+    if (!value) {
+      throw new AppError(
+        `${field} is required for ${scopeLevel}-level tenant scope`,
+        400,
+        { code: 'TENANT_SCOPE_LOCATION_REQUIRED' }
+      );
+    }
+  }
+};
+
+const normalizeGeographyLevel = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  return GEO_LEVEL_RANK.has(normalized) ? normalized : null;
+};
+
+const toSlugToken = (value, limit = 120) =>
+  String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, Math.max(8, limit));
+
+const buildTenantCodeCandidate = (rawCode, tenantName) => {
+  const fromCode = toSlugToken(rawCode || '', 120);
+  if (fromCode) return fromCode;
+  const base = toSlugToken(tenantName || 'TENANT', 100) || 'TENANT';
+  return `${base}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+};
+
+const buildGeographyCodeCandidate = ({ rawCode, name, level }) => {
+  const fromCode = toSlugToken(rawCode || '', 120);
+  if (fromCode) return fromCode;
+  const baseName = toSlugToken(name || level || 'GEO', 80) || 'GEO';
+  return `${baseName}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+};
+
+const resolveUniqueGeographyCode = async ({
+  tenantId,
+  level,
+  rawCode,
+  name,
+  excludeId = null,
+}) => {
+  let candidate = buildGeographyCodeCandidate({ rawCode, name, level });
+  let attempt = 0;
+  while (attempt < 20) {
+    const duplicate = await Geography.findOne({
+      where: {
+        tenant_id: tenantId,
+        level,
+        code: { [Op.iLike]: candidate },
+        ...(excludeId ? { id: { [Op.ne]: excludeId } } : {}),
+      },
+      attributes: ['id'],
+    });
+    if (!duplicate) return candidate;
+    const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+    candidate = `${candidate.slice(0, 110)}-${suffix}`.slice(0, 120);
+    attempt += 1;
+  }
+  throw new AppError('Unable to generate unique geography code', 409, {
+    code: 'GEOGRAPHY_CODE_EXISTS',
+  });
+};
+
+const resolveUniqueTenantCode = async ({ rawCode, tenantName, excludeTenantId = null }) => {
+  let candidate = buildTenantCodeCandidate(rawCode, tenantName);
+  let attempt = 0;
+  while (attempt < 20) {
+    const duplicate = await Tenant.findOne({
+      where: {
+        code: { [Op.iLike]: candidate },
+        ...(excludeTenantId ? { id: { [Op.ne]: excludeTenantId } } : {}),
+      },
+      attributes: ['id'],
+    });
+    if (!duplicate) return candidate;
+    const base = candidate.replace(/-[A-Z0-9]{4}$/, '');
+    const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    candidate = `${base}-${suffix}`.slice(0, 120);
+    attempt += 1;
+  }
+  throw new AppError('Unable to generate unique tenant code', 409, {
+    code: 'TENANT_CODE_EXISTS',
+  });
+};
+
+const mapTenantRow = (tenant) => ({
+  id: tenant.id,
+  name: tenant.name,
+  code: tenant.code,
+  status: tenant.status,
+  countryCode: tenant.country_code || null,
+  contactName: tenant.contact_name || null,
+  contactEmail: tenant.contact_email || null,
+  contactMobile: tenant.contact_mobile || null,
+  scopeLevel: tenant.scope_level || 'city',
+  countryName: tenant.country_name || null,
+  stateName: tenant.state_name || null,
+  districtName: tenant.district_name || null,
+  cityName: tenant.city_name || null,
+  zoneName: tenant.zone_name || null,
+  addressLine: tenant.address_line || null,
+  rootGeographyId: tenant.root_geography_id || null,
+  metadata: tenant.metadata || null,
+});
+
+const buildUserLocationFromTenant = (tenant) => ({
+  countryName: tenant?.country_name || null,
+  stateName: tenant?.state_name || null,
+  districtName: tenant?.district_name || null,
+  cityName: tenant?.city_name || null,
+  zoneName: tenant?.zone_name || null,
+});
+
+const parseBounds = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const north = toFiniteNumber(value.north);
+  const south = toFiniteNumber(value.south);
+  const east = toFiniteNumber(value.east);
+  const west = toFiniteNumber(value.west);
+  if ([north, south, east, west].some((item) => item === null)) return null;
+  return { north, south, east, west };
+};
+
+const pointsToBounds = (points = []) => {
+  if (!Array.isArray(points) || points.length === 0) return null;
+  const lats = points.map((point) => toFiniteNumber(point?.lat)).filter((value) => value !== null);
+  const lngs = points.map((point) => toFiniteNumber(point?.lng)).filter((value) => value !== null);
+  if (lats.length === 0 || lngs.length === 0) return null;
+  return {
+    north: Math.max(...lats),
+    south: Math.min(...lats),
+    east: Math.max(...lngs),
+    west: Math.min(...lngs),
+  };
+};
+
+const centroidFromPoints = (points = []) => {
+  if (!Array.isArray(points) || points.length === 0) return null;
+  const valid = points
+    .map((point) => ({ lat: toFiniteNumber(point?.lat), lng: toFiniteNumber(point?.lng) }))
+    .filter((point) => point.lat !== null && point.lng !== null);
+  if (valid.length === 0) return null;
+  const lat = valid.reduce((sum, point) => sum + point.lat, 0) / valid.length;
+  const lng = valid.reduce((sum, point) => sum + point.lng, 0) / valid.length;
+  return { latitude: lat, longitude: lng };
+};
+
+const areaSqKmFromPolygon = (points = []) => {
+  if (!Array.isArray(points) || points.length < 3) return null;
+  const valid = points
+    .map((point) => ({ lat: toFiniteNumber(point?.lat), lng: toFiniteNumber(point?.lng) }))
+    .filter((point) => point.lat !== null && point.lng !== null);
+  if (valid.length < 3) return null;
+  const avgLatRad =
+    (valid.reduce((sum, point) => sum + point.lat, 0) / valid.length) * (Math.PI / 180);
+  const kmPerDegLat = 110.574;
+  const kmPerDegLng = 111.32 * Math.cos(avgLatRad);
+  let twiceArea = 0;
+  for (let idx = 0; idx < valid.length; idx += 1) {
+    const current = valid[idx];
+    const next = valid[(idx + 1) % valid.length];
+    const x1 = current.lng * kmPerDegLng;
+    const y1 = current.lat * kmPerDegLat;
+    const x2 = next.lng * kmPerDegLng;
+    const y2 = next.lat * kmPerDegLat;
+    twiceArea += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(twiceArea / 2);
+};
+
+const polygonPointsFromGeoJson = (geojson) => {
+  if (!geojson || typeof geojson !== 'object') return [];
+  if (geojson.type !== 'Polygon' || !Array.isArray(geojson.coordinates)) return [];
+  const ring = Array.isArray(geojson.coordinates[0]) ? geojson.coordinates[0] : [];
+  return ring
+    .map((tuple) => {
+      if (!Array.isArray(tuple) || tuple.length < 2) return null;
+      const lng = toFiniteNumber(tuple[0]);
+      const lat = toFiniteNumber(tuple[1]);
+      if (lat === null || lng === null) return null;
+      return { lat, lng };
+    })
+    .filter(Boolean);
+};
+
+const deriveGeometryPayload = (body = {}) => {
+  const geometryType = String(body.geometryType || '').trim().toLowerCase() || null;
+  const geojson = body.geojson && typeof body.geojson === 'object' ? body.geojson : null;
+
+  let centroidLatitude = toFiniteNumber(body.centroidLatitude);
+  let centroidLongitude = toFiniteNumber(body.centroidLongitude);
+  let boundaryCenterLatitude = toFiniteNumber(body.boundaryCenterLatitude);
+  let boundaryCenterLongitude = toFiniteNumber(body.boundaryCenterLongitude);
+  let boundaryRadiusMeters = toFiniteNumber(body.boundaryRadiusMeters);
+  let bounds = parseBounds(body.bounds);
+  let areaSqKm = toFiniteNumber(body.areaSqKm);
+
+  if (geometryType === 'polygon' && geojson) {
+    const points = polygonPointsFromGeoJson(geojson);
+    const boundsFromPolygon = pointsToBounds(points);
+    const centroid = centroidFromPoints(points);
+    if (!bounds && boundsFromPolygon) {
+      bounds = boundsFromPolygon;
+    }
+    if ((centroidLatitude === null || centroidLongitude === null) && centroid) {
+      centroidLatitude = centroid.lat;
+      centroidLongitude = centroid.lng;
+    }
+    if ((boundaryCenterLatitude === null || boundaryCenterLongitude === null) && centroid) {
+      boundaryCenterLatitude = centroid.lat;
+      boundaryCenterLongitude = centroid.lng;
+    }
+    if (areaSqKm === null) {
+      areaSqKm = areaSqKmFromPolygon(points);
+    }
+  }
+
+  if (geometryType === 'circle') {
+    const centerLat = boundaryCenterLatitude ?? centroidLatitude;
+    const centerLng = boundaryCenterLongitude ?? centroidLongitude;
+    if (centerLat !== null && centerLng !== null) {
+      if (boundaryCenterLatitude === null) boundaryCenterLatitude = centerLat;
+      if (boundaryCenterLongitude === null) boundaryCenterLongitude = centerLng;
+      if (centroidLatitude === null) centroidLatitude = centerLat;
+      if (centroidLongitude === null) centroidLongitude = centerLng;
+      if (!bounds && boundaryRadiusMeters !== null) {
+        const latDelta = boundaryRadiusMeters / 111320;
+        const lngDelta =
+          boundaryRadiusMeters /
+          (111320 * Math.max(Math.cos((centerLat * Math.PI) / 180), 0.25));
+        bounds = {
+          north: centerLat + latDelta,
+          south: centerLat - latDelta,
+          east: centerLng + lngDelta,
+          west: centerLng - lngDelta,
+        };
+      }
+      if (areaSqKm === null && boundaryRadiusMeters !== null) {
+        areaSqKm = (Math.PI * boundaryRadiusMeters * boundaryRadiusMeters) / 1_000_000;
+      }
+    }
+  }
+
+  return {
+    geometryType,
+    geojson,
+    centroidLatitude,
+    centroidLongitude,
+    boundaryCenterLatitude,
+    boundaryCenterLongitude,
+    boundaryRadiusMeters,
+    bounds,
+    areaSqKm,
+    boundaryLabel: sanitizeOptionalText(body.boundaryLabel, 220),
+    isOperationalZone:
+      body.isOperationalZone !== undefined
+        ? Boolean(body.isOperationalZone)
+        : undefined,
+  };
+};
+
+const ensureParentHierarchyIsValid = ({ parentLevel, childLevel }) => {
+  if (!parentLevel || !childLevel) return true;
+  const parentRank = GEO_LEVEL_RANK.get(parentLevel);
+  const childRank = GEO_LEVEL_RANK.get(childLevel);
+  if (parentRank === undefined || childRank === undefined) return true;
+  return childRank > parentRank;
+};
+
+const boundsOverlap = (left, right) => {
+  if (!left || !right) return false;
+  return !(
+    Number(left.west) > Number(right.east) ||
+    Number(left.east) < Number(right.west) ||
+    Number(left.south) > Number(right.north) ||
+    Number(left.north) < Number(right.south)
+  );
+};
+
+const assertNoBoundaryConflict = async ({
+  tenantId,
+  level,
+  parentId = null,
+  bounds = null,
+  excludeId = null,
+}) => {
+  if (!tenantId || !bounds || !['zone', 'ward'].includes(String(level || '').toLowerCase())) {
+    return;
+  }
+  const rows = await Geography.findAll({
+    where: {
+      tenant_id: tenantId,
+      level,
+      parent_id: parentId || null,
+      ...(excludeId ? { id: { [Op.ne]: excludeId } } : {}),
+    },
+    attributes: ['id', 'bounds'],
+  });
+
+  const conflict = rows.find((row) => boundsOverlap(row.bounds, bounds));
+  if (conflict) {
+    throw new AppError('Boundary overlaps with an existing zone/ward in the same scope', 409, {
+      code: 'GEOGRAPHY_BOUNDARY_CONFLICT',
+    });
+  }
 };
 
 const normalizePermanentQrCode = (value) => {
@@ -927,7 +1291,7 @@ const resolveAssignmentAuthorization = async ({ req, row }) => {
         String(assignment.facility_id || '').trim() === facilityId
       );
     }
-    if (level === 'geography') {
+    if (GEOGRAPHY_ASSIGNMENT_LEVELS.has(level)) {
       return (
         geographyId &&
         String(assignment.geography_id || '').trim() === geographyId
@@ -1384,13 +1748,7 @@ const listTenants = async (req) => {
     where,
     order: [['name', 'ASC']],
   });
-  return tenants.map((tenant) => ({
-    id: tenant.id,
-    name: tenant.name,
-    code: tenant.code,
-    status: tenant.status,
-    countryCode: tenant.country_code,
-  }));
+  return tenants.map((tenant) => mapTenantRow(tenant));
 };
 
 const createTenant = async (req) => {
@@ -1399,11 +1757,43 @@ const createTenant = async (req) => {
       code: 'SCOPE_FORBIDDEN',
     });
   }
+  const tenantName = sanitizeText(req.body.name, 200);
+  const tenantCode = await resolveUniqueTenantCode({
+    rawCode: req.body.code,
+    tenantName,
+  });
+  const scopeLevel = normalizeTenantScopeLevel(req.body.scopeLevel, 'city');
+  const countryName = sanitizeOptionalText(req.body.countryName, 120);
+  const stateName = sanitizeOptionalText(req.body.stateName, 120);
+  const districtName = sanitizeOptionalText(req.body.districtName, 120);
+  const cityName = sanitizeOptionalText(req.body.cityName, 120);
+  const zoneName = sanitizeOptionalText(req.body.zoneName, 120);
+  assertTenantScopeLocationRequirements({
+    scopeLevel,
+    locationNames: {
+      countryName,
+      stateName,
+      districtName,
+      cityName,
+      zoneName,
+    },
+  });
   const tenant = await Tenant.create({
-    name: sanitizeText(req.body.name, 200),
-    code: sanitizeText(req.body.code, 120),
+    name: tenantName,
+    code: tenantCode,
     status: req.body.status || 'active',
-    country_code: req.body.countryCode || null,
+    country_code: sanitizeOptionalText(req.body.countryCode, 10),
+    contact_name: sanitizeOptionalText(req.body.contactName, 180),
+    contact_email: sanitizeOptionalText(req.body.contactEmail, 180),
+    contact_mobile: sanitizeOptionalText(req.body.contactMobile, 32),
+    scope_level: scopeLevel,
+    country_name: countryName,
+    state_name: stateName,
+    district_name: districtName,
+    city_name: cityName,
+    zone_name: zoneName,
+    address_line: sanitizeOptionalText(req.body.addressLine, 300),
+    root_geography_id: req.body.rootGeographyId || null,
     metadata: req.body.metadata || null,
   });
   await createAuditLog({
@@ -1413,7 +1803,7 @@ const createTenant = async (req) => {
     entityId: tenant.id,
     tenantId: tenant.id,
   });
-  return tenant;
+  return mapTenantRow(tenant);
 };
 
 const patchTenant = async (req) => {
@@ -1426,10 +1816,90 @@ const patchTenant = async (req) => {
   if (!tenant) {
     throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
   }
+  if (req.body.rootGeographyId) {
+    const rootGeo = await Geography.findByPk(req.body.rootGeographyId);
+    if (!rootGeo || rootGeo.tenant_id !== tenant.id) {
+      throw new AppError('rootGeographyId is outside tenant scope', 400, {
+        code: 'GEOGRAPHY_SCOPE_INVALID',
+      });
+    }
+  }
+  const nextScopeLevel =
+    req.body.scopeLevel !== undefined
+      ? normalizeTenantScopeLevel(req.body.scopeLevel, tenant.scope_level || 'city')
+      : tenant.scope_level;
+  const nextCountryName =
+    req.body.countryName !== undefined
+      ? sanitizeOptionalText(req.body.countryName, 120)
+      : tenant.country_name;
+  const nextStateName =
+    req.body.stateName !== undefined
+      ? sanitizeOptionalText(req.body.stateName, 120)
+      : tenant.state_name;
+  const nextDistrictName =
+    req.body.districtName !== undefined
+      ? sanitizeOptionalText(req.body.districtName, 120)
+      : tenant.district_name;
+  const nextCityName =
+    req.body.cityName !== undefined
+      ? sanitizeOptionalText(req.body.cityName, 120)
+      : tenant.city_name;
+  const nextZoneName =
+    req.body.zoneName !== undefined
+      ? sanitizeOptionalText(req.body.zoneName, 120)
+      : tenant.zone_name;
+  assertTenantScopeLocationRequirements({
+    scopeLevel: nextScopeLevel,
+    locationNames: {
+      countryName: nextCountryName,
+      stateName: nextStateName,
+      districtName: nextDistrictName,
+      cityName: nextCityName,
+      zoneName: nextZoneName,
+    },
+  });
+
   await tenant.update({
     name: req.body.name ? sanitizeText(req.body.name, 200) : tenant.name,
+    code:
+      req.body.code && String(req.body.code).trim()
+        ? await resolveUniqueTenantCode({
+            rawCode: req.body.code,
+            tenantName: req.body.name || tenant.name,
+            excludeTenantId: tenant.id,
+          })
+        : tenant.code,
     status: req.body.status || tenant.status,
-    country_code: req.body.countryCode || tenant.country_code,
+    country_code:
+      req.body.countryCode !== undefined
+        ? sanitizeOptionalText(req.body.countryCode, 10)
+        : tenant.country_code,
+    contact_name:
+      req.body.contactName !== undefined
+        ? sanitizeOptionalText(req.body.contactName, 180)
+        : tenant.contact_name,
+    contact_email:
+      req.body.contactEmail !== undefined
+        ? sanitizeOptionalText(req.body.contactEmail, 180)
+        : tenant.contact_email,
+    contact_mobile:
+      req.body.contactMobile !== undefined
+        ? sanitizeOptionalText(req.body.contactMobile, 32)
+        : tenant.contact_mobile,
+    scope_level: nextScopeLevel,
+    country_name: nextCountryName,
+    state_name: nextStateName,
+    district_name: nextDistrictName,
+    city_name: nextCityName,
+    zone_name: nextZoneName,
+    address_line:
+      req.body.addressLine !== undefined
+        ? sanitizeOptionalText(req.body.addressLine, 300)
+        : tenant.address_line,
+    root_geography_id:
+      req.body.rootGeographyId !== undefined
+        ? req.body.rootGeographyId || null
+        : tenant.root_geography_id,
     metadata: req.body.metadata ?? tenant.metadata,
     updated_at: new Date(),
   });
@@ -1440,7 +1910,7 @@ const patchTenant = async (req) => {
     entityId: tenant.id,
     tenantId: tenant.id,
   });
-  return tenant;
+  return mapTenantRow(tenant);
 };
 
 const buildGeographyTree = (rows) => {
@@ -1456,6 +1926,29 @@ const buildGeographyTree = (rows) => {
   return roots;
 };
 
+const mapGeographyRow = (row) => ({
+  id: row.id,
+  parentId: row.parent_id,
+  tenantId: row.tenant_id,
+  level: row.level,
+  code: row.code,
+  name: row.name,
+  centroidLatitude: row.centroid_latitude !== null ? Number(row.centroid_latitude) : null,
+  centroidLongitude: row.centroid_longitude !== null ? Number(row.centroid_longitude) : null,
+  geometryType: row.geometry_type || null,
+  geojson: row.geojson || null,
+  boundaryCenterLatitude:
+    row.boundary_center_latitude !== null ? Number(row.boundary_center_latitude) : null,
+  boundaryCenterLongitude:
+    row.boundary_center_longitude !== null ? Number(row.boundary_center_longitude) : null,
+  boundaryRadiusMeters:
+    row.boundary_radius_meters !== null ? Number(row.boundary_radius_meters) : null,
+  bounds: row.bounds || null,
+  areaSqKm: row.area_sq_km !== null ? Number(row.area_sq_km) : null,
+  boundaryLabel: row.boundary_label || null,
+  isOperationalZone: Boolean(row.is_operational_zone),
+});
+
 const listGeographyTree = async (req) => {
   const tenantId = tenantScope(req, req.query.tenantId);
   let where = tenantId ? { tenant_id: tenantId } : {};
@@ -1464,15 +1957,35 @@ const listGeographyTree = async (req) => {
     where,
     order: [['level', 'ASC'], ['name', 'ASC']],
   });
-  const mapped = rows.map((row) => ({
-    id: row.id,
-    parentId: row.parent_id,
-    tenantId: row.tenant_id,
-    level: row.level,
-    code: row.code,
-    name: row.name,
-  }));
+  const mapped = rows.map((row) => mapGeographyRow(row));
   return buildGeographyTree(mapped);
+};
+
+const listGeographyOptions = async (req) => {
+  const tenantId = tenantScope(req, req.query.tenantId);
+  let where = tenantId ? { tenant_id: tenantId } : {};
+  where = withGeographyScope(req, where);
+
+  const level = normalizeGeographyLevel(req.query.level);
+  if (level) {
+    where.level = level;
+  }
+  if (req.query.parentId !== undefined) {
+    where.parent_id = req.query.parentId || null;
+  }
+  if (req.query.search) {
+    const q = sanitizeText(req.query.search, 120);
+    where[Op.or] = [{ name: { [Op.iLike]: `%${q}%` } }, { code: { [Op.iLike]: `%${q}%` } }];
+  }
+
+  const rows = await Geography.findAll({
+    where,
+    order: [
+      ['level', 'ASC'],
+      ['name', 'ASC'],
+    ],
+  });
+  return rows.map((row) => mapGeographyRow(row));
 };
 
 const createGeography = async (req) => {
@@ -1480,17 +1993,63 @@ const createGeography = async (req) => {
   if (!tenantId) {
     throw new AppError('tenantId is required', 400, { code: 'TENANT_REQUIRED' });
   }
-  if (req.body.parentId && !isGeographyInScope(req, req.body.parentId)) {
-    throw new AppError('parentId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  const level = normalizeGeographyLevel(req.body.level);
+  if (!level) {
+    throw new AppError('Invalid geography level', 400, { code: 'GEOGRAPHY_LEVEL_INVALID' });
   }
+
+  let parent = null;
+  if (req.body.parentId) {
+    if (!isGeographyInScope(req, req.body.parentId)) {
+      throw new AppError('parentId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    parent = await Geography.findByPk(req.body.parentId);
+    if (!parent || parent.tenant_id !== tenantId) {
+      throw new AppError('parentId is outside tenant scope', 400, {
+        code: 'GEOGRAPHY_SCOPE_INVALID',
+      });
+    }
+    if (!ensureParentHierarchyIsValid({ parentLevel: parent.level, childLevel: level })) {
+      throw new AppError('Geography level must be deeper than parent level', 400, {
+        code: 'GEOGRAPHY_HIERARCHY_INVALID',
+      });
+    }
+  }
+
+  const geometryPayload = deriveGeometryPayload(req.body);
+  await assertNoBoundaryConflict({
+    tenantId,
+    level,
+    parentId: req.body.parentId || null,
+    bounds: geometryPayload.bounds,
+  });
+
+  const code = await resolveUniqueGeographyCode({
+    tenantId,
+    level,
+    rawCode: req.body.code,
+    name: req.body.name,
+  });
   const row = await Geography.create({
     tenant_id: tenantId,
     parent_id: req.body.parentId || null,
-    level: req.body.level,
-    code: sanitizeText(req.body.code, 120),
+    level,
+    code,
     name: sanitizeText(req.body.name, 200),
-    centroid_latitude: req.body.centroidLatitude ?? null,
-    centroid_longitude: req.body.centroidLongitude ?? null,
+    centroid_latitude: geometryPayload.centroidLatitude,
+    centroid_longitude: geometryPayload.centroidLongitude,
+    geometry_type: geometryPayload.geometryType,
+    geojson: geometryPayload.geojson,
+    boundary_center_latitude: geometryPayload.boundaryCenterLatitude,
+    boundary_center_longitude: geometryPayload.boundaryCenterLongitude,
+    boundary_radius_meters: geometryPayload.boundaryRadiusMeters,
+    bounds: geometryPayload.bounds,
+    area_sq_km: geometryPayload.areaSqKm,
+    boundary_label: geometryPayload.boundaryLabel,
+    is_operational_zone:
+      geometryPayload.isOperationalZone !== undefined
+        ? geometryPayload.isOperationalZone
+        : level === 'zone' || level === 'ward',
   });
   await createAuditLog({
     req,
@@ -1499,8 +2058,209 @@ const createGeography = async (req) => {
     entityId: row.id,
     tenantId,
   });
-  return row;
+  return mapGeographyRow(row);
 };
+
+const patchGeography = async (req) => {
+  const row = await Geography.findByPk(req.params.id);
+  if (!row) {
+    throw new AppError('Geography not found', 404, { code: 'GEOGRAPHY_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && req.user.tenantId !== row.tenant_id) {
+    throw new AppError('Geography out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isGeographyInScope(req, row.id)) {
+    throw new AppError('Geography out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  const nextLevel = req.body.level ? normalizeGeographyLevel(req.body.level) : row.level;
+  if (!nextLevel) {
+    throw new AppError('Invalid geography level', 400, { code: 'GEOGRAPHY_LEVEL_INVALID' });
+  }
+  const nextParentId =
+    req.body.parentId !== undefined ? req.body.parentId || null : row.parent_id || null;
+
+  let parent = null;
+  if (nextParentId) {
+    parent = await Geography.findByPk(nextParentId);
+    if (!parent || parent.tenant_id !== row.tenant_id) {
+      throw new AppError('parentId is outside tenant scope', 400, {
+        code: 'GEOGRAPHY_SCOPE_INVALID',
+      });
+    }
+    if (!ensureParentHierarchyIsValid({ parentLevel: parent.level, childLevel: nextLevel })) {
+      throw new AppError('Geography level must be deeper than parent level', 400, {
+        code: 'GEOGRAPHY_HIERARCHY_INVALID',
+      });
+    }
+  }
+
+  const geometryPayload = deriveGeometryPayload({
+    ...mapGeographyRow(row),
+    ...req.body,
+  });
+  await assertNoBoundaryConflict({
+    tenantId: row.tenant_id,
+    level: nextLevel,
+    parentId: nextParentId,
+    bounds: geometryPayload.bounds,
+    excludeId: row.id,
+  });
+
+  const code =
+    req.body.code !== undefined || req.body.name !== undefined || req.body.level !== undefined
+      ? await resolveUniqueGeographyCode({
+          tenantId: row.tenant_id,
+          level: nextLevel,
+          rawCode: req.body.code || row.code,
+          name: req.body.name || row.name,
+          excludeId: row.id,
+        })
+      : row.code;
+
+  await row.update({
+    parent_id: nextParentId,
+    level: nextLevel,
+    code,
+    name: req.body.name ? sanitizeText(req.body.name, 200) : row.name,
+    centroid_latitude: geometryPayload.centroidLatitude,
+    centroid_longitude: geometryPayload.centroidLongitude,
+    geometry_type: geometryPayload.geometryType,
+    geojson: geometryPayload.geojson,
+    boundary_center_latitude: geometryPayload.boundaryCenterLatitude,
+    boundary_center_longitude: geometryPayload.boundaryCenterLongitude,
+    boundary_radius_meters: geometryPayload.boundaryRadiusMeters,
+    bounds: geometryPayload.bounds,
+    area_sq_km: geometryPayload.areaSqKm,
+    boundary_label: geometryPayload.boundaryLabel,
+    is_operational_zone:
+      geometryPayload.isOperationalZone !== undefined
+        ? geometryPayload.isOperationalZone
+        : row.is_operational_zone,
+    updated_at: new Date(),
+  });
+
+  await createAuditLog({
+    req,
+    action: 'geography.update',
+    entityType: 'geography',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+  });
+  return mapGeographyRow(row);
+};
+
+const removeGeography = async (req) => {
+  const row = await Geography.findByPk(req.params.id);
+  if (!row) {
+    throw new AppError('Geography not found', 404, { code: 'GEOGRAPHY_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && req.user.tenantId !== row.tenant_id) {
+    throw new AppError('Geography out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isGeographyInScope(req, row.id)) {
+    throw new AppError('Geography out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  const [childrenCount, facilitiesCount] = await Promise.all([
+    Geography.count({ where: { parent_id: row.id } }),
+    Facility.count({
+      where: {
+        [Op.or]: [
+          { geography_id: row.id },
+          { zone_geography_id: row.id },
+          { ward_geography_id: row.id },
+        ],
+      },
+    }),
+  ]);
+
+  if (childrenCount > 0) {
+    throw new AppError('Cannot delete geography with child geographies', 409, {
+      code: 'GEOGRAPHY_HAS_CHILDREN',
+    });
+  }
+  if (facilitiesCount > 0) {
+    throw new AppError('Cannot delete geography mapped to facilities', 409, {
+      code: 'GEOGRAPHY_HAS_FACILITIES',
+    });
+  }
+
+  await row.destroy();
+  await createAuditLog({
+    req,
+    action: 'geography.delete',
+    entityType: 'geography',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+  });
+  return { id: row.id, deleted: true };
+};
+
+const ensureScopedGeographyInTenant = async ({
+  req,
+  geographyId,
+  tenantId,
+  field = 'geographyId',
+}) => {
+  if (!geographyId) return null;
+  if (!isGeographyInScope(req, geographyId)) {
+    throw new AppError(`${field} is outside scope`, 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  const geography = await Geography.findByPk(geographyId);
+  if (!geography || geography.tenant_id !== tenantId) {
+    throw new AppError(`${field} is outside tenant scope`, 400, {
+      code: 'GEOGRAPHY_SCOPE_INVALID',
+    });
+  }
+  return geography;
+};
+
+const ensureSupervisorForTenant = async ({ supervisorUserId, tenantId }) => {
+  if (!supervisorUserId) return null;
+  const supervisor = await PlatformUser.findByPk(supervisorUserId, {
+    include: [
+      {
+        model: Role,
+        attributes: ['code'],
+        through: { attributes: [] },
+        required: false,
+      },
+    ],
+  });
+  if (!supervisor || supervisor.tenant_id !== tenantId) {
+    throw new AppError('supervisorUserId is outside tenant scope', 400, {
+      code: 'SUPERVISOR_SCOPE_INVALID',
+    });
+  }
+  const roleCodes = new Set((supervisor.Roles || []).map((role) => String(role.code || '').toLowerCase()));
+  if (!roleCodes.has('supervisor')) {
+    throw new AppError('Selected supervisorUserId does not belong to supervisor role', 400, {
+      code: 'SUPERVISOR_ROLE_REQUIRED',
+    });
+  }
+  return supervisor;
+};
+
+const mapFacilityRow = (row) => ({
+  id: row.id,
+  tenantId: row.tenant_id,
+  geographyId: row.geography_id,
+  zoneGeographyId: row.zone_geography_id || null,
+  wardGeographyId: row.ward_geography_id || null,
+  supervisorUserId: row.supervisor_user_id || null,
+  supervisorName: row.supervisor?.full_name || null,
+  zoneName: row.zone?.name || null,
+  wardName: row.ward?.name || null,
+  code: row.code,
+  name: row.name,
+  facilityType: row.facility_type,
+  addressLine: row.address_line,
+  latitude: row.latitude !== null ? Number(row.latitude) : null,
+  longitude: row.longitude !== null ? Number(row.longitude) : null,
+  status: row.status,
+  metadata: row.metadata || null,
+});
 
 const listFacilities = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
@@ -1517,34 +2277,39 @@ const listFacilities = async (req) => {
     }
     where.geography_id = req.query.geographyId;
   }
+  if (req.query.zoneGeographyId) {
+    if (!isGeographyInScope(req, req.query.zoneGeographyId)) {
+      throw new AppError('zoneGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.zone_geography_id = req.query.zoneGeographyId;
+  }
+  if (req.query.wardGeographyId) {
+    if (!isGeographyInScope(req, req.query.wardGeographyId)) {
+      throw new AppError('wardGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.ward_geography_id = req.query.wardGeographyId;
+  }
+  if (req.query.supervisorUserId) {
+    where.supervisor_user_id = req.query.supervisorUserId;
+  }
   if (req.query.search) {
     const q = sanitizeText(req.query.search, 120);
-    where[Op.or] = [
-      { name: { [Op.iLike]: `%${q}%` } },
-      { code: { [Op.iLike]: `%${q}%` } },
-    ];
+    where[Op.or] = [{ name: { [Op.iLike]: `%${q}%` } }, { code: { [Op.iLike]: `%${q}%` } }];
   }
 
   const { rows, count } = await Facility.findAndCountAll({
     where,
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+      { model: PlatformUser, as: 'supervisor', attributes: ['id', 'full_name'], required: false },
+    ],
     order: [['name', 'ASC']],
     limit,
     offset,
   });
   return {
-    items: rows.map((row) => ({
-      id: row.id,
-      tenantId: row.tenant_id,
-      geographyId: row.geography_id,
-      code: row.code,
-      name: row.name,
-      facilityType: row.facility_type,
-      addressLine: row.address_line,
-      latitude: row.latitude,
-      longitude: row.longitude,
-      status: row.status,
-      metadata: row.metadata,
-    })),
+    items: rows.map((row) => mapFacilityRow(row)),
     meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
   };
 };
@@ -1554,18 +2319,42 @@ const createFacility = async (req) => {
   if (!tenantId) {
     throw new AppError('tenantId is required', 400, { code: 'TENANT_REQUIRED' });
   }
-  if (req.body.geographyId && !isGeographyInScope(req, req.body.geographyId)) {
-    throw new AppError('geographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
-  }
+
+  const geography = await ensureScopedGeographyInTenant({
+    req,
+    geographyId: req.body.geographyId || null,
+    tenantId,
+    field: 'geographyId',
+  });
+  const zone = await ensureScopedGeographyInTenant({
+    req,
+    geographyId: req.body.zoneGeographyId || null,
+    tenantId,
+    field: 'zoneGeographyId',
+  });
+  const ward = await ensureScopedGeographyInTenant({
+    req,
+    geographyId: req.body.wardGeographyId || null,
+    tenantId,
+    field: 'wardGeographyId',
+  });
+  const supervisor = await ensureSupervisorForTenant({
+    supervisorUserId: req.body.supervisorUserId || null,
+    tenantId,
+  });
+
   const facility = await Facility.create({
     tenant_id: tenantId,
-    geography_id: req.body.geographyId || null,
+    geography_id: geography?.id || ward?.id || zone?.id || null,
+    zone_geography_id: zone?.id || null,
+    ward_geography_id: ward?.id || null,
+    supervisor_user_id: supervisor?.id || null,
     code: sanitizeText(req.body.code, 120),
     name: sanitizeText(req.body.name, 220),
     facility_type: sanitizeText(req.body.facilityType, 80),
     address_line: req.body.addressLine ? sanitizeText(req.body.addressLine, 300) : null,
-    latitude: req.body.latitude ?? null,
-    longitude: req.body.longitude ?? null,
+    latitude: toFiniteNumber(req.body.latitude),
+    longitude: toFiniteNumber(req.body.longitude),
     status: req.body.status || 'active',
     metadata: req.body.metadata || null,
   });
@@ -1576,7 +2365,14 @@ const createFacility = async (req) => {
     entityId: facility.id,
     tenantId,
   });
-  return facility;
+  const payload = await Facility.findByPk(facility.id, {
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+      { model: PlatformUser, as: 'supervisor', attributes: ['id', 'full_name'], required: false },
+    ],
+  });
+  return mapFacilityRow(payload);
 };
 
 const patchFacility = async (req) => {
@@ -1590,16 +2386,63 @@ const patchFacility = async (req) => {
   if (!isFacilityInScope(req, facility.id)) {
     throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (req.body.geographyId && !isGeographyInScope(req, req.body.geographyId)) {
-    throw new AppError('geographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
-  }
+
+  const geography =
+    req.body.geographyId !== undefined
+      ? await ensureScopedGeographyInTenant({
+          req,
+          geographyId: req.body.geographyId || null,
+          tenantId: facility.tenant_id,
+          field: 'geographyId',
+        })
+      : null;
+  const zone =
+    req.body.zoneGeographyId !== undefined
+      ? await ensureScopedGeographyInTenant({
+          req,
+          geographyId: req.body.zoneGeographyId || null,
+          tenantId: facility.tenant_id,
+          field: 'zoneGeographyId',
+        })
+      : null;
+  const ward =
+    req.body.wardGeographyId !== undefined
+      ? await ensureScopedGeographyInTenant({
+          req,
+          geographyId: req.body.wardGeographyId || null,
+          tenantId: facility.tenant_id,
+          field: 'wardGeographyId',
+        })
+      : null;
+  const supervisor =
+    req.body.supervisorUserId !== undefined
+      ? await ensureSupervisorForTenant({
+          supervisorUserId: req.body.supervisorUserId || null,
+          tenantId: facility.tenant_id,
+        })
+      : null;
+
+  const nextGeographyId =
+    req.body.geographyId !== undefined
+      ? geography?.id || ward?.id || zone?.id || null
+      : facility.geography_id;
+
   await facility.update({
-    geography_id: req.body.geographyId ?? facility.geography_id,
+    geography_id: nextGeographyId,
+    zone_geography_id:
+      req.body.zoneGeographyId !== undefined ? zone?.id || null : facility.zone_geography_id,
+    ward_geography_id:
+      req.body.wardGeographyId !== undefined ? ward?.id || null : facility.ward_geography_id,
+    supervisor_user_id:
+      req.body.supervisorUserId !== undefined
+        ? supervisor?.id || null
+        : facility.supervisor_user_id,
     name: req.body.name ? sanitizeText(req.body.name, 220) : facility.name,
     facility_type: req.body.facilityType || facility.facility_type,
-    address_line: req.body.addressLine ?? facility.address_line,
-    latitude: req.body.latitude ?? facility.latitude,
-    longitude: req.body.longitude ?? facility.longitude,
+    address_line:
+      req.body.addressLine !== undefined ? sanitizeOptionalText(req.body.addressLine, 300) : facility.address_line,
+    latitude: req.body.latitude !== undefined ? toFiniteNumber(req.body.latitude) : facility.latitude,
+    longitude: req.body.longitude !== undefined ? toFiniteNumber(req.body.longitude) : facility.longitude,
     status: req.body.status || facility.status,
     metadata: req.body.metadata ?? facility.metadata,
     updated_at: new Date(),
@@ -1611,11 +2454,51 @@ const patchFacility = async (req) => {
     entityId: facility.id,
     tenantId: facility.tenant_id,
   });
-  return facility;
+  const payload = await Facility.findByPk(facility.id, {
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+      { model: PlatformUser, as: 'supervisor', attributes: ['id', 'full_name'], required: false },
+    ],
+  });
+  return mapFacilityRow(payload);
+};
+
+const removeFacility = async (req) => {
+  const facility = await Facility.findByPk(req.params.id);
+  if (!facility) {
+    throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && req.user.tenantId !== facility.tenant_id) {
+    throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  await facility.update({
+    status: 'inactive',
+    updated_at: new Date(),
+  });
+  await createAuditLog({
+    req,
+    action: 'facility.delete',
+    entityType: 'facility',
+    entityId: facility.id,
+    tenantId: facility.tenant_id,
+    details: { mode: 'soft_delete' },
+  });
+  return { id: facility.id, deleted: true, mode: 'soft_delete' };
 };
 
 const getFacilityById = async (req) => {
-  const facility = await Facility.findByPk(req.params.id);
+  const facility = await Facility.findByPk(req.params.id, {
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+      { model: PlatformUser, as: 'supervisor', attributes: ['id', 'full_name'], required: false },
+    ],
+  });
   if (!facility) {
     throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
   }
@@ -1636,6 +2519,12 @@ const getFacilityById = async (req) => {
     id: facility.id,
     tenantId: facility.tenant_id,
     geographyId: facility.geography_id,
+    zoneGeographyId: facility.zone_geography_id || null,
+    wardGeographyId: facility.ward_geography_id || null,
+    supervisorUserId: facility.supervisor_user_id || null,
+    supervisorName: facility.supervisor?.full_name || null,
+    zoneName: facility.zone?.name || null,
+    wardName: facility.ward?.name || null,
     code: facility.code,
     name: facility.name,
     facilityType: facility.facility_type,
@@ -2041,10 +2930,14 @@ module.exports = {
   createTenant,
   patchTenant,
   listGeographyTree,
+  listGeographyOptions,
   createGeography,
+  patchGeography,
+  removeGeography,
   listFacilities,
   createFacility,
   patchFacility,
+  removeFacility,
   getFacilityById,
   listBlocks,
   createBlock,

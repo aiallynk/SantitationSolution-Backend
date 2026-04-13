@@ -1,10 +1,28 @@
 const express = require('express');
 const dashboardController = require('./dashboard.controller');
-const { protect, requirePermissions } = require('../../core/middleware/auth');
+const {
+  protect,
+  requirePermissions,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
+} = require('../../core/middleware/auth');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
-router.use('/dashboard', protect, requirePermissions('dashboard.read'));
+router.use(
+  '/dashboard',
+  protect,
+  requireSurface(
+    SurfaceTypes.OPS_WEB,
+    SurfaceTypes.OPS_WEB_AND_MOBILE,
+    SurfaceTypes.MOBILE_ONLY,
+  ),
+  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requirePermissions('dashboard.read'),
+);
 
 router.get('/dashboard/overview', dashboardController.getOverview);
 router.get('/dashboard/map', dashboardController.getMap);

@@ -16,9 +16,16 @@ const {
   validateSubmitInspection,
   validateReviewInspection,
 } = require('./inspection.validator');
-const { protect, requirePermissions } = require('../../core/middleware/auth');
+const {
+  protect,
+  requirePermissions,
+  requireRouteKey,
+  requireScope,
+  requireSurface,
+} = require('../../core/middleware/auth');
 const { withIdempotency } = require('../../core/idempotency/idempotency.middleware');
 const { ingestionRateLimit } = require('../../core/security/rateLimit');
+const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
 
@@ -74,6 +81,15 @@ const upload = multer({
 });
 
 router.use(protect);
+router.use(
+  requireSurface(
+    SurfaceTypes.OPS_WEB,
+    SurfaceTypes.OPS_WEB_AND_MOBILE,
+    SurfaceTypes.MOBILE_ONLY,
+  ),
+  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+);
 
 router.post('/inspections', requirePermissions('inspection.create'), validate(validateCreateInspection), inspectionController.postInspection);
 router.post(

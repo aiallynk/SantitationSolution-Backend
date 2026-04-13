@@ -23,8 +23,8 @@ const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const {
-  applyTenantScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 const {
@@ -143,9 +143,10 @@ const isUniqueConstraintError = (error) => {
 };
 
 const scopedWhere = (req, where = {}) => {
-  let next = applyTenantScope(where, req);
-  next = applyFacilityScope(next, req);
-  return next;
+  return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'inspection', {
+    tenantKey: 'tenant_id',
+    facilityKey: 'facility_id',
+  });
 };
 
 const assertInspectionScope = (req, inspection) => {

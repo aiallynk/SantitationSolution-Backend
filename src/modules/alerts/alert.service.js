@@ -4,12 +4,19 @@ const { Alert } = require('../../models');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
-const { applyTenantScope, applyFacilityScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const {
+  buildAccessContextFromUser,
+  applyScopeToQuery,
+  isFacilityInScope,
+} = require('../../core/rbac/scopeWhere');
 
 const scopedWhere = (req) => {
-  let where = {};
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
+  const where = applyScopeToQuery(
+    {},
+    buildAccessContextFromUser(req?.user || {}),
+    'alert',
+    { tenantKey: 'tenant_id', facilityKey: 'facility_id' },
+  );
   if (req.query.status) where.status = req.query.status;
   if (req.query.severity) where.severity = req.query.severity;
   if (req.query.facilityId) {

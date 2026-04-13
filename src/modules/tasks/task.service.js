@@ -3,16 +3,18 @@ const AppError = require('../../core/errors/AppError');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const {
-  applyTenantScope,
-  applyFacilityScope,
+  buildAccessContextFromUser,
+  applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 
 const scopedWhere = (req, extra = {}) => {
-  let where = { ...extra };
-  where = applyTenantScope(where, req);
-  where = applyFacilityScope(where, req);
-  return where;
+  return applyScopeToQuery(
+    { ...extra },
+    buildAccessContextFromUser(req?.user || {}),
+    'task',
+    { tenantKey: 'tenant_id', facilityKey: 'facility_id' },
+  );
 };
 
 const hasPermission = (req, code) =>

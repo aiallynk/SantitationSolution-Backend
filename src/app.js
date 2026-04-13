@@ -100,6 +100,8 @@ app.use(
       'Idempotency-Key',
       'X-Requested-With',
       'X-Request-Id',
+      'X-Tenant-Id',
+      'x-tenant-id',
     ],
     exposedHeaders: ['X-Request-Id'],
     optionsSuccessStatus: 204,

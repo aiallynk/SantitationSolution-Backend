@@ -3,7 +3,7 @@ const { resolveMediaUrlForVision } = require('./analysisMediaResolver.service');
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
 const PROMPT_VERSION = 'sanitation-detection-v1';
-const SCORING_VERSION = 'sanitation-weighted-v1';
+const SCORING_VERSION = 'sanitation-weighted-v2';
 
 const DETECTION_PROMPT = `
 You are a sanitation inspection AI.
@@ -38,6 +38,11 @@ Then compute:
 - confidence_score (0-1)
 
 Rules:
+- Use the full 0-100 scale. Avoid defaulting to mid-range values.
+- 90-100: spotless and clearly well maintained.
+- 70-89: mostly clean with minor visible issues.
+- 40-69: noticeable dirt/stains/wetness or mixed condition.
+- 0-39: clearly unhygienic, heavy stains/waste/water problems.
 - If image is unclear, reduce confidence.
 - If toilet is not visible, return low confidence and explicit reason in explanation_summary.
 - Do NOT hallucinate.
@@ -470,21 +475,6 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
   });
   const detection = normalizeDetectionPayload(detectionPass.parsed);
 
-  if (!detection.toilet_detected) {
-    const reason = detection.reason || 'No toilet detected';
-    const error = new Error(reason);
-    error.code = 'NO_TOILET_DETECTED';
-    error.detection = detection;
-    throw error;
-  }
-  if (Number(detection.visibility_score || 0) < 0.4) {
-    const reason = detection.reason || 'Toilet visibility is too low';
-    const error = new Error(reason);
-    error.code = 'LOW_VISIBILITY';
-    error.detection = detection;
-    throw error;
-  }
-
   const scoringPass = await callOpenAiVisionJson({
     model,
     promptText: SCORING_PROMPT,
@@ -492,6 +482,44 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
     contextText,
   });
   const strictJson = normalizeScoringPayload(scoringPass.parsed);
+  const detectionWarnings = [];
+  const adjustedIssues = Array.isArray(strictJson.detected_issues)
+    ? [...strictJson.detected_issues]
+    : [];
+  let adjustedConfidence = Number(strictJson.confidence_score || 0);
+  let adjustedReviewRequired = Boolean(strictJson.human_review_required);
+
+  if (!detection.toilet_detected) {
+    adjustedConfidence = Math.min(adjustedConfidence, 0.32);
+    adjustedReviewRequired = true;
+    adjustedIssues.push('toilet_not_visible');
+    detectionWarnings.push(
+      String(detection.reason || 'Toilet/urinal not clearly detected').slice(0, 240)
+    );
+  }
+  if (Number(detection.visibility_score || 0) < 0.4) {
+    adjustedConfidence = Math.min(adjustedConfidence, 0.45);
+    adjustedReviewRequired = true;
+    adjustedIssues.push('low_visibility');
+    detectionWarnings.push('Low visibility detected in inspection image');
+  }
+  if (String(detection.scene_type || '').trim().toLowerCase() === 'unclear') {
+    adjustedConfidence = Math.min(adjustedConfidence, 0.5);
+    adjustedReviewRequired = true;
+    adjustedIssues.push('scene_unclear');
+    detectionWarnings.push('Scene classification is unclear');
+  }
+
+  const normalizedIssueTags = normalizeArray(adjustedIssues);
+  const resolvedExplanationText = [
+    String(strictJson.explanation_summary || '').trim(),
+    detectionWarnings.length > 0
+      ? `Detection notes: ${detectionWarnings.join('; ')}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' | ')
+    .slice(0, 1800);
 
   const odorRiskScore = clamp(
     Math.round(
@@ -526,14 +554,15 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
       wetness_concern: strictJson.water_stagnation >= 55,
       stain_concern: strictJson.stain_presence >= 55,
       litter_concern: strictJson.garbage_presence === true,
+      detection_uncertain: detectionWarnings.length > 0,
     },
-    confidenceScore: strictJson.confidence_score,
+    confidenceScore: Number(adjustedConfidence.toFixed(4)),
     explanationText:
-      strictJson.explanation_summary ||
-      (strictJson.detected_issues.length > 0
-        ? `Detected issues: ${strictJson.detected_issues.slice(0, 6).join(', ')}`
+      resolvedExplanationText ||
+      (normalizedIssueTags.length > 0
+        ? `Detected issues: ${normalizedIssueTags.slice(0, 6).join(', ')}`
         : 'No major issues detected'),
-    issueTags: strictJson.detected_issues,
+    issueTags: normalizedIssueTags,
     severityLabel: strictJson.severity_level,
     subScores: {
       floorCleanliness: strictJson.floor_cleanliness,
@@ -542,11 +571,18 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
       wastePresence: strictJson.garbage_presence ? 100 : 0,
       waterStagnation: strictJson.water_stagnation,
     },
-    reviewRequired: strictJson.human_review_required,
+    reviewRequired: adjustedReviewRequired,
     rawResult: {
       provider: 'openai',
-      strictJson,
+      strictJson: {
+        ...strictJson,
+        confidence_score: Number(adjustedConfidence.toFixed(4)),
+        human_review_required: adjustedReviewRequired,
+        detected_issues: normalizedIssueTags,
+        explanation_summary: resolvedExplanationText || strictJson.explanation_summary || null,
+      },
       detection,
+      detectionWarnings,
       promptVersion: PROMPT_VERSION,
       scoringVersion: SCORING_VERSION,
       responseIds: [detectionPass.responseId, scoringPass.responseId].filter(Boolean),

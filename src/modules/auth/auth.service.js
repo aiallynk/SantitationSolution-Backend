@@ -118,7 +118,6 @@ const resolveActiveTenantId = ({ user, requestedTenantId = null }) => {
 const deriveScopedAuth = (user, activeTenantId) => {
   const memberships = normalizeMemberships(user);
   const scopedRoles = [];
-  const permissionCodes = new Set();
 
   for (const role of user.Roles || []) {
     const roleCode = role.code;
@@ -132,16 +131,32 @@ const deriveScopedAuth = (user, activeTenantId) => {
     if (!inTenantScope) continue;
 
     scopedRoles.push(roleCode);
-    for (const permission of role.Permissions || []) {
-      permissionCodes.add(permission.code);
-    }
   }
 
   const roleCodes = unique(scopedRoles);
   const allRoleCodes = unique((user.Roles || []).map((role) => role.code));
   const isSuperAdmin = allRoleCodes.includes('super_admin');
+  const roleProfile = resolveRoleProfile({ roleCodes });
+  const permissionCodes = new Set(
+    Array.isArray(roleProfile.permissionCodes) ? roleProfile.permissionCodes : []
+  );
+
+  for (const role of user.Roles || []) {
+    const roleCode = role.code;
+    const roleTenantId = role?.UserRole?.tenant_id || user.tenant_id || null;
+    const isGlobalRole = GLOBAL_ROLE_CODES.has(roleCode);
+    const inTenantScope =
+      isGlobalRole ||
+      (activeTenantId ? roleTenantId === activeTenantId : roleTenantId == null);
+    if (!inTenantScope) continue;
+
+    for (const permission of role.Permissions || []) {
+      permissionCodes.add(permission.code);
+    }
+  }
 
   return {
+    primaryRoleCode: roleProfile.role || null,
     roleCodes,
     allRoleCodes,
     permissionCodes: [...permissionCodes],
@@ -157,15 +172,12 @@ const deriveScopedAuth = (user, activeTenantId) => {
 
 const mapUser = async ({ user, activeTenantId }) => {
   const scoped = deriveScopedAuth(user, activeTenantId);
-  const roleProfile = resolveRoleProfile({
-    role: scoped.roleCodes[0] || null,
-    roleCodes: scoped.roleCodes,
-  });
+  const roleProfile = resolveRoleProfile({ roleCodes: scoped.roleCodes });
   const activeAssignments = (Array.isArray(user.assignments) ? user.assignments : []).filter(
     (row) => row.status === 'active',
   );
   const scope = await resolveEffectiveScope({
-    roleCode: scoped.roleCodes[0] || null,
+    roleCode: roleProfile.role || null,
     roleProfile,
     memberships: scoped.activeMemberships,
     assignments: activeAssignments,
@@ -190,10 +202,16 @@ const mapUser = async ({ user, activeTenantId }) => {
     defaultTenantId: user.tenant_id,
     geographyId: user.geography_id,
     status: user.status,
+    role: roleProfile.role || null,
     roleCodes: scoped.roleCodes,
     allRoleCodes: scoped.allRoleCodes,
     permissions: scoped.permissionCodes,
     roleType: roleProfile.roleType,
+    personaFamily: roleProfile.personaFamily,
+    hierarchyLevel: roleProfile.hierarchyLevel,
+    surfaceType: roleProfile.surfaceType,
+    scopeType: roleProfile.scopeType,
+    managementLevel: roleProfile.managementLevel,
     scopeLevel: scope.scopeLevel,
     scopeId: scope.scopeId,
     scopeIds: scope.scopeIds,
@@ -204,9 +222,16 @@ const mapUser = async ({ user, activeTenantId }) => {
     organizationId: activeTenantId,
     allowedRoutes: roleProfile.allowedRoutes,
     allowedActions: roleProfile.allowedActions,
+    routeKeys: roleProfile.routeKeys,
+    actionKeys: roleProfile.actionKeys,
+    widgetKeys: roleProfile.widgetKeys,
+    allowedDataDomains: roleProfile.allowedDataDomains,
+    readOnly: Boolean(roleProfile.readOnly),
     defaultRoute: roleProfile.defaultRoute,
     webEnabled: roleProfile.webEnabled,
     mobileOnly: roleProfile.mobileOnly,
+    canAccessWeb: roleProfile.canAccessWeb,
+    canAccessMobile: roleProfile.canAccessMobile,
     tenantMemberships: scoped.memberships,
     activeMemberships: scoped.activeMemberships,
     activeTenant: user.Tenant
@@ -249,8 +274,13 @@ const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantI
     refreshToken,
     tokenType: 'Bearer',
     expiresAt: decodeTokenExpiry(accessToken)?.toISOString() || null,
-    role: mapped.roleCodes[0] || null,
+    role: mapped.role || null,
     roleType: mapped.roleType,
+    personaFamily: mapped.personaFamily,
+    hierarchyLevel: mapped.hierarchyLevel,
+    surfaceType: mapped.surfaceType,
+    scopeType: mapped.scopeType,
+    managementLevel: mapped.managementLevel,
     roleCodes: mapped.roleCodes,
     allRoleCodes: mapped.allRoleCodes,
     permissions: mapped.permissions,
@@ -262,9 +292,16 @@ const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantI
     organizationId: mapped.organizationId,
     allowedRoutes: mapped.allowedRoutes,
     allowedActions: mapped.allowedActions,
+    routeKeys: mapped.routeKeys,
+    actionKeys: mapped.actionKeys,
+    widgetKeys: mapped.widgetKeys,
+    allowedDataDomains: mapped.allowedDataDomains,
+    readOnly: mapped.readOnly,
     defaultRoute: mapped.defaultRoute,
     webEnabled: mapped.webEnabled,
     mobileOnly: mapped.mobileOnly,
+    canAccessWeb: mapped.canAccessWeb,
+    canAccessMobile: mapped.canAccessMobile,
     tenantMemberships: mapped.tenantMemberships,
     activeMemberships: mapped.activeMemberships,
     activeTenantId,

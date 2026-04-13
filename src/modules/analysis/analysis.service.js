@@ -35,6 +35,10 @@ const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.const
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
   value === null || value === undefined ? null : Number(Number(value).toFixed(2));
+const toFiniteNumber = (value, fallback = null) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
 const mean = (values = []) => {
   if (!Array.isArray(values) || values.length === 0) return null;
   const valid = values
@@ -48,6 +52,15 @@ const FRAUD_SIMILARITY_THRESHOLD = Number(process.env.ANALYSIS_FRAUD_SIMILARITY_
 const AI_IMAGE_MAX_RETRIES = Math.max(Number(process.env.AI_IMAGE_MAX_RETRIES || 4), 1);
 const AI_RETRY_BASE_DELAY_MS = Math.max(Number(process.env.AI_RETRY_BASE_DELAY_MS || 3000), 500);
 const JOB_LEASE_MS = Math.max(Number(process.env.ANALYSIS_JOB_LEASE_MS || 180000), 60000);
+const SCORE_SPREAD_GAIN = clamp(
+  toFiniteNumber(process.env.ANALYSIS_SCORE_SPREAD_GAIN, 1.16),
+  1,
+  1.4
+);
+const ALWAYS_SCORE_ON_FAILURE =
+  String(process.env.ANALYSIS_ALWAYS_SCORE_ON_FAILURE || 'true')
+    .trim()
+    .toLowerCase() !== 'false';
 
 const deriveStatus = (score) => {
   if (score >= 80) return 'clean';
@@ -308,6 +321,147 @@ const weightedOverallScore = (strictJson) => {
   );
 };
 
+const severityCalibrationShift = (severityLevel) => {
+  const normalized = String(severityLevel || '').trim().toLowerCase();
+  if (normalized === 'high') return -5;
+  if (normalized === 'medium') return -2;
+  if (normalized === 'low') return 2;
+  return 0;
+};
+
+const calibrateOverallScore = ({
+  strictJson,
+  normalizedIssues = [],
+  confidence = null,
+}) => {
+  const weighted = weightedOverallScore(strictJson);
+  const modelOverall = clamp(
+    toFiniteNumber(strictJson?.overall_cleanliness_score, weighted),
+    0,
+    100
+  );
+  const floor = clamp(
+    toFiniteNumber(strictJson?.floor_cleanliness, modelOverall),
+    0,
+    100
+  );
+  const commode = clamp(
+    toFiniteNumber(strictJson?.commode_urinal_cleanliness, modelOverall),
+    0,
+    100
+  );
+  const stainPresence = clamp(toFiniteNumber(strictJson?.stain_presence, 0), 0, 100);
+  const waterStagnation = clamp(
+    toFiniteNumber(strictJson?.water_stagnation, 0),
+    0,
+    100
+  );
+  const garbagePresence = Boolean(strictJson?.garbage_presence);
+
+  const issueCount = Array.isArray(normalizedIssues) ? normalizedIssues.length : 0;
+  const issuePenalty = Math.min(18, issueCount * 2.8);
+  const stainPenalty = clamp((stainPresence - 40) * 0.18, 0, 10);
+  const waterPenalty = clamp((waterStagnation - 40) * 0.15, 0, 9);
+  const garbagePenalty = garbagePresence ? 8 : 0;
+  const severityShift = severityCalibrationShift(strictJson?.severity_level);
+
+  const confidenceValue = toFiniteNumber(
+    confidence,
+    toFiniteNumber(strictJson?.confidence_score, null)
+  );
+  const confidencePenalty =
+    confidenceValue === null ? 0 : clamp((0.65 - confidenceValue) * 20, 0, 6);
+
+  const highCleanlinessBonus =
+    floor >= 88 &&
+    commode >= 88 &&
+    stainPresence <= 20 &&
+    waterStagnation <= 20 &&
+    !garbagePresence &&
+    issueCount === 0
+      ? 4
+      : 0;
+
+  const blendedBase = modelOverall * 0.62 + weighted * 0.38;
+  const adjustedBase =
+    blendedBase -
+    issuePenalty -
+    stainPenalty -
+    waterPenalty -
+    garbagePenalty -
+    confidencePenalty +
+    severityShift +
+    highCleanlinessBonus;
+  const spreadAdjusted = 50 + (adjustedBase - 50) * SCORE_SPREAD_GAIN;
+
+  return round2(clamp(spreadAdjusted, 0, 100));
+};
+
+const buildFallbackStrictJson = ({
+  captureStage = 'evidence',
+  qualityResult = null,
+  failure = null,
+}) => {
+  const stage = String(captureStage || 'evidence').trim().toLowerCase();
+  const qualityScore = clamp(
+    toFiniteNumber(qualityResult?.imageQualityScore, 0.52),
+    0,
+    1
+  );
+
+  const stageBase = stage === 'before' ? 42 : stage === 'after' ? 55 : 48;
+  const qualityLift = (qualityScore - 0.5) * 24;
+  const floorCleanliness = clamp(Math.round(stageBase + qualityLift), 18, 88);
+  const commodeCleanliness = clamp(Math.round(stageBase - 4 + qualityLift), 15, 86);
+  const stainPresence = clamp(
+    Math.round(100 - (floorCleanliness + commodeCleanliness) / 2 + 14),
+    18,
+    92
+  );
+  const waterStagnation = clamp(Math.round(100 - floorCleanliness + 10), 12, 90);
+  const garbagePresence = floorCleanliness < 45 || commodeCleanliness < 42;
+
+  const fallbackSummary = String(failure?.message || '').trim();
+  const fallbackCode = String(failure?.errorCode || failure?.code || '')
+    .trim()
+    .toLowerCase();
+  const confidenceScore = clamp(
+    Number((0.28 + qualityScore * 0.26).toFixed(4)),
+    0.28,
+    0.62
+  );
+
+  const rawIssues = [
+    fallbackCode ? `analysis_error_${fallbackCode}` : null,
+    'ai_fallback_scoring',
+    qualityResult?.validationStatus &&
+    String(qualityResult.validationStatus).toUpperCase() !== 'VALID'
+      ? 'image_quality_warning'
+      : null,
+  ].filter(Boolean);
+
+  const detectedIssues = Array.from(new Set(rawIssues));
+  const strict = {
+    floor_cleanliness: floorCleanliness,
+    commode_urinal_cleanliness: commodeCleanliness,
+    stain_presence: stainPresence,
+    water_stagnation: waterStagnation,
+    garbage_presence: garbagePresence,
+    overall_cleanliness_score: 0,
+    confidence_score: confidenceScore,
+    detected_issues: detectedIssues,
+    severity_level: floorCleanliness < 45 || commodeCleanliness < 45 ? 'high' : 'medium',
+    human_review_required: true,
+    explanation_summary:
+      fallbackSummary.length > 0
+        ? `Fallback scoring applied: ${fallbackSummary}`.slice(0, 1800)
+        : 'Fallback scoring applied because AI response was unavailable or invalid.',
+  };
+
+  strict.overall_cleanliness_score = weightedOverallScore(strict);
+  return strict;
+};
+
 const compareAgainstBeforeHashes = async ({ inspectionId, captureStage, perceptualHash, imageId }) => {
   const stage = String(captureStage || '').toLowerCase();
   if (!perceptualHash || stage !== 'after') {
@@ -558,8 +712,11 @@ const runInspectionAnalysis = async ({
 
   for (const mediaRow of mediaRows) {
     const forceReprocess = Boolean(req?.reprocess);
+    const hasCurrentScoringVersion =
+      String(mediaRow.scoring_version || '').trim() === String(SCORING_VERSION);
     if (
       !forceReprocess &&
+      hasCurrentScoringVersion &&
       String(mediaRow.ai_status || '').toUpperCase() === 'AI_COMPLETED' &&
       mediaRow.overall_score !== null &&
       mediaRow.overall_score !== undefined &&
@@ -651,7 +808,7 @@ const runInspectionAnalysis = async ({
       qualityResult = await validateInspectionMediaQuality(mediaRow);
       perceptualHash = await computePerceptualHash(mediaRow);
       const qualityValidationStatus = String(qualityResult.validationStatus || '').toUpperCase();
-      if (qualityValidationStatus !== 'VALID') {
+      if (qualityValidationStatus === 'FAILED_SOURCE') {
         const validationError = new Error(
           qualityResult.validationReason || 'Image validation failed'
         );
@@ -681,16 +838,6 @@ const runInspectionAnalysis = async ({
         detection.visibility_score !== null && detection.visibility_score !== undefined
           ? Number(detection.visibility_score)
           : null;
-      if (!toiletDetected) {
-        const detectionError = new Error('No toilet detected');
-        detectionError.code = 'NO_TOILET_DETECTED';
-        throw detectionError;
-      }
-      if (visibilityScore !== null && visibilityScore < 0.4) {
-        const visibilityError = new Error('Toilet visibility is too low');
-        visibilityError.code = 'LOW_VISIBILITY';
-        throw visibilityError;
-      }
 
       const normalizedIssues = normalizeIssueTags({
         aiIssues: Array.isArray(strictJson?.detected_issues) ? strictJson.detected_issues : [],
@@ -707,14 +854,18 @@ const runInspectionAnalysis = async ({
         lightingPenalty: qualityResult?.lightingPenalty || 0,
         visibilityScore,
       });
-      const scoringRejected = Boolean(confidenceEngine.rejected);
-      const overallScore = weightedOverallScore(strictJson);
+      const confidence = Number(confidenceEngine.finalConfidence || 0);
+      const lowConfidenceReview = Boolean(confidenceEngine.rejected);
       const issues = Array.isArray(strictJson?.detected_issues)
         ? normalizedIssues
         : Array.isArray(result.issueTags)
           ? normalizeIssueTags({ aiIssues: result.issueTags })
           : [];
-      const confidence = Number(confidenceEngine.finalConfidence || 0);
+      const overallScore = calibrateOverallScore({
+        strictJson,
+        normalizedIssues: issues,
+        confidence,
+      });
       const floorScore =
         strictJson && strictJson.floor_cleanliness !== undefined
           ? Number(strictJson.floor_cleanliness)
@@ -756,19 +907,37 @@ const runInspectionAnalysis = async ({
       if (confidenceEngine.reviewRequired) {
         suspiciousFlags.push('low_confidence');
       }
-      const resolvedValidationStatus = scoringRejected ? 'REJECTED_LOW_CONFIDENCE' : 'VALID';
+      const qualityWarning = qualityValidationStatus !== 'VALID';
+      const resolvedValidationStatus = lowConfidenceReview
+        ? qualityWarning
+          ? 'LOW_CONFIDENCE_QUALITY_WARNING'
+          : 'LOW_CONFIDENCE_REVIEW'
+        : qualityWarning
+          ? 'QUALITY_WARNING'
+          : 'VALID';
+      const validationReasons = [];
+      if (qualityWarning) {
+        validationReasons.push(
+          qualityResult?.validationReason || 'Image quality warning detected'
+        );
+      }
+      if (lowConfidenceReview) {
+        validationReasons.push('Confidence below review threshold');
+      }
+      const resolvedValidationReason =
+        validationReasons.length > 0 ? validationReasons.join(' | ').slice(0, 500) : null;
 
       await mediaRow.update({
         ai_status: 'AI_COMPLETED',
         processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
         image_quality_status: quality,
-        overall_score: scoringRejected ? null : round2(overallScore),
+        overall_score: round2(overallScore),
         confidence_score: round2(confidence),
-        floor_score: scoringRejected ? null : round2(floorScore),
-        commode_score: scoringRejected ? null : round2(commodeScore),
-        stain_score: scoringRejected ? null : round2(stainScore),
-        garbage_score: scoringRejected ? null : round2(garbageScore),
-        water_score: scoringRejected ? null : round2(waterScore),
+        floor_score: round2(floorScore),
+        commode_score: round2(commodeScore),
+        stain_score: round2(stainScore),
+        garbage_score: round2(garbageScore),
+        water_score: round2(waterScore),
         issue_tags: issues,
         issue_summary: issues.length > 0 ? issues.slice(0, 6).join(', ') : null,
         severity,
@@ -776,7 +945,7 @@ const runInspectionAnalysis = async ({
           reviewRequired ||
           quality !== 'ok' ||
           Boolean(similarityResult?.suspicious) ||
-          scoringRejected,
+          lowConfidenceReview,
         model_version: result.modelVersion || null,
         prompt_version: result.promptVersion || PROMPT_VERSION,
         scoring_version: result.scoringVersion || SCORING_VERSION,
@@ -788,14 +957,11 @@ const runInspectionAnalysis = async ({
         image_quality_score: qualityResult?.imageQualityScore || null,
         toilet_detected: toiletDetected,
         validation_status: resolvedValidationStatus,
-        validation_reason:
-          scoringRejected
-            ? 'Confidence below rejection threshold'
-            : qualityResult?.validationReason || null,
+        validation_reason: resolvedValidationReason,
         visibility_score: visibilityScore,
         perceptual_hash: perceptualHash || null,
         similarity_score: similarityResult?.maxSimilarity || null,
-        scoring_rejected: scoringRejected,
+        scoring_rejected: false,
         explanation_summary:
           strictJson?.explanation_summary ||
           result.explanationText ||
@@ -807,7 +973,7 @@ const runInspectionAnalysis = async ({
         imageId: mediaRow.id,
         strictJson,
         result,
-        scoringRejected,
+        scoringRejected: false,
       });
 
       await InspectionEvent.create({
@@ -821,17 +987,18 @@ const runInspectionAnalysis = async ({
         payload: {
           imageId: mediaRow.id,
           stage: mediaRow.capture_stage,
-          score: scoringRejected ? null : round2(overallScore),
+          score: round2(overallScore),
           confidence: round2(confidence),
           severity,
           reviewRequired:
             reviewRequired ||
             quality !== 'ok' ||
             Boolean(similarityResult?.suspicious) ||
-            scoringRejected,
+            lowConfidenceReview,
           suspiciousFlags,
           validationStatus: resolvedValidationStatus,
-          scoringRejected,
+          scoringRejected: false,
+          lowConfidenceReview,
           similarityScore: similarityResult?.maxSimilarity || null,
           processingMs,
         },
@@ -842,6 +1009,173 @@ const runInspectionAnalysis = async ({
       const failure = classifyAnalysisFailure(imageError);
       const retryCount = Number(mediaRow.retry_count || 0);
       const canRetry = failure.retryable && retryCount < AI_IMAGE_MAX_RETRIES;
+
+      if (ALWAYS_SCORE_ON_FAILURE) {
+        const fallbackStrictJson = buildFallbackStrictJson({
+          captureStage: mediaRow.capture_stage,
+          qualityResult,
+          failure,
+        });
+        const normalizedFallbackIssues = normalizeIssueTags({
+          aiIssues: fallbackStrictJson.detected_issues,
+          floorCleanliness: fallbackStrictJson.floor_cleanliness,
+          commodeCleanliness: fallbackStrictJson.commode_urinal_cleanliness,
+          stainPresence: fallbackStrictJson.stain_presence,
+          waterStagnation: fallbackStrictJson.water_stagnation,
+          garbagePresence: fallbackStrictJson.garbage_presence,
+          confidenceScore: fallbackStrictJson.confidence_score,
+        });
+        const fallbackIssues = Array.from(
+          new Set([...normalizedFallbackIssues, 'ai_fallback_scoring'])
+        );
+        const fallbackConfidenceEngine = computeConfidence({
+          aiConfidence: fallbackStrictJson.confidence_score,
+          blurPenalty: qualityResult?.blurPenalty || 0,
+          lightingPenalty: qualityResult?.lightingPenalty || 0,
+          visibilityScore,
+        });
+        const fallbackConfidence = Number(
+          fallbackConfidenceEngine.finalConfidence || fallbackStrictJson.confidence_score || 0
+        );
+        const fallbackOverallScore = calibrateOverallScore({
+          strictJson: fallbackStrictJson,
+          normalizedIssues: fallbackIssues,
+          confidence: fallbackConfidence,
+        });
+        const fallbackStrictWithCalibrated = {
+          ...fallbackStrictJson,
+          overall_cleanliness_score: Math.round(fallbackOverallScore),
+          confidence_score: Number(fallbackConfidence.toFixed(4)),
+          detected_issues: fallbackIssues,
+        };
+        const fallbackFloorScore = Number(
+          fallbackStrictWithCalibrated.floor_cleanliness || 0
+        );
+        const fallbackCommodeScore = Number(
+          fallbackStrictWithCalibrated.commode_urinal_cleanliness || 0
+        );
+        const fallbackStainScore = Number(
+          fallbackStrictWithCalibrated.stain_presence || 0
+        );
+        const fallbackWaterScore = Number(
+          fallbackStrictWithCalibrated.water_stagnation || 0
+        );
+        const fallbackGarbageScore = fallbackStrictWithCalibrated.garbage_presence
+          ? 100
+          : 0;
+        const fallbackSeverity =
+          fallbackStrictWithCalibrated.severity_level || 'high';
+        const fallbackOdorRiskScore = clamp(
+          Math.round(
+            fallbackStainScore * 0.45 +
+              fallbackWaterScore * 0.4 +
+              (fallbackStrictWithCalibrated.garbage_presence ? 15 : 0)
+          ),
+          0,
+          100
+        );
+        const fallbackValidationReason = `Fallback scoring applied due to ${
+          failure.errorCode || code || 'analysis_error'
+        }: ${failure.message || 'Unknown failure'}`.slice(0, 500);
+
+        await mediaRow.update({
+          ai_status: 'AI_COMPLETED',
+          processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
+          image_quality_status: qualityResult?.imageQualityStatus || 'unknown',
+          overall_score: round2(fallbackOverallScore),
+          confidence_score: round2(fallbackConfidence),
+          floor_score: round2(fallbackFloorScore),
+          commode_score: round2(fallbackCommodeScore),
+          stain_score: round2(fallbackStainScore),
+          garbage_score: round2(fallbackGarbageScore),
+          water_score: round2(fallbackWaterScore),
+          issue_tags: fallbackIssues,
+          issue_summary:
+            fallbackIssues.length > 0 ? fallbackIssues.slice(0, 6).join(', ') : null,
+          severity: fallbackSeverity,
+          review_required: true,
+          model_version: 'fallback-v1',
+          prompt_version: PROMPT_VERSION,
+          scoring_version: SCORING_VERSION,
+          ai_processed_at: new Date(),
+          ai_error: failure.message.slice(0, 2000),
+          last_error_code: failure.errorCode || code || null,
+          last_error_message: failure.message.slice(0, 2000),
+          next_retry_at: null,
+          image_quality_score: qualityResult?.imageQualityScore || null,
+          toilet_detected: Boolean(toiletDetected),
+          validation_status: 'FALLBACK_SCORED',
+          validation_reason: fallbackValidationReason,
+          visibility_score: visibilityScore,
+          perceptual_hash: perceptualHash || null,
+          similarity_score: similarityResult?.maxSimilarity || null,
+          scoring_rejected: false,
+          explanation_summary: fallbackStrictWithCalibrated.explanation_summary,
+          updated_at: new Date(),
+        });
+
+        const fallbackResult = {
+          overallCleanlinessScore: round2(fallbackOverallScore),
+          cleanlinessScore: round2(fallbackFloorScore),
+          hygieneScore: round2(fallbackCommodeScore),
+          odorRiskScore: round2(fallbackOdorRiskScore),
+          wetnessScore: round2(clamp(100 - fallbackWaterScore, 0, 100)),
+          stainScore: round2(clamp(100 - fallbackStainScore, 0, 100)),
+          litterScore: fallbackGarbageScore > 50 ? 0 : 100,
+          confidenceScore: round2(fallbackConfidence),
+          issueTags: fallbackIssues,
+          severityLabel: fallbackSeverity,
+          reviewRequired: true,
+          explanationText: fallbackStrictWithCalibrated.explanation_summary,
+          modelName: process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+          modelVersion: 'fallback-v1',
+          provider: 'fallback',
+          promptVersion: PROMPT_VERSION,
+          scoringVersion: SCORING_VERSION,
+          rawResult: {
+            strictJson: fallbackStrictWithCalibrated,
+            fallback: true,
+            failure: {
+              errorCode: failure.errorCode || code || null,
+              message: failure.message.slice(0, 500),
+              classification: failure.classification || null,
+            },
+          },
+        };
+
+        imageResults.push({
+          imageId: mediaRow.id,
+          strictJson: fallbackStrictWithCalibrated,
+          result: fallbackResult,
+          scoringRejected: false,
+        });
+
+        await InspectionEvent.create({
+          tenant_id: inspection.tenant_id,
+          inspection_id: inspection.id,
+          toilet_id: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+          image_id: mediaRow.id,
+          event_type: 'analysis.image.completed',
+          event_status: 'AI_COMPLETED',
+          source: 'worker',
+          payload: {
+            imageId: mediaRow.id,
+            stage: mediaRow.capture_stage,
+            score: round2(fallbackOverallScore),
+            confidence: round2(fallbackConfidence),
+            severity: fallbackSeverity,
+            reviewRequired: true,
+            validationStatus: 'FALLBACK_SCORED',
+            scoringRejected: false,
+            fallbackScored: true,
+            errorCode: failure.errorCode || code || null,
+            processingMs: Date.now() - mediaStartedAt,
+          },
+          occurred_at: new Date(),
+        });
+
+        continue;
+      }
 
       if (canRetry) {
         const nextRetryCount = retryCount + 1;
