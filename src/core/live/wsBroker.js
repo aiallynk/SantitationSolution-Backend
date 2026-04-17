@@ -1,5 +1,6 @@
 const { WebSocketServer } = require('ws');
 const { getAuthContextFromToken } = require('../middleware/auth');
+const { runtimeConfig } = require('../../config/runtime');
 
 const clients = new Map();
 let wsServer = null;
@@ -95,7 +96,7 @@ const startWebSocketServer = (httpServer) => {
     }
   });
 
-  const heartbeatMs = Math.max(Number(process.env.WS_HEARTBEAT_MS || 25_000), 10_000);
+  const heartbeatMs = Math.max(runtimeConfig.live.wsHeartbeatMs, 10_000);
   heartbeatTimer = setInterval(() => {
     for (const client of clients.values()) {
       sendEvent(client.socket, 'ping', { timestamp: new Date().toISOString() });

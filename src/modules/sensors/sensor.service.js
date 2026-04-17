@@ -14,12 +14,13 @@ const {
   applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
+const { runtimeConfig } = require('../../config/runtime');
 
 const THRESHOLDS = {
-  odor_ppm: Number(process.env.ALERT_ODOR_PPM_THRESHOLD || 70),
-  ammonia_ppm: Number(process.env.ALERT_AMMONIA_PPM_THRESHOLD || 35),
-  h2s_ppm: Number(process.env.ALERT_H2S_PPM_THRESHOLD || 10),
-  methane_ppm: Number(process.env.ALERT_METHANE_PPM_THRESHOLD || 90),
+  odor_ppm: runtimeConfig.alerts.odorPpmThreshold,
+  ammonia_ppm: runtimeConfig.alerts.ammoniaPpmThreshold,
+  h2s_ppm: runtimeConfig.alerts.h2sPpmThreshold,
+  methane_ppm: runtimeConfig.alerts.methanePpmThreshold,
 };
 
 const parseNumeric = (value) => {

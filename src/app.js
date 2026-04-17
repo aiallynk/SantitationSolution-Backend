@@ -4,17 +4,20 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const swaggerUi = require('swagger-ui-express');
-require('./config/env');
+const { runtimeConfig } = require('./config/runtime');
 
 const { apiRateLimit } = require('./core/security/rateLimit');
 const { attachRequestId } = require('./core/middleware/requestId');
 const { requestLogger } = require('./core/middleware/requestLogger');
 const { notFound } = require('./core/middleware/notFound');
 const { handleError } = require('./core/errors/handleError');
+const { logger } = require('./core/logging/logger');
+const { getReadinessState } = require('./core/runtime/readiness');
 const apiV1Router = require('./api/v1');
 const compatRouter = require('./api/compat');
 
 const app = express();
+const isProduction = runtimeConfig.isProduction;
 
 const normalizeOriginValue = (value) => {
   const raw = String(value || '').trim();
@@ -30,7 +33,7 @@ const normalizeOriginToken = (value) =>
   normalizeOriginValue(String(value || '').replace(/^['"]|['"]$/g, ''));
 
 const resolveAllowedOrigins = () => {
-  const raw = String(process.env.CORS_ORIGIN || '').trim();
+  const raw = String(runtimeConfig.app.corsOrigin || '').trim();
   if (!raw) {
     return null;
   }
@@ -41,6 +44,7 @@ const resolveAllowedOrigins = () => {
 };
 
 const allowedOrigins = resolveAllowedOrigins();
+const allowAllCors = Boolean(runtimeConfig.app.corsAllowAll);
 
 const escapeRegex = (value) =>
   String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -62,7 +66,10 @@ const originMatchers = Array.isArray(allowedOrigins)
 
 const isOriginAllowed = (origin) => {
   const normalizedOrigin = normalizeOriginValue(origin);
-  if (!normalizedOrigin || originMatchers.length === 0) return true;
+  if (!normalizedOrigin || allowAllCors) return true;
+  if (originMatchers.length === 0) {
+    return !isProduction;
+  }
   for (const matcher of originMatchers) {
     if (matcher.type === 'any') return true;
     if (matcher.type === 'exact' && matcher.value === normalizedOrigin) return true;
@@ -72,7 +79,16 @@ const isOriginAllowed = (origin) => {
 };
 
 app.disable('x-powered-by');
-app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
+app.set('trust proxy', Number(runtimeConfig.app.trustProxy || 1));
+
+if (isProduction && !allowAllCors && originMatchers.length === 0) {
+  logger.warn(
+    'CORS_ORIGIN is empty in production. Browser requests with Origin header will be denied.'
+  );
+}
+if (allowAllCors) {
+  logger.warn('CORS_ALLOW_ALL=true. Use only in trusted environments.');
+}
 
 app.use(attachRequestId);
 app.use(requestLogger);
@@ -84,7 +100,7 @@ app.use(
 app.use(
   cors({
     origin(origin, callback) {
-      if (!originMatchers.length || !origin) {
+      if (!origin) {
         return callback(null, true);
       }
       if (isOriginAllowed(origin)) {
@@ -92,7 +108,7 @@ app.use(
       }
       return callback(null, false);
     },
-    credentials: true,
+    credentials: !allowAllCors,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Authorization',
@@ -110,29 +126,34 @@ app.use(
   })
 );
 app.use(apiRateLimit);
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: process.env.JSON_BODY_LIMIT || '2mb' }));
+const jsonBodyLimit = String(runtimeConfig.app.jsonBodyLimit || (isProduction ? '1mb' : '2mb'));
+app.use(express.json({ limit: jsonBodyLimit }));
+app.use(express.urlencoded({ extended: false, limit: jsonBodyLimit }));
 
-const uploadsPath = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsPath)) {
-  fs.mkdirSync(uploadsPath, { recursive: true });
+const serveLocalUploads = Boolean(runtimeConfig.app.localMediaServeEnabled);
+if (serveLocalUploads) {
+  const uploadsPath = path.join(process.cwd(), 'uploads');
+  if (!fs.existsSync(uploadsPath)) {
+    fs.mkdirSync(uploadsPath, { recursive: true });
+  }
+  app.use(
+    '/static',
+    express.static(uploadsPath, {
+      maxAge: '1h',
+      etag: true,
+      setHeaders: (res) => {
+        // Allow admin web app to render locally stored evidence images cross-origin.
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Timing-Allow-Origin', '*');
+      },
+    })
+  );
 }
-app.use(
-  '/static',
-  express.static(uploadsPath, {
-    maxAge: '1h',
-    etag: true,
-    setHeaders: (res) => {
-      // Allow admin web app to render locally stored evidence images cross-origin.
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Timing-Allow-Origin', '*');
-    },
-  })
-);
 
+const docsEnabled = Boolean(runtimeConfig.app.apiDocsEnabled);
 const openApiPath = path.join(__dirname, 'docs', 'openapi.json');
-if (fs.existsSync(openApiPath)) {
+if (docsEnabled && fs.existsSync(openApiPath)) {
   const spec = JSON.parse(fs.readFileSync(openApiPath, 'utf8'));
   app.use('/docs', swaggerUi.serve, swaggerUi.setup(spec, { explorer: true }));
 }
@@ -143,8 +164,9 @@ app.get('/', (req, res) => {
     message: 'Sanitation Platform API is running',
     data: {
       version: 'v1',
-      docs: '/docs',
+      docs: docsEnabled ? '/docs' : null,
       health: '/health',
+      ready: '/ready',
     },
     requestId: req.requestId || null,
   });
@@ -157,6 +179,21 @@ app.get('/health', (req, res) => {
     data: {
       service: 'sanitation-platform-backend',
       now: new Date().toISOString(),
+    },
+    requestId: req.requestId || null,
+  });
+});
+
+app.get('/ready', (req, res) => {
+  const readiness = getReadinessState();
+  const statusCode = readiness.ready ? 200 : 503;
+  res.status(statusCode).json({
+    success: readiness.ready,
+    message: readiness.ready ? 'ready' : 'not_ready',
+    data: {
+      service: 'sanitation-platform-backend',
+      now: new Date().toISOString(),
+      ...readiness,
     },
     requestId: req.requestId || null,
   });

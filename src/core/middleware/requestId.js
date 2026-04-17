@@ -2,9 +2,13 @@ const { v4: uuidv4 } = require('uuid');
 
 const attachRequestId = (req, res, next) => {
   const incoming = req.headers['x-request-id'];
+  const normalizedIncoming =
+    typeof incoming === 'string'
+      ? incoming.trim().replace(/[^a-zA-Z0-9\-_.:]/g, '').slice(0, 120)
+      : '';
   const id =
-    typeof incoming === 'string' && incoming.trim().length > 0
-      ? incoming.trim()
+    normalizedIncoming.length > 0
+      ? normalizedIncoming
       : uuidv4();
 
   req.requestId = id;

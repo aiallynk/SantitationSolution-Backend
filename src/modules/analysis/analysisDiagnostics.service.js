@@ -8,18 +8,19 @@ const {
 } = require('../../models');
 const { getQueueMetrics } = require('../../core/queue/queueManager');
 const { ANALYSIS_QUEUE } = require('./analysis.queue');
+const { runtimeConfig } = require('../../config/runtime');
 
 const ANALYSIS_STALE_DEFAULT_MS = 3 * 60 * 1000;
 const IMAGE_SESSION_STALE_DEFAULT_MS = 15 * 60 * 1000;
 
 const resolveAnalysisStaleMs = () => {
-  const value = Number(process.env.ANALYSIS_PROCESSING_STALE_MS || ANALYSIS_STALE_DEFAULT_MS);
+  const value = Number(runtimeConfig.diagnostics.analysisStaleMs || ANALYSIS_STALE_DEFAULT_MS);
   if (Number.isFinite(value) && value >= 30000) return value;
   return ANALYSIS_STALE_DEFAULT_MS;
 };
 
 const resolveImageSessionStaleMs = () => {
-  const value = Number(process.env.IMAGE_SESSION_STALE_MS || IMAGE_SESSION_STALE_DEFAULT_MS);
+  const value = Number(runtimeConfig.diagnostics.imageSessionStaleMs || IMAGE_SESSION_STALE_DEFAULT_MS);
   if (Number.isFinite(value) && value >= 60000) return value;
   return IMAGE_SESSION_STALE_DEFAULT_MS;
 };

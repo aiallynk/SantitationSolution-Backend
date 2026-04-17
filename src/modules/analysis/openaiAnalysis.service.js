@@ -1,9 +1,10 @@
 const { resolveMediaUrlForVision } = require('./analysisMediaResolver.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
 const PROMPT_VERSION = 'sanitation-detection-v1';
-const SCORING_VERSION = 'sanitation-weighted-v2';
+const SCORING_VERSION = 'sanitation-weighted-v3';
 
 const DETECTION_PROMPT = `
 You are a sanitation inspection AI.
@@ -39,6 +40,7 @@ Then compute:
 
 Rules:
 - Use the full 0-100 scale. Avoid defaulting to mid-range values.
+- Use decimal precision (up to 2 decimals) when differences are subtle; do not snap all scores to fixed buckets.
 - 90-100: spotless and clearly well maintained.
 - 70-89: mostly clean with minor visible issues.
 - 40-69: noticeable dirt/stains/wetness or mixed condition.
@@ -62,6 +64,7 @@ const DETECTION_VISIBILITY_TYPES = new Set(['full', 'partial', 'not_visible']);
 const SCORING_SEVERITY_TYPES = new Set(['low', 'medium', 'high']);
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+const round2 = (value) => Number(Number(value).toFixed(2));
 
 const schemaError = (code, message) => {
   const error = new Error(message);
@@ -109,9 +112,12 @@ const tryParseJson = (value) => {
 };
 
 const toScore = (value, fallback = 0) => {
+  if (value === null || value === undefined || String(value).trim() === '') {
+    return fallback;
+  }
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return clamp(Math.round(parsed), 0, 100);
+  return round2(clamp(parsed, 0, 100));
 };
 
 const toConfidence = (value, fallback = null) => {
@@ -143,7 +149,7 @@ const weightedOverallFromStrict = ({
   const waterCleanliness = 100 - clamp(waterStagnation, 0, 100);
   const garbageCleanliness = garbagePresence ? 0 : 100;
 
-  return Math.round(
+  return round2(
     clamp(
       floorCleanliness * 0.3 +
         commodeCleanliness * 0.3 +
@@ -354,8 +360,8 @@ const normalizeScoringPayload = (parsed) => {
 };
 
 const getOpenAiAnalysisConfigState = () => {
-  const provider = String(process.env.ANALYSIS_PROVIDER || '').trim().toLowerCase();
-  const hasApiKey = Boolean(String(process.env.OPENAI_API_KEY || '').trim());
+  const provider = runtimeConfig.analysis.provider;
+  const hasApiKey = Boolean(String(runtimeConfig.analysis.openaiApiKey || '').trim());
   if (provider !== 'openai') {
     return {
       ok: false,
@@ -386,8 +392,11 @@ const assertOpenAiAnalysisConfigured = () => {
 const isOpenAiAnalysisEnabled = () => getOpenAiAnalysisConfigState().ok;
 
 const callOpenAiVisionJson = async ({ model, promptText, imageUrl, contextText }) => {
-  const baseUrl = String(process.env.OPENAI_BASE_URL || OPENAI_DEFAULT_BASE_URL).replace(/\/+$/, '');
-  const timeoutMs = Math.max(Number(process.env.OPENAI_ANALYSIS_TIMEOUT_MS || 45000), 5000);
+  const baseUrl = String(runtimeConfig.analysis.openaiBaseUrl || OPENAI_DEFAULT_BASE_URL).replace(
+    /\/+$/,
+    ''
+  );
+  const timeoutMs = Math.max(runtimeConfig.analysis.openaiTimeoutMs, 5000);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -397,7 +406,7 @@ const callOpenAiVisionJson = async ({ model, promptText, imageUrl, contextText }
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${runtimeConfig.analysis.openaiApiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -464,7 +473,7 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
     throw error;
   }
 
-  const model = process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o';
+  const model = runtimeConfig.analysis.openaiModel || 'gpt-4o-mini';
   const contextText = `inspection_id=${inspection.id}, facility_id=${inspection.facility_id}, stage=${selected.capture_stage || 'evidence'}`;
 
   const detectionPass = await callOpenAiVisionJson({

@@ -5,6 +5,7 @@ const { resolveMediaUrl, resolveMediaPairUrls } = require('./mediaUrl.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { recomputeInspectionAggregates } = require('../inspections/inspectionEvidence.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const buildAnalysisRequestContext = (req) => {
   const safeHeaders = {};
@@ -32,8 +33,7 @@ const buildAnalysisRequestContext = (req) => {
   };
 };
 
-const isAutoAnalysisOnUploadEnabled = () =>
-  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').toLowerCase() === 'true';
+const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
 const uploadInit = async (req) => {
   const inspection = req.body.inspectionId
@@ -74,7 +74,7 @@ const uploadInit = async (req) => {
   return {
     mediaId: media.id,
     uploadEndpoint: `/api/v1/media/upload-complete?mediaId=${media.id}`,
-    maxFileSizeBytes: Number(process.env.MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024),
+    maxFileSizeBytes: runtimeConfig.media.maxFileSizeBytes,
   };
 };
 

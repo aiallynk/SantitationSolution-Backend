@@ -1,9 +1,10 @@
 const IORedis = require('ioredis');
 const { isRedisEnabled } = require('../queue/queueManager');
+const { runtimeConfig } = require('../../config/runtime');
 
-const CHANNEL = String(process.env.REDIS_LIVE_CHANNEL || 'sanitation:live:events').trim();
+const CHANNEL = String(runtimeConfig.redis.liveChannel || 'sanitation:live:events').trim();
 const SERVER_ID =
-  String(process.env.LIVE_SERVER_ID || '').trim() ||
+  String(runtimeConfig.live.serverId || '').trim() ||
   `live-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
 let publisher = null;
@@ -13,7 +14,7 @@ let eventHandler = null;
 let redisLiveErrorLogged = false;
 
 const buildRedisClient = () =>
-  new IORedis(process.env.REDIS_URL, {
+  new IORedis(runtimeConfig.redis.url, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     retryStrategy: (times) => Math.min(times * 200, 2000),
@@ -38,7 +39,7 @@ const safeParse = (value) => {
 
 const startLiveRedisBridge = async ({ onEvent } = {}) => {
   eventHandler = onEvent || null;
-  if (started || !isRedisEnabled() || !process.env.REDIS_URL) {
+  if (started || !isRedisEnabled() || !runtimeConfig.redis.url) {
     return false;
   }
 

@@ -6,7 +6,11 @@
   "scripts": {
     "build": "node -e \"console.log('Backend build step: no compile required')\"",
     "start": "node src/server.js",
+    "start:prod": "node src/server.js",
     "dev": "node src/server.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
+    "pm2:reload": "pm2 reload ecosystem.config.cjs --env production",
+    "pm2:stop": "pm2 delete sanitation-backend",
     "worker:analysis": "node src/workers/analysis-worker.js",
     "db:migrate": "npx --yes sequelize-cli@6.6.2 db:migrate",
     "db:rollback": "npx --yes sequelize-cli@6.6.2 db:migrate:undo:all",

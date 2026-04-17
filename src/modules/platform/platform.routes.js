@@ -26,6 +26,14 @@ const {
 } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
+const PLATFORM_ROUTE_PREFIXES = [
+  '/tenants',
+  '/geographies',
+  '/facilities',
+  '/toilet-blocks',
+  '/toilet-units',
+  '/toilets',
+];
 
 const COMMON_SCOPE_RULE = {
   scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY],
@@ -39,7 +47,7 @@ const OPS_AND_MOBILE_SURFACES = [...OPS_WEB_SURFACES, SurfaceTypes.MOBILE_ONLY];
 const ADMINOPS_ROUTE_KEYS = [RouteKeys.OPS_ADMINOPS, RouteKeys.SA_TENANTS, RouteKeys.SA_GLOBAL_USERS];
 const TOILETS_ROUTE_KEYS = [RouteKeys.OPS_TOILETS, RouteKeys.SA_TENANTS, RouteKeys.SA_GLOBAL_USERS];
 
-router.use(protect);
+router.use(PLATFORM_ROUTE_PREFIXES, protect);
 
 router.get(
   '/tenants',

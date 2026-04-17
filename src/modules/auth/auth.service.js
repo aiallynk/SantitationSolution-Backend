@@ -21,6 +21,7 @@ const {
   decodeTokenExpiry,
 } = require('./token.service');
 const { createAuditLog } = require('../audit/audit.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
@@ -457,7 +458,7 @@ const forgotPassword = async ({ email, req }) => {
   await PasswordResetToken.create({
     user_id: user.id,
     token_hash: hashToken(resetToken),
-    expires_at: new Date(Date.now() + Number(process.env.PASSWORD_RESET_TTL_MS || 15 * 60 * 1000)),
+    expires_at: new Date(Date.now() + runtimeConfig.auth.passwordResetTtlMs),
   });
 
   await createAuditLog({
@@ -473,7 +474,7 @@ const forgotPassword = async ({ email, req }) => {
   return {
     accepted: true,
     resetToken,
-    expiresInMinutes: Math.round(Number(process.env.PASSWORD_RESET_TTL_MS || 900000) / 60000),
+    expiresInMinutes: Math.round(runtimeConfig.auth.passwordResetTtlMs / 60000),
   };
 };
 

@@ -3,8 +3,10 @@ const AppError = require('../errors/AppError');
 const { PlatformUser, Role, Permission, WorkerAssignment } = require('../../models');
 const { resolveRoleProfile } = require('../rbac/accessProfiles');
 const { resolveEffectiveScope, uniqueIds } = require('../rbac/scopeResolver');
+const { runtimeConfig } = require('../../config/runtime');
 
-const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET || 'change-me-access-secret';
+const ACCESS_TOKEN_SECRET = runtimeConfig.auth.jwtSecret || 'change-me-access-secret';
+const JWT_ALGORITHM = runtimeConfig.auth.jwtAlgorithm;
 // Legacy compatibility note:
 // `platform_ops` remains global-scoped here for backward compatibility only.
 // Do not elevate or auto-migrate it to `super_admin` without an explicit migration plan.
@@ -194,7 +196,9 @@ const getAuthContextFromToken = async ({ token, tenantId = null } = {}) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(token, ACCESS_TOKEN_SECRET);
+    decoded = jwt.verify(token, ACCESS_TOKEN_SECRET, {
+      algorithms: [JWT_ALGORITHM],
+    });
   } catch (error) {
     throw new AppError('Invalid or expired token', 401, { code: 'INVALID_TOKEN' });
   }

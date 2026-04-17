@@ -31,6 +31,7 @@ const {
   ensureAllQrImagesForToilet,
   ensureQrImagesForToilets,
 } = require('./toiletQr.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -449,7 +450,7 @@ const normalizeQrVersion = (value) => {
 };
 
 const resolveQrSigningSecret = () =>
-  String(process.env.QR_V2_SIGNING_SECRET || process.env.JWT_SECRET || '').trim() ||
+  String(runtimeConfig.auth.qrV2SigningSecret || runtimeConfig.auth.jwtSecret || '').trim() ||
   'sanitation-qr-signing-secret';
 
 const buildCanonicalQrSignatureInput = ({ version, toiletUnitId, tenantId, qrId }) =>
@@ -1265,14 +1266,18 @@ const resolveAssignmentAuthorization = async ({ req, row }) => {
   }
 
   const privilegedRole = isPrivilegedRoleForQrResolve(req);
-  const assignments = await WorkerAssignment.findAll({
-    where: {
-      user_id: req?.user?.id || null,
-      tenant_id: rowTenantId || userTenantId || null,
-      status: 'active',
-    },
-    attributes: ['id', 'assignment_level', 'geography_id', 'facility_id', 'toilet_unit_id'],
-  });
+  const tenantForAssignmentLookup = rowTenantId || userTenantId || null;
+  let assignments = [];
+  if (!privilegedRole && req?.user?.id && tenantForAssignmentLookup) {
+    assignments = await WorkerAssignment.findAll({
+      where: {
+        user_id: req.user.id,
+        tenant_id: tenantForAssignmentLookup,
+        status: 'active',
+      },
+      attributes: ['id', 'assignment_level', 'geography_id', 'facility_id', 'toilet_unit_id'],
+    });
+  }
 
   const facilityId = String(row.facility_id || row.Facility?.id || '').trim();
   const toiletId = String(row.id || '').trim();
@@ -1304,39 +1309,23 @@ const resolveAssignmentAuthorization = async ({ req, row }) => {
     return false;
   });
 
-  if (!matchedAssignment && assignments.length === 0 && !privilegedRole) {
-    return {
-      allowed: false,
-      reasonCode: QR_RESOLVE_REASON_CODES.ASSIGNMENT_MISSING,
-      details: {
-        workerId: req?.user?.id || null,
-      },
-      scopeRefreshRecommended: false,
-    };
-  }
-
-  if (!matchedAssignment && !privilegedRole) {
-    return {
-      allowed: false,
-      reasonCode: QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED,
-      details: {
-        workerId: req?.user?.id || null,
-        assignmentCount: assignments.length,
-      },
-      scopeRefreshRecommended: false,
-    };
-  }
-
   const tokenScopeAllowed = isFacilityInScope(req, facilityId || null);
+  const mode = matchedAssignment
+    ? 'assignment_match'
+    : privilegedRole
+      ? 'privileged_role'
+      : 'tenant_wide_worker_access';
+
   return {
     allowed: true,
     reasonCode: tokenScopeAllowed
       ? QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY
       : QR_RESOLVE_REASON_CODES.SCOPE_REFRESH_RECOMMENDED,
     details: {
-      mode: matchedAssignment ? 'assignment_match' : 'privileged_role',
+      mode,
       assignmentId: matchedAssignment?.id || null,
       assignmentLevel: matchedAssignment?.assignment_level || null,
+      assignmentCount: assignments.length,
       tokenScopeAllowed,
     },
     scopeRefreshRecommended: !tokenScopeAllowed,

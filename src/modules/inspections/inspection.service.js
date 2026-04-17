@@ -43,6 +43,7 @@ const {
 const {
   IMAGE_PROCESSING_STATES,
 } = require('./imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
 const REVIEW_LABELS = {
   reviewed: 'Reviewed',
@@ -867,8 +868,7 @@ const buildAnalysisRequestContext = (req) => {
   };
 };
 
-const isAutoAnalysisOnUploadEnabled = () =>
-  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').toLowerCase() === 'true';
+const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
 const createInspection = async (req) => {
   const inspectionType = normalizeInspectionType(req.body.inspectionType);

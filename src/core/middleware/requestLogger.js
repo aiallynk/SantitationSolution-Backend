@@ -1,7 +1,20 @@
-const shouldLogRequests =
-  String(process.env.REQUEST_LOGGING_ENABLED || 'true').toLowerCase() === 'true';
-const verboseRequestLogs =
-  String(process.env.REQUEST_LOGGING_VERBOSE || 'false').toLowerCase() === 'true';
+const { logger } = require('../logging/logger');
+const { runtimeConfig } = require('../../config/runtime');
+
+const shouldLogRequests = Boolean(runtimeConfig.logging.requestLoggingEnabled);
+const verboseRequestLogs = Boolean(runtimeConfig.logging.requestLoggingVerbose);
+const slowRequestThresholdMs = Math.max(
+  Number(runtimeConfig.logging.requestLoggingSlowMs || 1200),
+  100
+);
+
+const getSanitizedPath = (req) => {
+  const routePath = req?.route?.path;
+  if (typeof routePath === 'string' && routePath.trim()) {
+    return routePath;
+  }
+  return String(req.path || req.originalUrl || '/').split('?')[0];
+};
 
 const requestLogger = (req, res, next) => {
   if (!shouldLogRequests) {
@@ -12,29 +25,32 @@ const requestLogger = (req, res, next) => {
   res.on('finish', () => {
     const durationMs = Date.now() - startedAt;
     const status = Number(res.statusCode || 0);
-    const isError = status >= 500;
     const isWarn = status >= 400 && status < 500;
-    const shouldEmit = verboseRequestLogs || isWarn || isError;
+    const isSlow = durationMs >= slowRequestThresholdMs;
+    const shouldEmit = verboseRequestLogs || isWarn || isSlow;
     if (!shouldEmit) {
       return;
     }
 
-    const scope = req.user?.tenantId || 'platform';
-    const actor = req.user?.id || 'anonymous';
-    const message = `[${req.requestId || 'no-request-id'}] ${req.method} ${req.originalUrl} -> ${status} ${durationMs}ms tenant=${scope} user=${actor}`;
+    const meta = {
+      requestId: req.requestId || null,
+      method: req.method,
+      path: getSanitizedPath(req),
+      status,
+      durationMs,
+      tenantId: req.user?.tenantId || null,
+      userId: req.user?.id || null,
+      ip: req.ip || null,
+      userAgent: req.headers?.['user-agent']
+        ? String(req.headers['user-agent']).slice(0, 200)
+        : null,
+    };
 
-    if (isError) {
-      // eslint-disable-next-line no-console
-      console.error(message);
-      return;
-    }
     if (isWarn) {
-      // eslint-disable-next-line no-console
-      console.warn(message);
+      logger.warn('Request warning', meta);
       return;
     }
-    // eslint-disable-next-line no-console
-    console.log(message);
+    logger.info(isSlow ? 'Slow request' : 'Request completed', meta);
   });
 
   return next();

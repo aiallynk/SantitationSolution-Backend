@@ -1,7 +1,8 @@
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+const { runtimeConfig } = require('../../config/runtime');
 
-const REVIEW_THRESHOLD = Number(process.env.ANALYSIS_REVIEW_CONFIDENCE_THRESHOLD || 0.6);
-const REJECT_THRESHOLD = Number(process.env.ANALYSIS_REJECT_CONFIDENCE_THRESHOLD || 0.4);
+const REVIEW_THRESHOLD = runtimeConfig.analysis.reviewConfidenceThreshold;
+const REJECT_THRESHOLD = runtimeConfig.analysis.rejectConfidenceThreshold;
 
 const computeConfidence = ({
   aiConfidence = null,

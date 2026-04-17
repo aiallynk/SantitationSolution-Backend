@@ -1,5 +1,6 @@
 const clients = new Map();
 let clientCounter = 0;
+const { runtimeConfig } = require('../../config/runtime');
 
 const setupSseHeaders = (res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -63,7 +64,7 @@ const startHeartbeat = () => {
     for (const client of clients.values()) {
       sendEvent(client.res, 'ping', { timestamp: new Date().toISOString() });
     }
-  }, Number(process.env.SSE_HEARTBEAT_MS || 20_000)).unref();
+  }, runtimeConfig.live.sseHeartbeatMs).unref();
 };
 
 module.exports = {

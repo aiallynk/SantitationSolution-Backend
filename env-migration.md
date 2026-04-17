@@ -1,0 +1,32 @@
+# Environment Migration Notes
+
+## What changed
+- Environment parsing is now centralized in `src/config/runtime.js`.
+- Internal tuning knobs moved to `src/config/defaults.js` (no longer expected in `.env`).
+- Runtime now uses `DATABASE_URL` as the single DB source of truth.
+
+## Deprecated env names (ignored by runtime)
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS`
+- `PUBLIC_FEEDBACK_PROTOCOL`, `PUBLIC_FEEDBACK_HOST`, `PUBLIC_FEEDBACK_PORT`, `RENDER_EXTERNAL_URL`
+- Queue internals: `QUEUE_*`, `ANALYSIS_QUEUE_*`, `ANALYSIS_INLINE_*`, `ANALYSIS_DEDUP_WINDOW_MS`
+- Analysis internals: `ANALYSIS_CONFIDENCE_THRESHOLD`, `ANALYSIS_REVIEW_CONFIDENCE_THRESHOLD`, `ANALYSIS_REJECT_CONFIDENCE_THRESHOLD`, `ANALYSIS_SCORE_SPREAD_GAIN`, `ANALYSIS_ALWAYS_SCORE_ON_FAILURE`, `ANALYSIS_BLUR_VARIANCE_MIN`, `ANALYSIS_BRIGHTNESS_MIN`, `ANALYSIS_BRIGHTNESS_MAX`, `ANALYSIS_VALIDATION_MAX_DIMENSION`, `ANALYSIS_FRAUD_SIMILARITY_THRESHOLD`, `ANALYSIS_MEDIA_MAX_BYTES`, `ANALYSIS_MEDIA_FETCH_TIMEOUT_MS`
+- Watchdog / reconcile internals: `ANALYSIS_STALE_WATCHDOG_INTERVAL_MS`, `ANALYSIS_PROCESSING_STALE_MS`, `IMAGE_SESSION_RECONCILE_INTERVAL_MS`, `IMAGE_SESSION_RECONCILE_BATCH_SIZE`, `IMAGE_SESSION_RECONCILE_MAX_ATTEMPTS`, `IMAGE_SESSION_STALE_MS`
+- Runtime internals: `SSE_HEARTBEAT_MS`, `WS_HEARTBEAT_MS`, `IDEMPOTENCY_LOCK_MS`, `IDEMPOTENCY_TTL_MS`, `IDEMPOTENCY_RESPONSE_MAX_BYTES`, `TEMP_FILE_JANITOR_INTERVAL_MS`, `TEMP_FILE_JANITOR_MAX_DELETE_PER_RUN`, `TEMP_FILE_MAX_AGE_MS`, `TEMP_UPLOAD_SUBDIR`
+- Alert thresholds: `ALERT_ODOR_PPM_THRESHOLD`, `ALERT_AMMONIA_PPM_THRESHOLD`, `ALERT_H2S_PPM_THRESHOLD`, `ALERT_METHANE_PPM_THRESHOLD`
+
+## Required production env
+- `NODE_ENV=production`
+- `PORT`
+- `DATABASE_URL`
+- `JWT_SECRET`
+- `JWT_REFRESH_SECRET`
+- `CORS_ORIGIN` (unless `CORS_ALLOW_ALL=true`)
+
+## Optional production env
+- S3 (`AWS_REGION`, `AWS_S3_BUCKET`, credentials or IAM role, `S3_FALLBACK_TO_LOCAL=false`)
+- Redis (`REDIS_ENABLED=true`, `REDIS_URL`)
+- AI (`ANALYSIS_TRIGGER_ON_UPLOAD=true`, `OPENAI_API_KEY`, model/base URL/timeouts)
+
+## Compatibility
+- Existing old vars are detected and reported at boot as deprecated.
+- Server behavior remains backward compatible via code defaults where possible.

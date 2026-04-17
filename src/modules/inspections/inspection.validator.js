@@ -1,13 +1,10 @@
 const { isBlank, parsePositiveInteger } = require('../../utils/validators');
+const {
+  ALLOWED_CONTENT_TYPES,
+  MEDIA_MAX_FILE_SIZE,
+} = require('../media/uploadPolicy');
 
-const ALLOWED_CONTENT_TYPES = new Set([
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/webp',
-  'image/heic',
-  'image/heif',
-]);
+const MAX_CONTENT_LENGTH_BYTES = Number(MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024);
 
 const validateCreateInspection = (req) => {
   const errors = [];
@@ -70,6 +67,13 @@ const validateCreateMediaUploadSession = (req) => {
     if (image?.contentLength !== undefined && Number(image.contentLength) < 0) {
       errors.push(`images[${index}].contentLength must be >= 0`);
     }
+    if (
+      image?.contentLength !== undefined &&
+      Number.isFinite(Number(image.contentLength)) &&
+      Number(image.contentLength) > MAX_CONTENT_LENGTH_BYTES
+    ) {
+      errors.push(`images[${index}].contentLength exceeds max upload size`);
+    }
     if (image?.sha256 !== undefined) {
       const hash = String(image.sha256).trim().toLowerCase();
       if (hash.length > 0 && !/^[a-f0-9]{32,128}$/i.test(hash)) {
@@ -90,6 +94,13 @@ const validateConfirmMediaUpload = (req) => {
   if (isBlank(req.params.mediaId)) errors.push('media id is required');
   if (req.body.contentLength !== undefined && Number(req.body.contentLength) < 0) {
     errors.push('contentLength must be >= 0');
+  }
+  if (
+    req.body.contentLength !== undefined &&
+    Number.isFinite(Number(req.body.contentLength)) &&
+    Number(req.body.contentLength) > MAX_CONTENT_LENGTH_BYTES
+  ) {
+    errors.push('contentLength exceeds max upload size');
   }
   if (req.body.sha256 !== undefined) {
     const hash = String(req.body.sha256).trim().toLowerCase();
@@ -118,6 +129,13 @@ const validateRetryMediaUpload = (req) => {
   }
   if (req.body.contentLength !== undefined && Number(req.body.contentLength) < 0) {
     errors.push('contentLength must be >= 0');
+  }
+  if (
+    req.body.contentLength !== undefined &&
+    Number.isFinite(Number(req.body.contentLength)) &&
+    Number(req.body.contentLength) > MAX_CONTENT_LENGTH_BYTES
+  ) {
+    errors.push('contentLength exceeds max upload size');
   }
   if (req.body.sha256 !== undefined) {
     const hash = String(req.body.sha256).trim().toLowerCase();

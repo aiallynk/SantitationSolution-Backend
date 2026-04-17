@@ -34,6 +34,7 @@ const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { createAuditLog, listAuditLogs: listAuditLogsService } = require('../audit/audit.service');
 const { getQueueMetrics, isRedisEnabled } = require('../../core/queue/queueManager');
 const { ANALYSIS_QUEUE } = require('../analysis/analysis.queue');
+const { runtimeConfig } = require('../../config/runtime');
 
 const TENANT_ADMIN_ROLE_CODES = ['tenant_admin', 'country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin'];
 const TENANT_SCOPE_LEVELS = new Set(['country', 'state', 'district', 'city', 'zone']);
@@ -377,8 +378,8 @@ const getSystemHealth = async (req) => {
     status: 'ok',
     time: new Date().toISOString(),
     latestSensorReadingAt: latestSensor?.timestamp || null,
-    redisEnabled: Boolean(process.env.REDIS_URL && isRedisEnabled()),
-    analysisMode: `${String(process.env.ANALYSIS_PROVIDER || 'openai').toLowerCase()}:${process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o'}`,
+    redisEnabled: Boolean(runtimeConfig.redis.url && isRedisEnabled()),
+    analysisMode: `${runtimeConfig.analysis.provider}:${runtimeConfig.analysis.openaiModel}`,
     openIncidents,
     openSyncFailures,
   };

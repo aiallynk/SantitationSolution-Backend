@@ -12,9 +12,9 @@ const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessM
 
 const router = express.Router();
 
-router.use(protect);
 router.use(
   '/analysis/inspections',
+  protect,
   requireSurface(
     SurfaceTypes.OPS_WEB,
     SurfaceTypes.OPS_WEB_AND_MOBILE,
