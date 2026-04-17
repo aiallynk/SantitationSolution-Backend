@@ -15,11 +15,15 @@ const ids = {
   taskTwo: 'b9999999-9999-4999-8999-999999999992',
 };
 
+const DEFAULT_SEED_PASSWORD = String(
+  process.env.DEFAULT_SEED_PASSWORD || process.env.PERSONA_SEED_PASSWORD || '11111111'
+);
+
 /** @type {import('sequelize-cli').Migration} */
 module.exports = {
   async up(queryInterface) {
     const now = new Date();
-    const passwordHash = await bcrypt.hash('Password@123', 10);
+    const passwordHash = await bcrypt.hash(DEFAULT_SEED_PASSWORD, 10);
 
     await queryInterface.bulkInsert('tenants', [
       {

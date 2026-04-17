@@ -130,23 +130,43 @@ const jsonBodyLimit = String(runtimeConfig.app.jsonBodyLimit || (isProduction ? 
 app.use(express.json({ limit: jsonBodyLimit }));
 app.use(express.urlencoded({ extended: false, limit: jsonBodyLimit }));
 
+const uploadsPath = path.join(process.cwd(), 'uploads');
+if (!fs.existsSync(uploadsPath)) {
+  fs.mkdirSync(uploadsPath, { recursive: true });
+}
+
+const staticAssetHeaders = (res) => {
+  // Allow web clients to render hosted assets across origins.
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Timing-Allow-Origin', '*');
+};
+
 const serveLocalUploads = Boolean(runtimeConfig.app.localMediaServeEnabled);
 if (serveLocalUploads) {
-  const uploadsPath = path.join(process.cwd(), 'uploads');
-  if (!fs.existsSync(uploadsPath)) {
-    fs.mkdirSync(uploadsPath, { recursive: true });
-  }
   app.use(
     '/static',
     express.static(uploadsPath, {
       maxAge: '1h',
       etag: true,
-      setHeaders: (res) => {
-        // Allow admin web app to render locally stored evidence images cross-origin.
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Timing-Allow-Origin', '*');
-      },
+      setHeaders: staticAssetHeaders,
+    })
+  );
+} else {
+  // Keep QR assets reachable even when general local media serving is disabled.
+  const qrUploadsPath = path.join(uploadsPath, 'qr');
+  if (!fs.existsSync(qrUploadsPath)) {
+    fs.mkdirSync(qrUploadsPath, { recursive: true });
+  }
+  logger.warn(
+    'LOCAL_MEDIA_SERVE_ENABLED=false; exposing /static/qr fallback so worker/public QR images remain accessible.'
+  );
+  app.use(
+    '/static/qr',
+    express.static(qrUploadsPath, {
+      maxAge: '1h',
+      etag: true,
+      setHeaders: staticAssetHeaders,
     })
   );
 }

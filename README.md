@@ -84,7 +84,8 @@ Use `.env.example` as the source for required variables. Main groups:
 
 ## Seed Accounts
 
-Password: `Password@123`
+Password (default): `11111111`
+Override with env: `DEFAULT_SEED_PASSWORD` (or `PERSONA_SEED_PASSWORD`)
 
 - `superadmin@platform.gov`
 - `tenantadmin@nmc.gov.in`
