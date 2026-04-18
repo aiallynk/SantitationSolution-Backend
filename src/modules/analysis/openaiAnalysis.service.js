@@ -3,8 +3,8 @@ const { runtimeConfig } = require('../../config/runtime');
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
-const PROMPT_VERSION = 'sanitation-detection-v1';
-const SCORING_VERSION = 'sanitation-weighted-v3';
+const PROMPT_VERSION = 'sanitation-detection-v2';
+const SCORING_VERSION = 'sanitation-weighted-v4';
 
 const DETECTION_PROMPT = `
 You are a sanitation inspection AI.
@@ -18,6 +18,7 @@ Analyze this image and return ONLY JSON with these exact keys:
 
 Rules:
 - If toilet/urinal is not clearly visible, set toilet_detected=false.
+- Ignore overlay text/watermarks (GPS/time/worker/toilet/stage/score) while detecting scene contents.
 - Do not hallucinate.
 - Return valid JSON only.
 `.trim();
@@ -47,6 +48,8 @@ Rules:
 - 0-39: clearly unhygienic, heavy stains/waste/water problems.
 - If image is unclear, reduce confidence.
 - If toilet is not visible, return low confidence and explicit reason in explanation_summary.
+- Ignore overlay text/watermarks (GPS/time/worker/toilet/stage/score).
+- Do not infer cleanliness from workflow labels such as BEFORE/AFTER; score only visible hygiene condition.
 - Do NOT hallucinate.
 - Be strict and realistic.
 
@@ -65,6 +68,10 @@ const SCORING_SEVERITY_TYPES = new Set(['low', 'medium', 'high']);
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) => Number(Number(value).toFixed(2));
+const toFiniteOrNull = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
 
 const schemaError = (code, message) => {
   const error = new Error(message);
@@ -111,19 +118,40 @@ const tryParseJson = (value) => {
   }
 };
 
-const toScore = (value, fallback = 0) => {
+const inferPercentScaleMultiplier = ({
+  floorRaw,
+  commodeRaw,
+  overallRaw,
+}) => {
+  const anchors = [floorRaw, commodeRaw, overallRaw]
+    .map((item) => toFiniteOrNull(item))
+    .filter((item) => item !== null);
+  if (anchors.length < 2) return 1;
+  const normalized01 = anchors.every((item) => item >= 0 && item <= 1.0001);
+  return normalized01 ? 100 : 1;
+};
+
+const toScore = (value, fallback = 0, { multiplier = 1 } = {}) => {
   if (value === null || value === undefined || String(value).trim() === '') {
     return fallback;
   }
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return round2(clamp(parsed, 0, 100));
+  const adjusted =
+    multiplier > 1 && parsed >= 0 && parsed <= 1.0001 ? parsed * multiplier : parsed;
+  return round2(clamp(adjusted, 0, 100));
 };
 
 const toConfidence = (value, fallback = null) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return clamp(Number(parsed.toFixed(4)), 0, 1);
+  if (parsed >= 0 && parsed <= 1) {
+    return clamp(Number(parsed.toFixed(4)), 0, 1);
+  }
+  if (parsed > 1 && parsed <= 100) {
+    return clamp(Number((parsed / 100).toFixed(4)), 0, 1);
+  }
+  return fallback;
 };
 
 const normalizeArray = (value) => {
@@ -321,10 +349,23 @@ const normalizeScoringPayload = (parsed) => {
     throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Scoring key "explanation_summary" must be string');
   }
 
-  const floorCleanliness = toScore(floorRaw, 0);
-  const commodeCleanliness = toScore(commodeRaw, 0);
-  const stainPresence = toScore(stainRaw, 0);
-  const waterStagnation = toScore(waterRaw, 0);
+  const percentScaleMultiplier = inferPercentScaleMultiplier({
+    floorRaw,
+    commodeRaw,
+    overallRaw,
+  });
+  const floorCleanliness = toScore(floorRaw, 0, {
+    multiplier: percentScaleMultiplier,
+  });
+  const commodeCleanliness = toScore(commodeRaw, 0, {
+    multiplier: percentScaleMultiplier,
+  });
+  const stainPresence = toScore(stainRaw, 0, {
+    multiplier: percentScaleMultiplier,
+  });
+  const waterStagnation = toScore(waterRaw, 0, {
+    multiplier: percentScaleMultiplier,
+  });
 
   const weightedOverall = weightedOverallFromStrict({
     floorCleanliness,
@@ -334,7 +375,9 @@ const normalizeScoringPayload = (parsed) => {
     garbagePresence,
   });
 
-  const overallScore = toScore(overallRaw, weightedOverall);
+  const overallScore = toScore(overallRaw, weightedOverall, {
+    multiplier: percentScaleMultiplier,
+  });
   const confidenceScore = toConfidence(confidenceRaw, null);
   if (confidenceScore === null) {
     throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Scoring key "confidence_score" has invalid value');
@@ -391,7 +434,13 @@ const assertOpenAiAnalysisConfigured = () => {
 
 const isOpenAiAnalysisEnabled = () => getOpenAiAnalysisConfigState().ok;
 
-const callOpenAiVisionJson = async ({ model, promptText, imageUrl, contextText }) => {
+const callOpenAiVisionJson = async ({
+  model,
+  promptText,
+  imageUrl,
+  contextText,
+  maxTokens = 700,
+}) => {
   const baseUrl = String(runtimeConfig.analysis.openaiBaseUrl || OPENAI_DEFAULT_BASE_URL).replace(
     /\/+$/,
     ''
@@ -412,7 +461,7 @@ const callOpenAiVisionJson = async ({ model, promptText, imageUrl, contextText }
       body: JSON.stringify({
         model,
         temperature: 0,
-        max_tokens: 700,
+        max_tokens: clamp(Number(maxTokens) || 700, 120, 1200),
         response_format: { type: 'json_object' },
         messages: [
           {
@@ -474,22 +523,30 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
   }
 
   const model = runtimeConfig.analysis.openaiModel || 'gpt-4o-mini';
-  const contextText = `inspection_id=${inspection.id}, facility_id=${inspection.facility_id}, stage=${selected.capture_stage || 'evidence'}`;
+  const contextText = [
+    `inspection_id=${inspection.id}`,
+    `facility_id=${inspection.facility_id}`,
+    'Ignore any overlay watermark text (GPS/time/worker/toilet/stage/score).',
+    'Evaluate only visible hygiene condition in the scene.',
+  ].join(', ');
 
-  const detectionPass = await callOpenAiVisionJson({
-    model,
-    promptText: DETECTION_PROMPT,
-    imageUrl,
-    contextText,
-  });
+  const [detectionPass, scoringPass] = await Promise.all([
+    callOpenAiVisionJson({
+      model,
+      promptText: DETECTION_PROMPT,
+      imageUrl,
+      contextText,
+      maxTokens: 220,
+    }),
+    callOpenAiVisionJson({
+      model,
+      promptText: SCORING_PROMPT,
+      imageUrl,
+      contextText,
+      maxTokens: 650,
+    }),
+  ]);
   const detection = normalizeDetectionPayload(detectionPass.parsed);
-
-  const scoringPass = await callOpenAiVisionJson({
-    model,
-    promptText: SCORING_PROMPT,
-    imageUrl,
-    contextText,
-  });
   const strictJson = normalizeScoringPayload(scoringPass.parsed);
   const detectionWarnings = [];
   const adjustedIssues = Array.isArray(strictJson.detected_issues)
@@ -616,4 +673,9 @@ module.exports = {
   PROMPT_VERSION,
   SCORING_VERSION,
   ANALYSIS_SCHEMA_VERSION,
+  __testUtils: {
+    normalizeScoringPayload,
+    inferPercentScaleMultiplier,
+    toConfidence,
+  },
 };

@@ -18,12 +18,14 @@ const complaintRoutes = require('../../modules/complaints/complaint.routes');
 const notificationRoutes = require('../../modules/notifications/notification.routes');
 const liveRoutes = require('../../modules/live/live.routes');
 const auditRoutes = require('../../modules/audit/audit.routes');
+const appUpdateRoutes = require('../../modules/appUpdate/appUpdate.routes');
 const { protect } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 
 const router = express.Router();
 
 router.use('/auth', authRoutes);
+router.use(appUpdateRoutes);
 router.get('/me', protect, authController.getMe);
 router.patch('/me', protect, validate(validateUpdateMe), authController.patchMe);
 // Keep public complaint feedback endpoints reachable without auth.
