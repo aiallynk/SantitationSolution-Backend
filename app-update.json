@@ -1,8 +1,8 @@
 ﻿{
-    "latestVersion":  "1.0.2",
+    "latestVersion":  "1.0.3",
     "minimumSupportedVersion":  "1.0.0",
     "apkUrl":  "",
     "apkFileName":  "",
-    "releaseNotes":  "Initial Green Toilet release.",
-    "sha256":  "e277bf73def8b4aeddae4ed35dfdf3ce187d275af3dc83341105afcbc4c55a50"
+    "releaseNotes":  "- Improved performance and stability\n- Bug fixes and minor improvements",
+    "sha256":  "637e620191a5ff08a00cad2c3c3e0f994928c068ed03a2c85d434e594e7396b7"
 }
