@@ -259,6 +259,11 @@ const maybeCreateAlert = async ({ inspection, result }) => {
     return openAlert;
   }
 
+  const inspectionCode = `INS-${String(inspection.id || '')
+    .replace(/-/g, '')
+    .slice(0, 8)
+    .toUpperCase()}`;
+
   const alert = await Alert.create({
     tenant_id: inspection.tenant_id,
     alert_type: 'inspection_quality_breach',
@@ -266,7 +271,7 @@ const maybeCreateAlert = async ({ inspection, result }) => {
     source_type: 'ai_analysis',
     source_id: inspection.id,
     facility_id: inspection.facility_id,
-    message: `Inspection ${inspection.id} flagged ${result.severityLabel} (score ${result.overallCleanlinessScore})`,
+    message: `${inspectionCode} flagged ${result.severityLabel} (score ${result.overallCleanlinessScore})`,
     status: 'open',
     created_at: new Date(),
     updated_at: new Date(),
