@@ -6,6 +6,7 @@ const {
 } = require('../../models');
 const { enqueueInspectionAnalysis } = require('./analysis.queue');
 const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
 const WATCHDOG_DEFAULT_INTERVAL_MS = 30 * 1000;
 const WATCHDOG_DEFAULT_STALE_MS = 3 * 60 * 1000;
@@ -14,13 +15,15 @@ let watchdogTimer = null;
 let watchdogRunning = false;
 
 const resolveWatchdogIntervalMs = () => {
-  const value = Number(process.env.ANALYSIS_STALE_WATCHDOG_INTERVAL_MS || WATCHDOG_DEFAULT_INTERVAL_MS);
+  const value = Number(
+    runtimeConfig.queue.analysisStaleWatchdogIntervalMs || WATCHDOG_DEFAULT_INTERVAL_MS
+  );
   if (Number.isFinite(value) && value >= 10000) return value;
   return WATCHDOG_DEFAULT_INTERVAL_MS;
 };
 
 const resolveWatchdogStaleMs = () => {
-  const value = Number(process.env.ANALYSIS_PROCESSING_STALE_MS || WATCHDOG_DEFAULT_STALE_MS);
+  const value = Number(runtimeConfig.queue.analysisProcessingStaleMs || WATCHDOG_DEFAULT_STALE_MS);
   if (Number.isFinite(value) && value >= 30000) return value;
   return WATCHDOG_DEFAULT_STALE_MS;
 };

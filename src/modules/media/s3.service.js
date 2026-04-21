@@ -7,6 +7,7 @@ const {
   HeadObjectCommand,
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { runtimeConfig } = require('../../config/runtime');
 
 const normalizeBool = (value) => String(value || '').toLowerCase() === 'true';
 const normalizeText = (value) => String(value || '').trim();
@@ -18,22 +19,26 @@ const PUBLIC_ACLS = new Set([
   'aws-exec-read',
 ]);
 const ALLOWED_SERVER_SIDE_ENCRYPTION = new Set(['AES256', 'aws:kms']);
+const MAX_S3_BUFFER_BYTES = Math.max(
+  Number(runtimeConfig.media.s3ObjectMaxBufferBytes || 12 * 1024 * 1024),
+  1024 * 1024
+);
 
 const s3Config = {
-  region: normalizeText(process.env.AWS_REGION),
-  bucket: normalizeText(process.env.AWS_S3_BUCKET),
-  accessKeyId: normalizeText(process.env.AWS_ACCESS_KEY_ID),
-  secretAccessKey: normalizeText(process.env.AWS_SECRET_ACCESS_KEY),
-  sessionToken: normalizeText(process.env.AWS_SESSION_TOKEN),
-  endpoint: normalizeText(process.env.AWS_S3_ENDPOINT),
-  forcePathStyle: normalizeBool(process.env.AWS_S3_FORCE_PATH_STYLE),
-  publicBaseUrl: normalizeText(process.env.AWS_S3_PUBLIC_BASE_URL),
-  objectAcl: normalizeText(process.env.AWS_S3_OBJECT_ACL),
-  mediaUrlMode: normalizeText(process.env.S3_MEDIA_URL_MODE || 'locator').toLowerCase(),
-  enforcePrivateAcl: normalizeBool(process.env.S3_ENFORCE_PRIVATE_ACL || 'true'),
-  serverSideEncryption: normalizeText(process.env.AWS_S3_SERVER_SIDE_ENCRYPTION || 'AES256'),
-  kmsKeyId: normalizeText(process.env.AWS_S3_KMS_KEY_ID),
-  bucketKeyEnabled: normalizeBool(process.env.AWS_S3_BUCKET_KEY_ENABLED || 'true'),
+  region: normalizeText(runtimeConfig.media.s3.region),
+  bucket: normalizeText(runtimeConfig.media.s3.bucket),
+  accessKeyId: normalizeText(runtimeConfig.media.s3.accessKeyId),
+  secretAccessKey: normalizeText(runtimeConfig.media.s3.secretAccessKey),
+  sessionToken: normalizeText(runtimeConfig.media.s3.sessionToken),
+  endpoint: normalizeText(runtimeConfig.media.s3.endpoint),
+  forcePathStyle: normalizeBool(runtimeConfig.media.s3.forcePathStyle),
+  publicBaseUrl: normalizeText(runtimeConfig.media.s3.publicBaseUrl),
+  objectAcl: normalizeText(runtimeConfig.media.s3.objectAcl),
+  mediaUrlMode: normalizeText(runtimeConfig.media.s3.mediaUrlMode || 'locator').toLowerCase(),
+  enforcePrivateAcl: normalizeBool(runtimeConfig.media.s3.enforcePrivateAcl || 'true'),
+  serverSideEncryption: normalizeText(runtimeConfig.media.s3.serverSideEncryption || 'AES256'),
+  kmsKeyId: normalizeText(runtimeConfig.media.s3.kmsKeyId),
+  bucketKeyEnabled: normalizeBool(runtimeConfig.media.s3.bucketKeyEnabled || 'true'),
 };
 
 const isTemplateSecret = (value) => {
@@ -237,7 +242,8 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
     throw new Error('S3 is not configured');
   }
 
-  const body = await fs.promises.readFile(filePath);
+  const stat = await fs.promises.stat(filePath);
+  const body = fs.createReadStream(filePath);
   const contentType = resolveMimeType(filePath);
 
   const command = new PutObjectCommand({
@@ -256,7 +262,7 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
     region: s3Config.region,
     objectKey,
     fileUrl: buildObjectUrl(objectKey),
-    bytes: body.length,
+    bytes: Number(stat.size || 0),
     contentType,
     eTag: response.ETag || null,
   };
@@ -267,7 +273,7 @@ const getPresignedPutObjectUrl = async ({
   contentType = 'image/jpeg',
   contentLength = null,
   metadata = null,
-  expiresInSeconds = Number(process.env.S3_PRESIGNED_URL_TTL_SEC || 900),
+  expiresInSeconds = Number(runtimeConfig.media.s3PresignedPutTtlSec || 900),
 }) => {
   const client = getS3Client();
   if (!client) {
@@ -314,7 +320,7 @@ const getPresignedPutObjectUrl = async ({
 
 const getPresignedGetObjectUrl = async ({
   storageKey,
-  expiresInSeconds = Number(process.env.S3_PRESIGNED_GET_TTL_SEC || 900),
+  expiresInSeconds = Number(runtimeConfig.media.s3PresignedGetTtlSec || 900),
 }) => {
   const client = getS3Client();
   if (!client) return null;
@@ -330,10 +336,18 @@ const getPresignedGetObjectUrl = async ({
   return getSignedUrl(client, command, { expiresIn: safeExpires });
 };
 
-const streamToBuffer = async (stream) => {
+const streamToBuffer = async (stream, maxBytes = MAX_S3_BUFFER_BYTES) => {
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const normalized = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += normalized.length;
+    if (totalBytes > maxBytes) {
+      throw new Error(
+        `S3 object exceeds in-memory buffer limit (${maxBytes} bytes)`
+      );
+    }
+    chunks.push(normalized);
   }
   return Buffer.concat(chunks);
 };

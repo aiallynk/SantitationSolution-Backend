@@ -72,7 +72,7 @@ VALUES (
 )
 ON CONFLICT (id) DO NOTHING;
 
--- bcrypt hash for Password@123 generated in seeder script path.
+-- bcrypt hash for 11111111 generated in seeder script path.
 INSERT INTO platform_users (id, tenant_id, geography_id, full_name, email, phone, password_hash, auth_provider, status)
 VALUES (
   'b7777777-7777-4777-8777-777777777777',
@@ -81,7 +81,7 @@ VALUES (
   'Platform Super Admin',
   'superadmin@platform.gov',
   '9000001111',
-  '$2b$10$S2b7qkKxL7i2/4p0x9p9v.56xq7YdNsmt6q2P6fFtYzseppU2hQrq',
+  '$2b$10$6/1tChha1CAMRNK.OUCOSuvEiGIPyXqQU4jaX1qbfAjiduT9d2QyG',
   'local',
   'active'
 )

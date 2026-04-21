@@ -21,6 +21,7 @@ const {
   decodeTokenExpiry,
 } = require('./token.service');
 const { createAuditLog } = require('../audit/audit.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
@@ -194,10 +195,22 @@ const mapUser = async ({ user, activeTenantId }) => {
 
   return {
     id: user.id,
+    userIdCode: user.user_id_code || null,
     fullName: user.full_name,
     email: user.email,
     phone: user.phone,
     employeeCode: user.employee_code || null,
+    remarks: user.remarks || null,
+    countryName: user.country_name || null,
+    stateName: user.state_name || null,
+    districtName: user.district_name || null,
+    cityName: user.city_name || null,
+    zoneName: user.zone_name || null,
+    wardName: user.ward_name || null,
+    lastLoginAt: user.last_login_at || null,
+    metadata: user.metadata || {},
+    createdAt: user.created_at || null,
+    updatedAt: user.updated_at || null,
     tenantId: activeTenantId,
     defaultTenantId: user.tenant_id,
     geographyId: user.geography_id,
@@ -457,7 +470,7 @@ const forgotPassword = async ({ email, req }) => {
   await PasswordResetToken.create({
     user_id: user.id,
     token_hash: hashToken(resetToken),
-    expires_at: new Date(Date.now() + Number(process.env.PASSWORD_RESET_TTL_MS || 15 * 60 * 1000)),
+    expires_at: new Date(Date.now() + runtimeConfig.auth.passwordResetTtlMs),
   });
 
   await createAuditLog({
@@ -473,7 +486,7 @@ const forgotPassword = async ({ email, req }) => {
   return {
     accepted: true,
     resetToken,
-    expiresInMinutes: Math.round(Number(process.env.PASSWORD_RESET_TTL_MS || 900000) / 60000),
+    expiresInMinutes: Math.round(runtimeConfig.auth.passwordResetTtlMs / 60000),
   };
 };
 
@@ -556,12 +569,35 @@ const updateMe = async ({ userId, body, req }) => {
   }
 
   const updates = {
-    full_name: body.fullName || user.full_name,
-    phone: body.phone || user.phone,
-    employee_code: body.employeeCode ?? user.employee_code,
-    metadata: body.metadata ?? user.metadata,
     updated_at: new Date(),
   };
+
+  if (body.fullName !== undefined) {
+    const fullName = String(body.fullName || '').trim();
+    if (!fullName) {
+      throw new AppError('fullName cannot be blank', 400, { code: 'VALIDATION_ERROR' });
+    }
+    updates.full_name = fullName;
+  }
+
+  if (body.phone !== undefined) {
+    const phone = String(body.phone || '').trim();
+    updates.phone = phone || null;
+  }
+
+  if (body.employeeCode !== undefined) {
+    const employeeCode = String(body.employeeCode || '').trim();
+    updates.employee_code = employeeCode || null;
+  }
+
+  if (body.remarks !== undefined) {
+    const remarks = String(body.remarks || '').trim();
+    updates.remarks = remarks || null;
+  }
+
+  if (body.metadata !== undefined) {
+    updates.metadata = body.metadata === null ? null : body.metadata;
+  }
 
   await user.update(updates);
 

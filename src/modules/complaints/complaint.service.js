@@ -8,7 +8,6 @@ const {
   WorkerAssignment,
   UserRole,
   Role,
-  NotificationEvent,
   Inspection,
   CleaningEvent,
 } = require('../../models');
@@ -18,6 +17,7 @@ const { uploadImage, removeTempFile } = require('../media/storage.service');
 const { resolveMediaUrl } = require('../media/mediaUrl.service');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const { getPublicFeedbackUrl } = require('../platform/toiletQr.service');
+const notificationService = require('../notifications/notification.service');
 const {
   buildAccessContextFromUser,
   applyScopeToQuery,
@@ -946,41 +946,64 @@ const dispatchComplaint = async (req) => {
     requestedAt: now.toISOString(),
   };
 
-  const notifications = [];
-  for (const worker of workerUsers) {
-    notifications.push({
-      tenant_id: tenantId,
-      user_id: worker.id,
-      event_type: 'complaint.dispatch',
-      channel: 'in_app',
+  if (workerUsers.length > 0) {
+    await notificationService.publishNotification({
+      recipients: workerUsers.map((worker) => worker.id),
+      eventType: 'complaint.dispatch',
+      notificationType: 'COMPLAINT',
+      priority: complaint.priority === 'critical' ? 'CRITICAL' : 'HIGH',
+      title: 'Complaint assigned to worker',
+      body: dispatchMessage,
+      shortBody: dispatchMessage,
+      entityType: 'complaint',
+      entityId: complaint.id,
+      route: `/ops/complaints/${complaint.id}`,
+      iconKey: 'complaint',
+      severity: complaint.priority,
+      tenantId,
+      geographyId,
+      facilityId,
+      audienceKind: 'TARGETED_LIST',
+      createdByUserId: req.user.id,
+      dedupeKey: `complaint.dispatch.worker:${complaint.id}:${now.toISOString().slice(0, 16)}`,
+      metadata: {
+        audience: 'worker',
+      },
       payload: {
         ...payloadBase,
         audience: 'worker',
       },
-      status: 'sent',
-      sent_at: now,
-      created_at: now,
-      updated_at: now,
     });
   }
-  for (const supervisor of supervisorUsers) {
-    notifications.push({
-      tenant_id: tenantId,
-      user_id: supervisor.id,
-      event_type: 'complaint.dispatch',
-      channel: 'in_app',
+
+  if (supervisorUsers.length > 0) {
+    await notificationService.publishNotification({
+      recipients: supervisorUsers.map((supervisor) => supervisor.id),
+      eventType: 'complaint.dispatch',
+      notificationType: 'COMPLAINT',
+      priority: complaint.priority === 'critical' ? 'CRITICAL' : 'HIGH',
+      title: 'Complaint escalated to supervisor',
+      body: dispatchMessage,
+      shortBody: dispatchMessage,
+      entityType: 'complaint',
+      entityId: complaint.id,
+      route: `/ops/complaints/${complaint.id}`,
+      iconKey: 'complaint',
+      severity: complaint.priority,
+      tenantId,
+      geographyId,
+      facilityId,
+      audienceKind: 'TARGETED_LIST',
+      createdByUserId: req.user.id,
+      dedupeKey: `complaint.dispatch.supervisor:${complaint.id}:${now.toISOString().slice(0, 16)}`,
+      metadata: {
+        audience: 'supervisor',
+      },
       payload: {
         ...payloadBase,
         audience: 'supervisor',
       },
-      status: 'sent',
-      sent_at: now,
-      created_at: now,
-      updated_at: now,
     });
-  }
-  if (notifications.length > 0) {
-    await NotificationEvent.bulkCreate(notifications);
   }
 
   const nextAssignedTo = complaint.assigned_to_user_id || workerUsers[0]?.id || null;

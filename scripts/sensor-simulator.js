@@ -3,7 +3,7 @@ require('../src/config/env');
 
 const API_BASE_URL = (process.env.SIM_API_BASE_URL || 'http://localhost:5000/api/v1').replace(/\/+$/, '');
 const IDENTIFIER = process.env.SIM_USERNAME || 'superadmin@platform.gov';
-const PASSWORD = process.env.SIM_PASSWORD || 'Password@123';
+const PASSWORD = process.env.SIM_PASSWORD || '11111111';
 const INTERVAL_MS = Number(process.env.SIM_INTERVAL_MS || 5000);
 const DEVICE_LIMIT = Number(process.env.SIM_DEVICE_LIMIT || 10);
 

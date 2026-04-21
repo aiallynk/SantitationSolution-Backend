@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const cloudinary = require('../../config/cloudinary');
 const { isS3Enabled, uploadFileToS3 } = require('./s3.service');
+const { logger } = require('../../core/logging/logger');
+const { runtimeConfig } = require('../../config/runtime');
 
 const uploadRoot = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadRoot)) {
@@ -12,18 +14,13 @@ let s3BackoffLogged = false;
 
 const useCloudinary = () =>
   Boolean(
-    process.env.CLOUDINARY_CLOUD_NAME &&
-      process.env.CLOUDINARY_API_KEY &&
-      process.env.CLOUDINARY_API_SECRET
+    runtimeConfig.media.cloudinary.cloudName &&
+      runtimeConfig.media.cloudinary.apiKey &&
+      runtimeConfig.media.cloudinary.apiSecret
   );
 
 const allowS3FallbackToLocal = () => {
-  const configured = String(process.env.S3_FALLBACK_TO_LOCAL || '')
-    .trim()
-    .toLowerCase();
-  if (configured === 'true') return true;
-  if (configured === 'false') return false;
-  return String(process.env.NODE_ENV || 'development').toLowerCase() === 'development';
+  return Boolean(runtimeConfig.media.s3FallbackToLocal);
 };
 
 const resolveMimeType = (filePath) => {
@@ -118,8 +115,7 @@ const uploadImage = async (filePath, targetFolder) => {
           s3BackoffUntilTs = Date.now() + 10 * 60 * 1000;
           if (!s3BackoffLogged) {
             s3BackoffLogged = true;
-            // eslint-disable-next-line no-console
-            console.error(
+            logger.error(
               'S3 access denied. Temporarily falling back to local media storage for 10 minutes.'
             );
           }
@@ -127,8 +123,9 @@ const uploadImage = async (filePath, targetFolder) => {
         if (!allowLocalFallback) {
           throw new Error(`S3 upload failed and local fallback is disabled: ${error.message}`);
         }
-        // eslint-disable-next-line no-console
-        console.error('S3 upload failed, falling back to local storage:', error.message);
+        logger.warn('S3 upload failed, falling back to local storage', {
+          error: error.message,
+        });
       }
     } else if (!allowLocalFallback) {
       throw new Error(
@@ -148,8 +145,7 @@ const removeTempFile = async (filePath) => {
     await fs.promises.unlink(filePath);
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      // eslint-disable-next-line no-console
-      console.error('Failed to remove temp file:', error.message);
+      logger.warn('Failed to remove temp file', { error: error.message });
     }
   }
 };

@@ -1,12 +1,13 @@
 const sharp = require('sharp');
 const { resolveMediaBuffer } = require('./analysisMediaResolver.service');
+const { runtimeConfig } = require('../../config/runtime');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
-const BLUR_VARIANCE_MIN = Number(process.env.ANALYSIS_BLUR_VARIANCE_MIN || 120);
-const BRIGHTNESS_MIN = Number(process.env.ANALYSIS_BRIGHTNESS_MIN || 35);
-const BRIGHTNESS_MAX = Number(process.env.ANALYSIS_BRIGHTNESS_MAX || 220);
-const MAX_DIMENSION = Number(process.env.ANALYSIS_VALIDATION_MAX_DIMENSION || 768);
+const BLUR_VARIANCE_MIN = runtimeConfig.analysis.blurVarianceMin;
+const BRIGHTNESS_MIN = runtimeConfig.analysis.brightnessMin;
+const BRIGHTNESS_MAX = runtimeConfig.analysis.brightnessMax;
+const MAX_DIMENSION = runtimeConfig.analysis.validationMaxDimension;
 
 const variance = (values = []) => {
   if (!Array.isArray(values) || values.length === 0) return 0;

@@ -12,6 +12,7 @@ const {
 } = require('../media/s3.service');
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { IMAGE_PROCESSING_STATES } = require('./imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
 const DEFAULT_RECONCILE_INTERVAL_MS = 45 * 1000;
 const DEFAULT_RECONCILE_BATCH_SIZE = 100;
@@ -21,29 +22,28 @@ const DEFAULT_SESSION_STALE_MS = 90 * 1000;
 let reconcileTimer = null;
 let reconcileRunning = false;
 
-const isAutoAnalysisOnUploadEnabled = () =>
-  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').toLowerCase() === 'true';
+const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
 const resolveReconcileIntervalMs = () => {
-  const value = Number(process.env.IMAGE_SESSION_RECONCILE_INTERVAL_MS || DEFAULT_RECONCILE_INTERVAL_MS);
+  const value = Number(runtimeConfig.imageSession.reconcileIntervalMs || DEFAULT_RECONCILE_INTERVAL_MS);
   if (Number.isFinite(value) && value >= 10000) return value;
   return DEFAULT_RECONCILE_INTERVAL_MS;
 };
 
 const resolveReconcileBatchSize = () => {
-  const value = Number(process.env.IMAGE_SESSION_RECONCILE_BATCH_SIZE || DEFAULT_RECONCILE_BATCH_SIZE);
+  const value = Number(runtimeConfig.imageSession.reconcileBatchSize || DEFAULT_RECONCILE_BATCH_SIZE);
   if (Number.isFinite(value) && value >= 1) return Math.min(value, 500);
   return DEFAULT_RECONCILE_BATCH_SIZE;
 };
 
 const resolveSessionStaleMs = () => {
-  const value = Number(process.env.IMAGE_SESSION_STALE_MS || DEFAULT_SESSION_STALE_MS);
+  const value = Number(runtimeConfig.imageSession.staleMs || DEFAULT_SESSION_STALE_MS);
   if (Number.isFinite(value) && value >= 30000) return value;
   return DEFAULT_SESSION_STALE_MS;
 };
 
 const resolveMaxAttempts = () => {
-  const value = Number(process.env.IMAGE_SESSION_RECONCILE_MAX_ATTEMPTS || DEFAULT_MAX_RECONCILE_ATTEMPTS);
+  const value = Number(runtimeConfig.imageSession.reconcileMaxAttempts || DEFAULT_MAX_RECONCILE_ATTEMPTS);
   if (Number.isFinite(value) && value > 0) return Math.min(value, 20);
   return DEFAULT_MAX_RECONCILE_ATTEMPTS;
 };

@@ -45,6 +45,10 @@ const NEW_USER_EMAILS = [
   'worker1@nmc.gov.in',
 ];
 
+const DEFAULT_SEED_PASSWORD = String(
+  process.env.DEFAULT_SEED_PASSWORD || process.env.PERSONA_SEED_PASSWORD || '11111111'
+);
+
 /** @type {import('sequelize-cli').Migration} */
 module.exports = {
   async up(queryInterface) {
@@ -163,7 +167,7 @@ module.exports = {
     );
     const userByEmail = Object.fromEntries(existingUsers.map((row) => [row.email, row.id]));
 
-    const passwordHash = await bcrypt.hash('Password@123', 10);
+    const passwordHash = await bcrypt.hash(DEFAULT_SEED_PASSWORD, 10);
     const usersToInsert = [
       {
         id: crypto.randomUUID(),

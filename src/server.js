@@ -1,3 +1,14 @@
+require('./config/env');
+const { logger, installGlobalConsoleBridge } = require('./core/logging/logger');
+const { markReady, markNotReady } = require('./core/runtime/readiness');
+const { runtimeConfig, validateRuntimeConfig } = require('./config/runtime');
+const {
+  startTempFileJanitor,
+  stopTempFileJanitor,
+} = require('./core/runtime/tempFileJanitor');
+
+installGlobalConsoleBridge();
+
 const app = require('./app');
 const { sequelize, ToiletUnit } = require('./models');
 const { registerAnalysisWorker } = require('./modules/analysis/analysis.queue');
@@ -24,11 +35,16 @@ const {
 const { execSync } = require('child_process');
 const net = require('net');
 
-const PORT = Number(process.env.PORT || 5000);
-const DB_STARTUP_MAX_ATTEMPTS = Number(process.env.DB_STARTUP_MAX_ATTEMPTS || 4);
-const DB_STARTUP_RETRY_DELAY_MS = Number(process.env.DB_STARTUP_RETRY_DELAY_MS || 2000);
+const PORT = runtimeConfig.app.port;
+const DB_STARTUP_MAX_ATTEMPTS = runtimeConfig.server.dbStartupMaxAttempts;
+const DB_STARTUP_RETRY_DELAY_MS = runtimeConfig.server.dbStartupRetryDelayMs;
+const SERVER_REQUEST_TIMEOUT_MS = runtimeConfig.server.requestTimeoutMs;
+const SERVER_HEADERS_TIMEOUT_MS = runtimeConfig.server.headersTimeoutMs;
+const SERVER_KEEPALIVE_TIMEOUT_MS = runtimeConfig.server.keepAliveTimeoutMs;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = runtimeConfig.server.gracefulShutdownTimeoutMs;
 
 let server = null;
+let shutdownInProgress = false;
 
 const TRANSIENT_DB_ERROR_CODES = new Set([
   'ENOTFOUND',
@@ -136,12 +152,13 @@ const runWithTransientDbRetry = async (label, operation) => {
         throw error;
       }
 
-      // eslint-disable-next-line no-console
-      console.warn(
-        `${label} failed with a transient DB/network error (attempt ${attempt}/${attempts}): ${error.message}`
-      );
-      // eslint-disable-next-line no-console
-      console.warn(`Retrying ${label.toLowerCase()} in ${delayMs}ms...`);
+      logger.warn('Transient DB/network error during startup operation', {
+        operation: label,
+        attempt,
+        attempts,
+        error: error.message,
+        retryInMs: delayMs,
+      });
       await sleep(delayMs);
     }
   }
@@ -150,10 +167,7 @@ const runWithTransientDbRetry = async (label, operation) => {
 };
 
 const shouldProbeRedis = () =>
-  Boolean(
-    process.env.REDIS_URL &&
-      String(process.env.REDIS_ENABLED || 'true').toLowerCase() === 'true'
-  );
+  Boolean(runtimeConfig.redis.url && runtimeConfig.redis.enabled);
 
 const probeRedisConnectivity = async () => {
   if (!shouldProbeRedis()) {
@@ -162,11 +176,10 @@ const probeRedisConnectivity = async () => {
 
   let url;
   try {
-    url = new URL(process.env.REDIS_URL);
+    url = new URL(runtimeConfig.redis.url);
   } catch (_) {
-    // eslint-disable-next-line no-console
-    console.warn('REDIS_URL is invalid. Disabling Redis features for this process.');
-    process.env.REDIS_ENABLED = 'false';
+    logger.warn('REDIS_URL is invalid. Disabling Redis features for this process.');
+    runtimeConfig.redis.enabled = false;
     return false;
   }
 
@@ -185,11 +198,12 @@ const probeRedisConnectivity = async () => {
       settled = true;
       socket.destroy();
       if (!ok) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `Redis is not reachable at ${host}:${port}${reason ? ` (${reason})` : ''}. Falling back to local mode.`
-        );
-        process.env.REDIS_ENABLED = 'false';
+        logger.warn('Redis is not reachable. Falling back to local mode.', {
+          host,
+          port,
+          reason: reason || null,
+        });
+        runtimeConfig.redis.enabled = false;
       }
       resolve(ok);
     };
@@ -202,19 +216,9 @@ const probeRedisConnectivity = async () => {
   });
 };
 
-const shouldAutoRunMigrations = () => {
-  const configured = String(process.env.AUTO_RUN_MIGRATIONS || '').trim().toLowerCase();
-  if (configured === 'true') return true;
-  if (configured === 'false') return false;
-  return String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production';
-};
+const shouldAutoRunMigrations = () => Boolean(runtimeConfig.server.autoRunMigrations);
 
-const shouldFailOnMigrationError = () => {
-  const configured = String(process.env.AUTO_RUN_MIGRATIONS_STRICT || '').trim().toLowerCase();
-  if (configured === 'true') return true;
-  if (configured === 'false') return false;
-  return String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production';
-};
+const shouldFailOnMigrationError = () => Boolean(runtimeConfig.server.autoRunMigrationsStrict);
 
 const runPendingMigrations = async () => {
   if (!shouldAutoRunMigrations()) {
@@ -222,8 +226,7 @@ const runPendingMigrations = async () => {
   }
 
   try {
-    // eslint-disable-next-line no-console
-    console.log('Checking and applying pending database migrations...');
+    logger.info('Checking and applying pending database migrations');
     await runWithTransientDbRetry('Database migration check', async () => {
       try {
         const output = execSync('npx sequelize-cli db:migrate', {
@@ -245,11 +248,11 @@ const runPendingMigrations = async () => {
         throw error;
       }
     });
-    // eslint-disable-next-line no-console
-    console.log('Database migrations are up to date');
+    logger.info('Database migrations are up to date');
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('Auto migration failed. Continue with current schema. Error:', error.message);
+    logger.error('Auto migration failed. Continue with current schema.', {
+      error: error.message,
+    });
     if (shouldFailOnMigrationError()) {
       throw error;
     }
@@ -257,23 +260,12 @@ const runPendingMigrations = async () => {
 };
 
 const shouldAutoBackfillQrOnBoot = () => {
-  const configured = String(process.env.AUTO_BACKFILL_TOILET_QR_ON_BOOT || '')
-    .trim()
-    .toLowerCase();
-  if (configured === 'false') return false;
-  if (configured === 'true') return true;
-  return true;
+  return Boolean(runtimeConfig.server.autoBackfillToiletQrOnBoot);
 };
 
-const shouldFailOnAnalysisConfigError = () => {
-  const configured = String(process.env.ANALYSIS_BOOT_STRICT || '').trim().toLowerCase();
-  if (configured === 'true') return true;
-  if (configured === 'false') return false;
-  return false;
-};
+const shouldFailOnAnalysisConfigError = () => Boolean(runtimeConfig.server.analysisBootStrict);
 
-const isAnalysisTriggerOnUploadEnabled = () =>
-  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').trim().toLowerCase() === 'true';
+const isAnalysisTriggerOnUploadEnabled = () => Boolean(runtimeConfig.analysis.triggerOnUpload);
 
 const validateAnalysisConfigAtBoot = () => {
   const state = getOpenAiAnalysisConfigState();
@@ -291,13 +283,11 @@ const validateAnalysisConfigAtBoot = () => {
     throw error;
   }
 
-  // eslint-disable-next-line no-console
-  console.warn(`${message} Continuing boot with AI analysis disabled.`);
+  logger.warn(`${message} Continuing boot with AI analysis disabled.`);
 
   if (isAnalysisTriggerOnUploadEnabled()) {
-    process.env.ANALYSIS_TRIGGER_ON_UPLOAD = 'false';
-    // eslint-disable-next-line no-console
-    console.warn('ANALYSIS_TRIGGER_ON_UPLOAD has been forced to false for this process.');
+    runtimeConfig.analysis.triggerOnUpload = false;
+    logger.warn('ANALYSIS_TRIGGER_ON_UPLOAD has been forced to false for this process.');
   }
 };
 
@@ -307,34 +297,46 @@ const backfillToiletQrOnBoot = async () => {
   }
 
   try {
-    const forceRegenerate =
-      String(process.env.QR_FORCE_REGENERATE_ON_BOOT || 'false').trim().toLowerCase() ===
-      'true';
+    const forceRegenerate = Boolean(runtimeConfig.server.qrForceRegenerateOnBoot);
     const units = await ToiletUnit.findAll({
       attributes: ['id', 'code', 'qr_code'],
     });
     const result = await ensureQrImagesForToilets(units, {
       forceRegenerate,
     });
-    // eslint-disable-next-line no-console
-    console.log(
-      `Toilet QR bootstrap completed: total=${result.total} generated=${result.generated} skipped=${result.skipped} failed=${result.failed} forceRegenerate=${forceRegenerate}`
-    );
+    logger.info('Toilet QR bootstrap completed', {
+      total: result.total,
+      generated: result.generated,
+      skipped: result.skipped,
+      failed: result.failed,
+      forceRegenerate,
+    });
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn('Toilet QR bootstrap failed:', error.message);
+    logger.warn('Toilet QR bootstrap failed', { error: error.message });
   }
 };
 
 const bootstrap = async () => {
   try {
+    const configValidation = validateRuntimeConfig({
+      requireAnalysis: runtimeConfig.analysis.triggerOnUpload,
+    });
+    if (!configValidation.ok) {
+      throw new Error(`Invalid runtime config: ${configValidation.errors.join(' | ')}`);
+    }
+    if (runtimeConfig.deprecated.activeKeys.length > 0) {
+      logger.warn('Deprecated environment variables detected; these are ignored now', {
+        keys: runtimeConfig.deprecated.activeKeys,
+      });
+    }
+
+    markNotReady('bootstrapping');
     validateAnalysisConfigAtBoot();
     await runPendingMigrations();
     await runWithTransientDbRetry('Database connection', async () => {
       await sequelize.authenticate();
     });
-    // eslint-disable-next-line no-console
-    console.log('Database connection established');
+    logger.info('Database connection established');
     await backfillToiletQrOnBoot();
     await probeRedisConnectivity();
     assertQueueRuntimePolicy();
@@ -348,46 +350,63 @@ const bootstrap = async () => {
         },
       });
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error('Live Redis bridge unavailable, using single-node live events:', error.message);
+      logger.warn('Live Redis bridge unavailable, using single-node live events', {
+        error: error.message,
+      });
     }
 
-    const runEmbeddedWorker =
-      String(process.env.ANALYSIS_WORKER_EMBEDDED || 'true').toLowerCase() === 'true';
+    const runEmbeddedWorker = Boolean(runtimeConfig.server.analysisWorkerEmbedded);
     if (isRedisEnabled() && runEmbeddedWorker) {
       registerAnalysisWorker();
-      // eslint-disable-next-line no-console
-      console.log('Analysis worker registered (embedded mode)');
+      logger.info('Analysis worker registered (embedded mode)');
     } else if (isRedisEnabled()) {
-      // eslint-disable-next-line no-console
-      console.log('Analysis worker is expected to run as a separate process');
+      logger.info('Analysis worker is expected to run as a separate process');
     } else {
-      if (String(process.env.REDIS_REQUIRED_IN_PROD || 'false').toLowerCase() === 'true' &&
-          String(process.env.NODE_ENV || 'development').toLowerCase() === 'production') {
+      if (runtimeConfig.redis.requiredInProduction && runtimeConfig.isProduction) {
         throw new Error('Redis queue is mandatory in production and is currently unavailable');
       }
-      // eslint-disable-next-line no-console
-      console.warn('Redis disabled: analysis queue running in inline fallback mode');
+      logger.warn('Redis disabled: analysis queue running in inline fallback mode');
     }
 
     startAnalysisJobWatchdog();
     startImageSessionReconciler();
+    startTempFileJanitor();
 
     server = app.listen(PORT, () => {
-      // eslint-disable-next-line no-console
-      console.log(`Server is running on port ${PORT}`);
+      logger.info('Server is running', {
+        port: PORT,
+        requestTimeoutMs: SERVER_REQUEST_TIMEOUT_MS,
+        keepAliveTimeoutMs: SERVER_KEEPALIVE_TIMEOUT_MS,
+      });
     });
+    server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
+    server.headersTimeout = SERVER_HEADERS_TIMEOUT_MS;
+    server.keepAliveTimeout = SERVER_KEEPALIVE_TIMEOUT_MS;
     startWebSocketServer(server);
+    markReady('serving');
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('Server bootstrap failed:', error);
+    logger.error('Server bootstrap failed', { error });
+    markNotReady('bootstrap_failed');
     process.exit(1);
   }
 };
 
-const gracefulShutdown = async (signal) => {
-  // eslint-disable-next-line no-console
-  console.log(`Received ${signal}. Starting graceful shutdown...`);
+const gracefulShutdown = async (signal, exitCode = 0) => {
+  if (shutdownInProgress) {
+    return;
+  }
+  shutdownInProgress = true;
+  markNotReady(`shutting_down:${signal}`);
+  logger.info('Received shutdown signal. Starting graceful shutdown.', { signal });
+
+  const hardStopTimer = setTimeout(() => {
+    logger.error('Graceful shutdown timed out. Forcing process exit.', {
+      timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+    });
+    process.exit(1);
+  }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+  hardStopTimer.unref?.();
+
   try {
     if (server) {
       await new Promise((resolve) => {
@@ -398,19 +417,34 @@ const gracefulShutdown = async (signal) => {
     await closeLiveRedisBridge();
     stopAnalysisJobWatchdog();
     stopImageSessionReconciler();
+    stopTempFileJanitor();
     await closeQueues();
     await sequelize.close();
-    // eslint-disable-next-line no-console
-    console.log('Shutdown complete');
+    logger.info('Shutdown complete');
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('Shutdown encountered errors:', error);
+    logger.error('Shutdown encountered errors', { error });
+    exitCode = 1;
   } finally {
-    process.exit(0);
+    clearTimeout(hardStopTimer);
+    process.exit(exitCode);
   }
 };
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { reason });
+  void gracefulShutdown('unhandledRejection', 1);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception', { error });
+  void gracefulShutdown('uncaughtException', 1);
+});
 
 bootstrap();

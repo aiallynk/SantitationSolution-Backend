@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
+const { runtimeConfig } = require('../../config/runtime');
 
 const QR_ROOT_DIR = path.join(process.cwd(), 'uploads', 'qr', 'toilets');
 const FEEDBACK_QR_SUBDIR = 'public-feedback';
@@ -61,30 +62,19 @@ const normalizeBaseUrl = (rawValue) => {
 };
 
 const resolvePublicFeedbackBaseUrl = () => {
-  const explicit = normalizeBaseUrl(process.env.PUBLIC_FEEDBACK_BASE_URL);
+  const explicit = normalizeBaseUrl(runtimeConfig.urls.publicFeedbackBaseUrl);
   if (explicit) {
     return explicit;
   }
 
-  // Render exposes the externally routable service URL via this env var.
-  const renderExternalUrl = normalizeBaseUrl(process.env.RENDER_EXTERNAL_URL);
-  if (renderExternalUrl) {
-    return renderExternalUrl;
-  }
-
-  // Optional generic override for other platforms.
-  const apiPublicBaseUrl = normalizeBaseUrl(process.env.API_PUBLIC_BASE_URL);
+  const apiPublicBaseUrl = normalizeBaseUrl(runtimeConfig.urls.apiPublicBaseUrl);
   if (apiPublicBaseUrl) {
     return apiPublicBaseUrl;
   }
 
-  const protocol =
-    String(process.env.PUBLIC_FEEDBACK_PROTOCOL || 'http').trim().toLowerCase() ===
-    'https'
-      ? 'https'
-      : 'http';
-  const host = String(process.env.PUBLIC_FEEDBACK_HOST || 'localhost').trim() || 'localhost';
-  const rawPort = Number(process.env.PUBLIC_FEEDBACK_PORT || process.env.PORT || 5000);
+  const protocol = 'http';
+  const host = 'localhost';
+  const rawPort = Number(runtimeConfig.app.port || 5000);
   const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 5000;
   const includePort = !(
     (protocol === 'http' && port === 80) ||

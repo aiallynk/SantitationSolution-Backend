@@ -12,8 +12,9 @@ const { validateIngestion, validateSensorListQuery } = require('./sensor.validat
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
+const SENSOR_ROUTE_PREFIXES = ['/sensor-ingestion', '/sensors', '/facilities', '/alerts'];
 
-router.use(protect);
+router.use(SENSOR_ROUTE_PREFIXES, protect);
 
 router.post('/sensor-ingestion/readings', requirePermissions('sensor.ingest'), validate(validateIngestion), sensorController.postIngestion);
 router.get(

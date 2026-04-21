@@ -1,9 +1,11 @@
 const crypto = require('crypto');
 const AppError = require('../errors/AppError');
 const { IdempotencyKey } = require('../../models');
+const { runtimeConfig } = require('../../config/runtime');
 
-const DEFAULT_LOCK_MS = Number(process.env.IDEMPOTENCY_LOCK_MS || 60_000);
-const DEFAULT_TTL_MS = Number(process.env.IDEMPOTENCY_TTL_MS || 86_400_000);
+const DEFAULT_LOCK_MS = runtimeConfig.idempotency.lockMs;
+const DEFAULT_TTL_MS = runtimeConfig.idempotency.ttlMs;
+const DEFAULT_RESPONSE_MAX_BYTES = runtimeConfig.idempotency.responseMaxBytes;
 
 const stableStringify = (value) => {
   if (value === null || value === undefined) {
@@ -41,6 +43,14 @@ const normalizeHeaderValue = (value) =>
 const resolveScopedKey = ({ tenantId, idempotencyKey }) =>
   `${tenantId || 'platform'}:${idempotencyKey}`;
 
+const estimateJsonSizeBytes = (value) => {
+  try {
+    return Buffer.byteLength(JSON.stringify(value));
+  } catch (_) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+};
+
 const withIdempotency = (scope, options = {}) => {
   const scopeName = String(scope || '').trim();
   if (!scopeName) {
@@ -56,6 +66,10 @@ const withIdempotency = (scope, options = {}) => {
       ? Number(options.ttlMs)
       : DEFAULT_TTL_MS;
   const storeResponse = options.storeResponse !== false;
+  const responseMaxBytes =
+    Number.isFinite(Number(options.responseMaxBytes)) && Number(options.responseMaxBytes) > 0
+      ? Number(options.responseMaxBytes)
+      : DEFAULT_RESPONSE_MAX_BYTES;
   const requireKey = options.requireKey === true;
 
   return async (req, res, next) => {
@@ -205,7 +219,8 @@ const withIdempotency = (scope, options = {}) => {
           storeResponse &&
           res.statusCode >= 200 &&
           res.statusCode < 500 &&
-          capturedBody !== null;
+          capturedBody !== null &&
+          estimateJsonSizeBytes(capturedBody) <= responseMaxBytes;
         const updatePayload = shouldPersist
           ? {
               response_code: res.statusCode,

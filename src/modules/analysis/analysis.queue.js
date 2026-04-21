@@ -9,11 +9,13 @@ const {
   InspectionMedia,
 } = require('../../models');
 const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
 const ANALYSIS_QUEUE = 'inspection-analysis';
 const ANALYSIS_JOB_TYPE = 'AI_ANALYSIS';
 const DEFAULT_INLINE_TIMEOUT_MS = 120000;
 const DEFAULT_INLINE_CONCURRENCY = 2;
+const DEFAULT_INLINE_QUEUE_MAX = 1000;
 const DEFAULT_DEDUP_WINDOW_MS = 120000;
 const STALE_RUNNING_FAILURE_MS = 180000;
 
@@ -22,7 +24,7 @@ const inlineQueuedKeys = new Set();
 let inlineActiveCount = 0;
 
 const resolveMaxAttempts = () => {
-  const value = Number(process.env.ANALYSIS_QUEUE_ATTEMPTS || process.env.QUEUE_ATTEMPTS || 3);
+  const value = Number(runtimeConfig.queue.analysisQueueAttempts || runtimeConfig.queue.attempts || 3);
   if (Number.isFinite(value) && value > 0) {
     return Math.min(value, 10);
   }
@@ -30,7 +32,7 @@ const resolveMaxAttempts = () => {
 };
 
 const resolveInlineTimeoutMs = () => {
-  const value = Number(process.env.ANALYSIS_INLINE_JOB_TIMEOUT_MS || DEFAULT_INLINE_TIMEOUT_MS);
+  const value = Number(runtimeConfig.queue.analysisInlineTimeoutMs || DEFAULT_INLINE_TIMEOUT_MS);
   if (Number.isFinite(value) && value >= 15000) {
     return value;
   }
@@ -38,7 +40,7 @@ const resolveInlineTimeoutMs = () => {
 };
 
 const resolveInlineConcurrency = () => {
-  const value = Number(process.env.ANALYSIS_INLINE_CONCURRENCY || DEFAULT_INLINE_CONCURRENCY);
+  const value = Number(runtimeConfig.queue.analysisInlineConcurrency || DEFAULT_INLINE_CONCURRENCY);
   if (Number.isFinite(value) && value > 0) {
     return Math.min(value, 8);
   }
@@ -46,11 +48,19 @@ const resolveInlineConcurrency = () => {
 };
 
 const resolveDedupWindowMs = () => {
-  const value = Number(process.env.ANALYSIS_DEDUP_WINDOW_MS || DEFAULT_DEDUP_WINDOW_MS);
+  const value = Number(runtimeConfig.queue.analysisDedupWindowMs || DEFAULT_DEDUP_WINDOW_MS);
   if (Number.isFinite(value) && value >= 10000) {
     return value;
   }
   return DEFAULT_DEDUP_WINDOW_MS;
+};
+
+const resolveInlineQueueMax = () => {
+  const value = Number(runtimeConfig.queue.analysisInlineQueueMax || DEFAULT_INLINE_QUEUE_MAX);
+  if (Number.isFinite(value) && value >= 50) {
+    return Math.min(value, 10000);
+  }
+  return DEFAULT_INLINE_QUEUE_MAX;
 };
 
 const buildInlineTaskKey = ({
@@ -517,9 +527,9 @@ const enqueueInspectionAnalysis = async ({
       attempts: maxAttempts,
       backoff: {
         type: 'exponential',
-        delay: Number(process.env.ANALYSIS_QUEUE_BACKOFF_MS || process.env.QUEUE_BACKOFF_MS || 1000),
+        delay: Number(runtimeConfig.queue.analysisQueueBackoffMs || runtimeConfig.queue.backoffMs || 1000),
       },
-      removeOnComplete: Number(process.env.ANALYSIS_QUEUE_REMOVE_COMPLETE || 200),
+      removeOnComplete: Number(runtimeConfig.queue.analysisQueueRemoveOnComplete || 200),
       removeOnFail: false,
       ...(Number.isFinite(Number(delayMs)) && Number(delayMs) > 0
         ? { delay: Number(delayMs) }
@@ -599,6 +609,29 @@ const enqueueInspectionAnalysis = async ({
   });
 
   inlineQueuedKeys.add(inlineKey);
+  if (inlineQueue.length >= resolveInlineQueueMax()) {
+    inlineQueuedKeys.delete(inlineKey);
+    await markInlineJobFailure({
+      inspectionId,
+      tenantId,
+      submissionId,
+      imageId,
+      queueJobId: degradedQueueJobId,
+      jobType: payload.type,
+      error: new Error(
+        'Inline analysis queue capacity reached. Try again later or enable Redis-backed workers.'
+      ),
+    });
+    return {
+      queued: false,
+      inline: true,
+      rejected: true,
+      queueJobId: degradedQueueJobId,
+      type: payload.type,
+      imageId,
+    };
+  }
+
   inlineQueue.push({
     key: inlineKey,
     inspectionId,
@@ -634,7 +667,9 @@ const registerAnalysisWorker = () => {
       });
     },
     {
-      concurrency: Number(process.env.ANALYSIS_WORKER_CONCURRENCY || process.env.QUEUE_WORKER_CONCURRENCY || 2),
+      concurrency: Number(
+        runtimeConfig.queue.analysisWorkerConcurrency || runtimeConfig.queue.workerConcurrency || 2
+      ),
     }
   );
 

@@ -1,9 +1,5 @@
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
-const multer = require('multer');
 const complaintController = require('./complaint.controller');
-const AppError = require('../../core/errors/AppError');
 const {
   protect,
   requirePermissions,
@@ -20,63 +16,13 @@ const {
   validateComplaintDispatch,
 } = require('./complaint.validator');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
+const { createImageDiskUpload } = require('../media/uploadPolicy');
 
 const router = express.Router();
 
-const publicTempDir = path.join(process.cwd(), 'uploads', 'temp', 'public-feedback');
-if (!fs.existsSync(publicTempDir)) {
-  fs.mkdirSync(publicTempDir, { recursive: true });
-}
-
-const publicStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, publicTempDir),
-  filename: (req, file, cb) => {
-    const extension = path.extname(file.originalname || '');
-    cb(
-      null,
-      `public-feedback-${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`
-    );
-  },
-});
-
-const publicUpload = multer({
-  storage: publicStorage,
-  limits: {
-    fileSize: Number(process.env.MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024),
-  },
-  fileFilter: (req, file, cb) => {
-    const mimetype = String(file.mimetype || '').toLowerCase();
-    const originalName = String(file.originalname || '');
-    const extension = path.extname(originalName).toLowerCase();
-    const allowedExtensions = new Set([
-      '.png',
-      '.jpg',
-      '.jpeg',
-      '.webp',
-      '.gif',
-      '.bmp',
-      '.heic',
-      '.heif',
-    ]);
-    const isImageMime = mimetype.startsWith('image/');
-    const canTrustExtension =
-      (mimetype === '' || mimetype === 'application/octet-stream') &&
-      allowedExtensions.has(extension);
-
-    if (!isImageMime && !canTrustExtension) {
-      return cb(
-        new AppError('Only image uploads are supported', 400, {
-          code: 'INVALID_MEDIA_TYPE',
-          details: {
-            mimetype: mimetype || null,
-            originalName,
-            extension: extension || null,
-          },
-        })
-      );
-    }
-    return cb(null, true);
-  },
+const publicUpload = createImageDiskUpload({
+  filenamePrefix: 'public-feedback',
+  tempSubdir: 'public-feedback',
 });
 
 router.get(
@@ -89,8 +35,9 @@ router.post(
   complaintController.postPublicFeedback
 );
 
-router.use(protect);
+router.use('/complaints', protect);
 router.use(
+  '/complaints',
   requireSurface(
     SurfaceTypes.OPS_WEB,
     SurfaceTypes.OPS_WEB_AND_MOBILE,

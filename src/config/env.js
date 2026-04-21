@@ -1,12 +1,9 @@
-const dotenv = require('dotenv');
-
-dotenv.config({
-  override: true,
-  quiet: true,
-});
+const { runtimeConfig, validateRuntimeConfig } = require('./runtime');
 
 module.exports = {
-  NODE_ENV: process.env.NODE_ENV || 'development',
-  PORT: Number(process.env.PORT || 5000),
+  ...runtimeConfig,
+  NODE_ENV: runtimeConfig.env,
+  PORT: runtimeConfig.app.port,
+  IS_PRODUCTION: runtimeConfig.isProduction,
+  validateRuntimeConfig,
 };
-

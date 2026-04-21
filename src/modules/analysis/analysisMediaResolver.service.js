@@ -1,6 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const { getObjectBufferFromS3 } = require('../media/s3.service');
+const { logger } = require('../../core/logging/logger');
+const { runtimeConfig } = require('../../config/runtime');
+
+const MAX_MEDIA_RESOLVE_BYTES = Math.max(runtimeConfig.analysis.mediaMaxBytes, 1024 * 1024);
+const REMOTE_FETCH_TIMEOUT_MS = Math.max(runtimeConfig.analysis.mediaFetchTimeoutMs, 1000);
 
 const getMimeType = (filePath) => {
   const ext = path.extname(filePath || '').toLowerCase();
@@ -40,7 +45,23 @@ const resolveLocalCandidates = ({ fileUrl, storageKey }) => {
 };
 
 const readLocalImage = async (candidate) => {
-  if (!candidate || !fs.existsSync(candidate)) return null;
+  if (!candidate) return null;
+  let stat;
+  try {
+    stat = await fs.promises.stat(candidate);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isFile()) return null;
+  if (Number(stat.size || 0) > MAX_MEDIA_RESOLVE_BYTES) {
+    logger.warn('Skipping local analysis image because file is too large', {
+      localPath: candidate,
+      bytes: Number(stat.size || 0),
+      maxBytes: MAX_MEDIA_RESOLVE_BYTES,
+    });
+    return null;
+  }
   const buffer = await fs.promises.readFile(candidate);
   if (!buffer || buffer.length === 0) return null;
   return {
@@ -65,6 +86,9 @@ const decodeDataUrl = (value) => {
     const buffer = isBase64
       ? Buffer.from(dataPart, 'base64')
       : Buffer.from(decodeURIComponent(dataPart), 'utf8');
+    if (buffer.length > MAX_MEDIA_RESOLVE_BYTES) {
+      return null;
+    }
     return {
       buffer,
       mimeType,
@@ -76,14 +100,32 @@ const decodeDataUrl = (value) => {
 };
 
 const fetchRemoteImage = async (url) => {
-  const response = await fetch(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REMOTE_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!response.ok) {
     throw new Error(`Unable to fetch image (${response.status})`);
+  }
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_MEDIA_RESOLVE_BYTES) {
+    throw new Error(
+      `Remote image too large (${contentLength} bytes > ${MAX_MEDIA_RESOLVE_BYTES})`
+    );
   }
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
   if (!buffer || buffer.length === 0) {
     throw new Error('Fetched image is empty');
+  }
+  if (buffer.length > MAX_MEDIA_RESOLVE_BYTES) {
+    throw new Error(
+      `Remote image too large (${buffer.length} bytes > ${MAX_MEDIA_RESOLVE_BYTES})`
+    );
   }
   return {
     buffer,

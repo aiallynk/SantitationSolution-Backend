@@ -1,12 +1,17 @@
 const rateLimit = require('express-rate-limit');
+const { runtimeConfig } = require('../../config/runtime');
 
 const isIngestionPath = (req) =>
   /^\/api\/v1\/inspections\/[^/]+\/media(?:\/|$)/i.test(String(req.originalUrl || req.path || ''));
+const isInfraPath = (req) => {
+  const path = String(req.path || req.originalUrl || '').split('?')[0];
+  return path === '/health' || path === '/ready' || path === '/';
+};
 
 const apiRateLimit = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000),
-  max: Number(process.env.RATE_LIMIT_MAX || 300),
-  skip: (req) => isIngestionPath(req),
+  windowMs: Number(runtimeConfig.security.rateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.rateLimitMax || 300),
+  skip: (req) => isIngestionPath(req) || isInfraPath(req),
   standardHeaders: true,
   legacyHeaders: false,
   message: {
@@ -17,8 +22,8 @@ const apiRateLimit = rateLimit({
 });
 
 const ingestionRateLimit = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000),
-  max: Number(process.env.INGEST_RATE_LIMIT_MAX || 5000),
+  windowMs: Number(runtimeConfig.security.rateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.ingestRateLimitMax || 5000),
   standardHeaders: true,
   legacyHeaders: false,
   message: {

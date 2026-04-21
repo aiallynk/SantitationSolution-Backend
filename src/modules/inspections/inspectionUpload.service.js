@@ -19,22 +19,22 @@ const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { recomputeInspectionAggregates } = require('./inspectionEvidence.service');
 const { isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const { logger } = require('../../core/logging/logger');
 const {
   IMAGE_PROCESSING_STATES,
   resolveLegacyProcessingState,
 } = require('./imageLifecycle.constants');
+const {
+  ALLOWED_CONTENT_TYPES,
+  MEDIA_MAX_FILE_SIZE,
+  normalizeContentType,
+} = require('../media/uploadPolicy');
+const { runtimeConfig } = require('../../config/runtime');
 
 const ALLOWED_CAPTURE_STAGE = new Set(['before', 'after', 'evidence']);
-const ALLOWED_CONTENT_TYPES = new Set([
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/webp',
-  'image/heic',
-  'image/heif',
-]);
-
-const normalizeContentType = (value) => String(value || '').trim().toLowerCase();
+const MAX_CONTENT_LENGTH_BYTES = Number(MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024);
+const uploadDiagnosticsEnabled =
+  runtimeConfig.media.uploadDiagnosticsLogsEnabled;
 
 const normalizeHashHex = (value) => {
   const normalized = String(value || '')
@@ -83,6 +83,9 @@ const isS3ObjectEncryptionCompliant = ({ policy, head }) => {
 };
 
 const logInspectionUploadEvent = (req, event, payload = {}) => {
+  if (!uploadDiagnosticsEnabled) {
+    return;
+  }
   try {
     const entry = {
       event,
@@ -92,8 +95,7 @@ const logInspectionUploadEvent = (req, event, payload = {}) => {
       mediaId: req?.params?.mediaId || null,
       ...payload,
     };
-    // eslint-disable-next-line no-console
-    console.info('[inspection-upload]', JSON.stringify(entry));
+    logger.debug('Inspection upload diagnostics', entry);
   } catch (_) {
     // no-op logging fallback
   }
@@ -121,6 +123,20 @@ const normalizeClientImageId = (value) => {
     });
   }
   return normalized;
+};
+
+const assertContentLengthWithinLimit = (contentLength, fieldName = 'contentLength') => {
+  if (!Number.isFinite(Number(contentLength)) || Number(contentLength) <= 0) {
+    return;
+  }
+  if (Number(contentLength) > MAX_CONTENT_LENGTH_BYTES) {
+    throw new AppError(`${fieldName} exceeds allowed upload size`, 400, {
+      code: 'FILE_TOO_LARGE',
+      details: {
+        maxBytes: MAX_CONTENT_LENGTH_BYTES,
+      },
+    });
+  }
 };
 
 const extensionFromContentType = (contentType) => {
@@ -216,8 +232,7 @@ const buildAnalysisRequestContext = (req) => {
   };
 };
 
-const isAutoAnalysisOnUploadEnabled = () =>
-  String(process.env.ANALYSIS_TRIGGER_ON_UPLOAD || 'true').toLowerCase() === 'true';
+const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
 const isUniqueConstraintError = (error) => {
   const code = String(error?.original?.code || error?.parent?.code || '').trim();
@@ -255,6 +270,7 @@ const createUploadSessions = async (req) => {
         });
       }
       const contentLength = Number(image.contentLength || 0);
+      assertContentLengthWithinLimit(contentLength, `images.${clientImageId}.contentLength`);
       const expectedSha256 = String(image.sha256 || '').trim().toLowerCase() || null;
       const extension = extensionFromContentType(contentType);
       const candidateObjectKey = `sanitation/${inspection.tenant_id}/inspections/${inspection.id}/${captureStage}/${clientImageId}${extension}`;
@@ -868,6 +884,7 @@ const retryUploadSession = async (req) => {
   const contentLength = Number(
     req.body.contentLength || session?.expected_size || media.content_length || 0
   );
+  assertContentLengthWithinLimit(contentLength, 'contentLength');
   const expectedSha256 =
     normalizeHashHex(req.body.sha256) ||
     normalizeHashHex(session?.expected_sha256) ||

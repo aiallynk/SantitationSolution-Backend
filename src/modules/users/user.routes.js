@@ -17,9 +17,11 @@ const {
 const { ManagementLevels, RouteKeys, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
+const USER_ROUTE_PREFIXES = ['/users', '/roles', '/permissions'];
 
-router.use(protect);
+router.use(USER_ROUTE_PREFIXES, protect);
 router.use(
+  USER_ROUTE_PREFIXES,
   requireSurface(
     SurfaceTypes.OPS_WEB,
     SurfaceTypes.OPS_WEB_AND_MOBILE,

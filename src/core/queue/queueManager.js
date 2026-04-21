@@ -1,5 +1,7 @@
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
+const { runtimeConfig } = require('../../config/runtime');
+const { logger } = require('../logging/logger');
 
 const queues = new Map();
 const workers = [];
@@ -8,17 +10,15 @@ let redisSuppressed = false;
 let redisErrorLogged = false;
 let redisFallbackLogged = false;
 
-const isProduction = () =>
-  String(process.env.NODE_ENV || 'development').trim().toLowerCase() === 'production';
+const isProduction = () => runtimeConfig.isProduction;
 
-const isRedisRequiredInProd = () =>
-  String(process.env.REDIS_REQUIRED_IN_PROD || 'false').trim().toLowerCase() === 'true';
+const isRedisRequiredInProd = () => Boolean(runtimeConfig.redis.requiredInProduction);
 
 const isRedisEnabled = () =>
   Boolean(
     !redisSuppressed &&
-      process.env.REDIS_URL &&
-      String(process.env.REDIS_ENABLED || 'true').toLowerCase() === 'true'
+      runtimeConfig.redis.url &&
+      runtimeConfig.redis.enabled
   );
 
 const isConnectionRefusedError = (error) => {
@@ -32,10 +32,19 @@ const logRedisFallback = (reason) => {
     return;
   }
   redisFallbackLogged = true;
-  // eslint-disable-next-line no-console
-  console.warn(
-    `Redis unavailable (${reason}). Falling back to in-process queue mode.`
-  );
+  logger.warn('Redis unavailable. Falling back to in-process queue mode.', {
+    reason: String(reason || 'unknown'),
+  });
+};
+
+const resolveBullRetention = (value, fallback) => {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === 'boolean') return value;
+  const asNumber = Number(value);
+  if (Number.isFinite(asNumber) && asNumber >= 0) {
+    return Math.floor(asNumber);
+  }
+  return fallback;
 };
 
 const suppressRedis = (reason) => {
@@ -56,13 +65,13 @@ const assertQueueRuntimePolicy = () => {
     return true;
   }
 
-  if (!process.env.REDIS_URL) {
+  if (!runtimeConfig.redis.url) {
     throw new Error(
       'REDIS_REQUIRED_IN_PROD=true but REDIS_URL is missing. Refusing inline queue mode in production.'
     );
   }
 
-  if (String(process.env.REDIS_ENABLED || 'true').toLowerCase() !== 'true') {
+  if (!runtimeConfig.redis.enabled) {
     throw new Error(
       'REDIS_REQUIRED_IN_PROD=true but REDIS_ENABLED is false. Refusing inline queue mode in production.'
     );
@@ -82,7 +91,7 @@ const getRedisConnection = () => {
     return null;
   }
   if (!redisConnection) {
-    redisConnection = new IORedis(process.env.REDIS_URL, {
+    redisConnection = new IORedis(runtimeConfig.redis.url, {
       maxRetriesPerRequest: null,
       enableReadyCheck: false,
       retryStrategy: (times) => Math.min(times * 200, 2000),
@@ -90,8 +99,7 @@ const getRedisConnection = () => {
     redisConnection.on('error', (error) => {
       if (!redisErrorLogged) {
         redisErrorLogged = true;
-        // eslint-disable-next-line no-console
-        console.error('Redis connection error:', error.message);
+        logger.error('Redis connection error', { error: error.message });
       }
       if (isConnectionRefusedError(error)) {
         suppressRedis(error.message || 'ECONNREFUSED');
@@ -116,17 +124,13 @@ const getQueue = (name) => {
   return queue;
 };
 
-const queueEnvToken = (name) =>
-  String(name || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '_');
-
 const resolveWorkerConcurrency = (name, fallback = 1) => {
-  const queueSpecific = Number(process.env[`QUEUE_${queueEnvToken(name)}_CONCURRENCY`]);
-  if (Number.isFinite(queueSpecific) && queueSpecific > 0) {
-    return queueSpecific;
-  }
-  const globalValue = Number(process.env.QUEUE_WORKER_CONCURRENCY || fallback);
+  const queueSpecific =
+    String(name || '').toLowerCase() === 'inspection-analysis'
+      ? runtimeConfig.queue.analysisWorkerConcurrency
+      : null;
+  if (Number.isFinite(queueSpecific) && queueSpecific > 0) return queueSpecific;
+  const globalValue = Number(runtimeConfig.queue.workerConcurrency || fallback);
   return Number.isFinite(globalValue) && globalValue > 0 ? globalValue : fallback;
 };
 
@@ -225,13 +229,13 @@ const addJob = async (name, jobName, payload, options = {}) => {
 
   try {
     return await queue.add(jobName, payload, {
-      attempts: Number(process.env.QUEUE_ATTEMPTS || 3),
+      attempts: Number(runtimeConfig.queue.attempts || 3),
       backoff: {
         type: 'exponential',
-        delay: Number(process.env.QUEUE_BACKOFF_MS || 1000),
+        delay: Number(runtimeConfig.queue.backoffMs || 1000),
       },
-      removeOnComplete: true,
-      removeOnFail: false,
+      removeOnComplete: resolveBullRetention(runtimeConfig.queue.removeOnComplete, 200),
+      removeOnFail: resolveBullRetention(runtimeConfig.queue.removeOnFail, 1000),
       ...options,
     });
   } catch (error) {
@@ -254,8 +258,11 @@ const addDeadLetterJob = async (name, payload, options = {}) =>
         type: 'fixed',
         delay: 1000,
       },
-      removeOnComplete: false,
-      removeOnFail: false,
+      removeOnComplete: resolveBullRetention(
+        runtimeConfig.queue.dlqRemoveOnComplete,
+        50
+      ),
+      removeOnFail: resolveBullRetention(runtimeConfig.queue.dlqRemoveOnFail, 500),
       ...options,
     }
   );

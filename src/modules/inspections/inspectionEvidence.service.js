@@ -26,13 +26,10 @@ const {
 } = require('../media/mediaUrl.service');
 const { applyTenantScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
 const { IMAGE_PROCESSING_STATES } = require('./imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
-const REVIEW_CONFIDENCE_THRESHOLD = Number(
-  process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7
-);
-const IMPROVEMENT_THRESHOLD = Number(
-  process.env.INSPECTION_IMPROVEMENT_THRESHOLD || 5
-);
+const REVIEW_CONFIDENCE_THRESHOLD = runtimeConfig.analysis.confidenceThreshold;
+const IMPROVEMENT_THRESHOLD = runtimeConfig.analysis.improvementThreshold;
 
 const toNumber = (value, fallback = null) => {
   const parsed = Number(value);
@@ -306,7 +303,7 @@ const mapMediaEvidence = async (row, options = {}) => {
   const validationStatus = row.validation_status || null;
   const validationReason = row.validation_reason || null;
   const suspiciousFlags = [];
-  if (similarityScore !== null && similarityScore >= Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92)) {
+  if (similarityScore !== null && similarityScore >= runtimeConfig.analysis.fraudSimilarityThreshold) {
     suspiciousFlags.push('possible_fake_cleaning_similar_images');
   }
   const operationalStatus =
@@ -717,8 +714,7 @@ const isStaleTimestamp = (value, staleMs) => {
 const requeueStaleImageAnalysis = async ({ inspection, rows = [], req }) => {
   if (!Array.isArray(rows) || rows.length === 0) return rows;
   const staleMs =
-    toMillis(process.env.ANALYSIS_PROCESSING_STALE_MS) ??
-    toMillis(process.env.ANALYSIS_QUEUE_STALE_MS) ??
+    toMillis(runtimeConfig.queue.analysisProcessingStaleMs) ??
     180000;
   const candidates = rows.filter((row) => {
     const status = String(row.ai_status || '').trim().toUpperCase();
@@ -1014,7 +1010,7 @@ const recomputeInspectionAggregates = async (
   });
   const suspiciousReuseByPerceptualHash = afterRows.some((after) => {
     const similarity = toNumber(after.similarity_score, null);
-    return similarity !== null && similarity >= Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92);
+    return similarity !== null && similarity >= runtimeConfig.analysis.fraudSimilarityThreshold;
   });
   const qualityInvalid = evidenceRows.some(
     (row) =>

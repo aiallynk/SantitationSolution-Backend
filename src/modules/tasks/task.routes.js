@@ -15,8 +15,9 @@ const { validateTaskCreate } = require('./task.validator');
 
 const router = express.Router();
 
-router.use(protect);
+router.use('/tasks', protect);
 router.use(
+  '/tasks',
   requireSurface(
     SurfaceTypes.OPS_WEB,
     SurfaceTypes.OPS_WEB_AND_MOBILE,

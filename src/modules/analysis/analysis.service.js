@@ -31,6 +31,7 @@ const {
 } = require('../inspections/inspectionEvidence.service');
 const { classifyAnalysisFailure } = require('./analysisFailureClassifier.service');
 const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
+const { runtimeConfig } = require('../../config/runtime');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -48,19 +49,16 @@ const mean = (values = []) => {
   return valid.reduce((sum, item) => sum + item, 0) / valid.length;
 };
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
-const FRAUD_SIMILARITY_THRESHOLD = Number(process.env.ANALYSIS_FRAUD_SIMILARITY_THRESHOLD || 0.92);
-const AI_IMAGE_MAX_RETRIES = Math.max(Number(process.env.AI_IMAGE_MAX_RETRIES || 4), 1);
-const AI_RETRY_BASE_DELAY_MS = Math.max(Number(process.env.AI_RETRY_BASE_DELAY_MS || 3000), 500);
-const JOB_LEASE_MS = Math.max(Number(process.env.ANALYSIS_JOB_LEASE_MS || 180000), 60000);
+const FRAUD_SIMILARITY_THRESHOLD = runtimeConfig.analysis.fraudSimilarityThreshold;
+const AI_IMAGE_MAX_RETRIES = Math.max(runtimeConfig.analysis.aiImageMaxRetries, 1);
+const AI_RETRY_BASE_DELAY_MS = Math.max(runtimeConfig.analysis.aiRetryBaseDelayMs, 500);
+const JOB_LEASE_MS = Math.max(runtimeConfig.analysis.jobLeaseMs, 60000);
 const SCORE_SPREAD_GAIN = clamp(
-  toFiniteNumber(process.env.ANALYSIS_SCORE_SPREAD_GAIN, 1.16),
+  toFiniteNumber(runtimeConfig.analysis.scoreSpreadGain, 1.16),
   1,
   1.4
 );
-const ALWAYS_SCORE_ON_FAILURE =
-  String(process.env.ANALYSIS_ALWAYS_SCORE_ON_FAILURE || 'true')
-    .trim()
-    .toLowerCase() !== 'false';
+const ALWAYS_SCORE_ON_FAILURE = Boolean(runtimeConfig.analysis.alwaysScoreOnFailure);
 
 const deriveStatus = (score) => {
   if (score >= 80) return 'clean';
@@ -125,7 +123,7 @@ const buildStrictToiletJsonFromNormalizedResult = ({
         ? 'medium'
         : 'low');
 
-  const threshold = Number(process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7);
+  const threshold = runtimeConfig.analysis.confidenceThreshold;
   const humanReviewRequired =
     reviewRequired !== undefined && reviewRequired !== null
       ? Boolean(reviewRequired)
@@ -171,7 +169,7 @@ const normalizeResultFromProvider = ({ providerResult, processingMs }) => {
   const reviewRequired =
     source.reviewRequired !== undefined
       ? Boolean(source.reviewRequired)
-      : (confidenceScore ?? 0.65) < Number(process.env.ANALYSIS_CONFIDENCE_THRESHOLD || 0.7);
+      : (confidenceScore ?? 0.65) < runtimeConfig.analysis.confidenceThreshold;
 
   const severityLabel =
     source.severityLabel ||
@@ -183,7 +181,7 @@ const normalizeResultFromProvider = ({ providerResult, processingMs }) => {
   const overallStatus = source.overallStatus || deriveStatus(overallCleanlinessScore);
 
   const normalizedBase = {
-    modelName: source.modelName || process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+    modelName: source.modelName || runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
     modelVersion: source.modelVersion || 'openai-chat-completions-v4',
     provider: source.provider || 'openai',
     schemaVersion: source.schemaVersion || ANALYSIS_SCHEMA_VERSION,
@@ -261,6 +259,11 @@ const maybeCreateAlert = async ({ inspection, result }) => {
     return openAlert;
   }
 
+  const inspectionCode = `INS-${String(inspection.id || '')
+    .replace(/-/g, '')
+    .slice(0, 8)
+    .toUpperCase()}`;
+
   const alert = await Alert.create({
     tenant_id: inspection.tenant_id,
     alert_type: 'inspection_quality_breach',
@@ -268,7 +271,7 @@ const maybeCreateAlert = async ({ inspection, result }) => {
     source_type: 'ai_analysis',
     source_id: inspection.id,
     facility_id: inspection.facility_id,
-    message: `Inspection ${inspection.id} flagged ${result.severityLabel} (score ${result.overallCleanlinessScore})`,
+    message: `${inspectionCode} flagged ${result.severityLabel} (score ${result.overallCleanlinessScore})`,
     status: 'open',
     created_at: new Date(),
     updated_at: new Date(),
@@ -308,7 +311,7 @@ const weightedOverallScore = (strictJson) => {
   const waterCleanliness = 100 - waterSeverity;
   const garbageCleanliness = garbagePresence ? 0 : 100;
 
-  return Math.round(
+  return round2(
     clamp(
       floor * 0.3 +
         commode * 0.3 +
@@ -323,9 +326,9 @@ const weightedOverallScore = (strictJson) => {
 
 const severityCalibrationShift = (severityLevel) => {
   const normalized = String(severityLevel || '').trim().toLowerCase();
-  if (normalized === 'high') return -5;
-  if (normalized === 'medium') return -2;
-  if (normalized === 'low') return 2;
+  if (normalized === 'high') return -1.5;
+  if (normalized === 'medium') return -0.3;
+  if (normalized === 'low') return 1;
   return 0;
 };
 
@@ -359,10 +362,10 @@ const calibrateOverallScore = ({
   const garbagePresence = Boolean(strictJson?.garbage_presence);
 
   const issueCount = Array.isArray(normalizedIssues) ? normalizedIssues.length : 0;
-  const issuePenalty = Math.min(18, issueCount * 2.8);
-  const stainPenalty = clamp((stainPresence - 40) * 0.18, 0, 10);
-  const waterPenalty = clamp((waterStagnation - 40) * 0.15, 0, 9);
-  const garbagePenalty = garbagePresence ? 8 : 0;
+  const issuePenalty = Math.min(9, issueCount * 1.6);
+  const stainPenalty = clamp((stainPresence - 60) * 0.09, 0, 4);
+  const waterPenalty = clamp((waterStagnation - 60) * 0.07, 0, 3);
+  const garbagePenalty = garbagePresence ? 4 : 0;
   const severityShift = severityCalibrationShift(strictJson?.severity_level);
 
   const confidenceValue = toFiniteNumber(
@@ -370,7 +373,9 @@ const calibrateOverallScore = ({
     toFiniteNumber(strictJson?.confidence_score, null)
   );
   const confidencePenalty =
-    confidenceValue === null ? 0 : clamp((0.65 - confidenceValue) * 20, 0, 6);
+    confidenceValue === null ? 0 : clamp((0.58 - confidenceValue) * 8, 0, 2.5);
+  const confidenceBoost =
+    confidenceValue === null ? 0 : clamp((confidenceValue - 0.8) * 3, 0, 1);
 
   const highCleanlinessBonus =
     floor >= 88 &&
@@ -382,7 +387,27 @@ const calibrateOverallScore = ({
       ? 4
       : 0;
 
-  const blendedBase = modelOverall * 0.62 + weighted * 0.38;
+  const catastrophicDirty =
+    floor <= 5 &&
+    commode <= 5 &&
+    stainPresence >= 95 &&
+    waterStagnation >= 95 &&
+    garbagePresence;
+
+  const calibratedFloor = catastrophicDirty
+    ? 0
+    : clamp(
+        weighted * 0.38 +
+          (garbagePresence ? 0 : 4) +
+          (confidenceValue === null ? 0 : clamp((confidenceValue - 0.5) * 3, -1.2, 1.2)),
+        1.5,
+        35
+      );
+
+  const scoreGap = Math.abs(modelOverall - weighted);
+  const modelWeight =
+    scoreGap >= 35 ? 0.1 : scoreGap >= 20 ? 0.2 : scoreGap >= 10 ? 0.3 : 0.4;
+  const blendedBase = weighted * (1 - modelWeight) + modelOverall * modelWeight;
   const adjustedBase =
     blendedBase -
     issuePenalty -
@@ -390,11 +415,19 @@ const calibrateOverallScore = ({
     waterPenalty -
     garbagePenalty -
     confidencePenalty +
+    confidenceBoost +
     severityShift +
     highCleanlinessBonus;
   const spreadAdjusted = 50 + (adjustedBase - 50) * SCORE_SPREAD_GAIN;
+  const spreadProtected =
+    spreadAdjusted > adjustedBase
+      ? adjustedBase + (spreadAdjusted - adjustedBase) * 0.35
+      : adjustedBase;
+  const finalScore = catastrophicDirty
+    ? clamp(spreadProtected, 0, 100)
+    : clamp(Math.max(spreadProtected, calibratedFloor), 0, 100);
 
-  return round2(clamp(spreadAdjusted, 0, 100));
+  return round2(finalScore);
 };
 
 const buildFallbackStrictJson = ({
@@ -570,7 +603,7 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
     explanationText:
       base?.explanationText ||
       (issueTags.length > 0 ? `Detected issues: ${issueTags.slice(0, 6).join(', ')}` : 'No major issues detected'),
-    modelName: base?.modelName || process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+    modelName: base?.modelName || runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
     modelVersion: base?.modelVersion || 'openai-chat-completions-v4',
     provider: base?.provider || 'openai',
     schemaVersion: ANALYSIS_SCHEMA_VERSION,
@@ -754,7 +787,7 @@ const runInspectionAnalysis = async ({
           issueTags: Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [],
           reviewRequired: Boolean(mediaRow.review_required),
           severityLabel: mediaRow.severity || 'medium',
-          modelName: process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+          modelName: runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
           modelVersion: mediaRow.model_version || 'openai-chat-completions-v4',
           provider: 'cached',
           explanationText: mediaRow.explanation_summary || mediaRow.issue_summary || null,
@@ -1127,7 +1160,7 @@ const runInspectionAnalysis = async ({
           severityLabel: fallbackSeverity,
           reviewRequired: true,
           explanationText: fallbackStrictWithCalibrated.explanation_summary,
-          modelName: process.env.OPENAI_ANALYSIS_MODEL || 'gpt-4o',
+          modelName: runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
           modelVersion: 'fallback-v1',
           provider: 'fallback',
           promptVersion: PROMPT_VERSION,

@@ -1,5 +1,6 @@
 const { WebSocketServer } = require('ws');
 const { getAuthContextFromToken } = require('../middleware/auth');
+const { runtimeConfig } = require('../../config/runtime');
 
 const clients = new Map();
 let wsServer = null;
@@ -8,7 +9,17 @@ let clientCounter = 0;
 
 const shouldDeliver = (clientScope, payloadScope) => {
   if (!payloadScope) return true;
-  if (clientScope.isSuperAdmin || clientScope.roleCode === 'super_admin') return true;
+
+  if (payloadScope.userId) {
+    if (!clientScope.userId) return false;
+    if (String(payloadScope.userId) !== String(clientScope.userId)) {
+      return false;
+    }
+  }
+
+  if ((clientScope.isSuperAdmin || clientScope.roleCode === 'super_admin') && !payloadScope.userId) {
+    return true;
+  }
 
   if (payloadScope.tenantId && clientScope.tenantId && payloadScope.tenantId !== clientScope.tenantId) {
     return false;
@@ -95,7 +106,7 @@ const startWebSocketServer = (httpServer) => {
     }
   });
 
-  const heartbeatMs = Math.max(Number(process.env.WS_HEARTBEAT_MS || 25_000), 10_000);
+  const heartbeatMs = Math.max(runtimeConfig.live.wsHeartbeatMs, 10_000);
   heartbeatTimer = setInterval(() => {
     for (const client of clients.values()) {
       sendEvent(client.socket, 'ping', { timestamp: new Date().toISOString() });

@@ -1,47 +1,53 @@
 const { Sequelize } = require('sequelize');
-require('./env');
+const { runtimeConfig } = require('./runtime');
 
 const getDialectOptions = () => {
-  const sslEnabled = String(process.env.DB_SSL || 'false').toLowerCase() === 'true';
-  if (!sslEnabled) {
-    return {};
-  }
+  const sslEnabled = runtimeConfig.database.ssl;
+  const statementTimeout = Number(runtimeConfig.database.statementTimeoutMs || 15000);
+  const queryTimeout = Number(runtimeConfig.database.queryTimeoutMs || 15000);
+  const idleTxnTimeout = Number(runtimeConfig.database.idleInTxnTimeoutMs || 15000);
 
-  return {
-    ssl: {
+  const options = {
+    ...(Number.isFinite(statementTimeout) && statementTimeout > 0
+      ? { statement_timeout: statementTimeout }
+      : {}),
+    ...(Number.isFinite(queryTimeout) && queryTimeout > 0
+      ? { query_timeout: queryTimeout }
+      : {}),
+    ...(Number.isFinite(idleTxnTimeout) && idleTxnTimeout > 0
+      ? { idle_in_transaction_session_timeout: idleTxnTimeout }
+      : {}),
+  };
+
+  if (sslEnabled) {
+    options.ssl = {
       require: true,
       rejectUnauthorized: false,
-    },
-  };
+    };
+  }
+  return options;
 };
 
 const buildSequelize = () => {
   const options = {
     dialect: 'postgres',
-    logging: false,
+    logging: runtimeConfig.database.loggingEnabled ? console.log : false,
     dialectOptions: getDialectOptions(),
     pool: {
-      max: Number(process.env.DB_POOL_MAX || 20),
-      min: Number(process.env.DB_POOL_MIN || 2),
-      acquire: Number(process.env.DB_POOL_ACQUIRE || 30000),
-      idle: Number(process.env.DB_POOL_IDLE || 10000),
+      max: Number(runtimeConfig.database.poolMax || 20),
+      min: Number(runtimeConfig.database.poolMin || 2),
+      acquire: Number(runtimeConfig.database.poolAcquire || 30000),
+      idle: Number(runtimeConfig.database.poolIdle || 10000),
+      evict: Number(runtimeConfig.database.poolEvict || 1000),
+      maxUses: Number(runtimeConfig.database.poolMaxUses || 5000),
     },
+    retry: {
+      max: Number(runtimeConfig.database.retryMax || 2),
+    },
+    benchmark: false,
   };
 
-  if (process.env.DATABASE_URL) {
-    return new Sequelize(process.env.DATABASE_URL, options);
-  }
-
-  return new Sequelize(
-    process.env.DB_NAME || 'sanitation_solution',
-    process.env.DB_USER || 'postgres',
-    process.env.DB_PASS || 'postgres',
-    {
-      ...options,
-      host: process.env.DB_HOST || 'localhost',
-      port: Number(process.env.DB_PORT || 5432),
-    }
-  );
+  return new Sequelize(runtimeConfig.database.url, options);
 };
 
 const sequelize = buildSequelize();

@@ -1,4 +1,9 @@
 require('../config/env');
+const {
+  logger,
+  installGlobalConsoleBridge,
+} = require('../core/logging/logger');
+installGlobalConsoleBridge();
 
 const net = require('net');
 const { sequelize } = require('../models');
@@ -9,20 +14,22 @@ const {
   isRedisEnabled,
   assertQueueRuntimePolicy,
 } = require('../core/queue/queueManager');
+const { runtimeConfig } = require('../config/runtime');
 
 let worker = null;
+let shuttingDown = false;
 
 const probeRedisConnectivity = async () => {
   if (
-    !process.env.REDIS_URL ||
-    String(process.env.REDIS_ENABLED || 'true').toLowerCase() !== 'true'
+    !runtimeConfig.redis.url ||
+    !runtimeConfig.redis.enabled
   ) {
     return false;
   }
 
   let url;
   try {
-    url = new URL(process.env.REDIS_URL);
+    url = new URL(runtimeConfig.redis.url);
   } catch (_) {
     return false;
   }
@@ -52,20 +59,19 @@ const bootstrap = async () => {
   try {
     assertOpenAiAnalysisConfigured();
     await sequelize.authenticate();
-    // eslint-disable-next-line no-console
-    console.log('Analysis worker DB connection established');
+    logger.info('Analysis worker DB connection established');
 
     const redisReachable = await probeRedisConnectivity();
     if (!redisReachable) {
-      // eslint-disable-next-line no-console
-      console.error('Redis is not reachable; analysis worker requires a running Redis instance.');
+      logger.error(
+        'Redis is not reachable; analysis worker requires a running Redis instance.'
+      );
       process.exit(1);
       return;
     }
 
     if (!isRedisEnabled()) {
-      // eslint-disable-next-line no-console
-      console.error('Redis is disabled; analysis worker requires REDIS_ENABLED=true');
+      logger.error('Redis is disabled; analysis worker requires REDIS_ENABLED=true');
       process.exit(1);
       return;
     }
@@ -73,24 +79,22 @@ const bootstrap = async () => {
 
     worker = registerAnalysisWorker();
     if (!worker) {
-      // eslint-disable-next-line no-console
-      console.error('Failed to register analysis worker');
+      logger.error('Failed to register analysis worker');
       process.exit(1);
       return;
     }
 
-    // eslint-disable-next-line no-console
-    console.log('Analysis worker started and listening for jobs');
+    logger.info('Analysis worker started and listening for jobs');
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('Analysis worker bootstrap failed:', error);
+    logger.error('Analysis worker bootstrap failed', { error });
     process.exitCode = 1;
   }
 };
 
-const gracefulShutdown = async (signal) => {
-  // eslint-disable-next-line no-console
-  console.log(`Received ${signal}. Shutting down analysis worker...`);
+const gracefulShutdown = async (signal, exitCode = 0) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('Shutting down analysis worker', { signal });
   try {
     if (worker) {
       await worker.close();
@@ -98,14 +102,26 @@ const gracefulShutdown = async (signal) => {
     await closeQueues();
     await sequelize.close();
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('Analysis worker shutdown failed:', error);
+    logger.error('Analysis worker shutdown failed', { error });
+    exitCode = 1;
   } finally {
-    process.exit(0);
+    process.exit(exitCode);
   }
 };
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection in analysis worker', { reason });
+  void gracefulShutdown('unhandledRejection', 1);
+});
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception in analysis worker', { error });
+  void gracefulShutdown('uncaughtException', 1);
+});
 
 bootstrap();

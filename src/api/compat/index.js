@@ -13,6 +13,7 @@ const alertService = require('../../modules/alerts/alert.service');
 const inspectionService = require('../../modules/inspections/inspection.service');
 const analysisService = require('../../modules/analysis/analysis.service');
 const authRouter = require('../../modules/auth/auth.routes');
+const appUpdateController = require('../../modules/appUpdate/appUpdate.controller');
 const AppError = require('../../core/errors/AppError');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
@@ -29,6 +30,10 @@ const OPS_WEB_SURFACES = [SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE]
 
 // Legacy auth aliases
 router.use('/auth', authRouter);
+
+// Legacy app update aliases.
+router.get('/api/app/update', appUpdateController.getAppUpdateMetadata);
+router.get('/api/app/apk/:version', appUpdateController.downloadApkByVersion);
 
 // Legacy inspections aliases for current frontend contract.
 router.get(

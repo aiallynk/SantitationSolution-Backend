@@ -3,15 +3,16 @@ const {
   getPresignedGetObjectUrl,
   normalizeS3ObjectKey,
 } = require('./s3.service');
+const { runtimeConfig } = require('../../config/runtime');
 
-const S3_BUCKET_NAME = String(process.env.AWS_S3_BUCKET || '')
+const S3_BUCKET_NAME = String(runtimeConfig.media.s3.bucket || '')
   .trim()
   .toLowerCase();
-const S3_PUBLIC_BASE_URL = String(process.env.AWS_S3_PUBLIC_BASE_URL || '')
+const S3_PUBLIC_BASE_URL = String(runtimeConfig.media.s3.publicBaseUrl || '')
   .trim()
   .replace(/\/+$/, '');
 const S3_ENDPOINT_HOST = (() => {
-  const endpoint = String(process.env.AWS_S3_ENDPOINT || '').trim();
+  const endpoint = String(runtimeConfig.media.s3.endpoint || '').trim();
   if (!endpoint) return '';
   try {
     return new URL(endpoint).hostname.toLowerCase();

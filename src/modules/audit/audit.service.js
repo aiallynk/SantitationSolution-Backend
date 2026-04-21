@@ -23,6 +23,7 @@ const {
   buildAccessContextFromUser,
   applyScopeToQuery,
 } = require('../../core/rbac/scopeWhere');
+const notificationService = require('../notifications/notification.service');
 
 const ACTION_LABELS = {
   'auth.login': 'User Logged In',
@@ -441,7 +442,7 @@ const createAuditLog = async ({
   details = null,
 }) => {
   try {
-    await AuditLog.create({
+    const row = await AuditLog.create({
       tenant_id: tenantId || req?.user?.tenantId || null,
       actor_user_id: actorUserId || req?.user?.id || null,
       action,
@@ -452,6 +453,21 @@ const createAuditLog = async ({
       user_agent: req?.headers['user-agent'] || null,
       details,
     });
+
+    try {
+      await notificationService.publishFromAuditLog({
+        action,
+        entityType,
+        entityId,
+        tenantId: row.tenant_id || tenantId || req?.user?.tenantId || null,
+        actorUserId: row.actor_user_id || actorUserId || req?.user?.id || null,
+        details,
+        requestId: row.request_id || req?.requestId || null,
+      });
+    } catch (notificationError) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to publish audit notification:', notificationError.message);
+    }
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to persist audit log:', error.message);

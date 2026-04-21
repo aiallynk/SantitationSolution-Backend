@@ -20,6 +20,9 @@ const {
 const {
   validateQrResolve,
 } = require('../src/modules/platform/platform.validator');
+const {
+  validateBroadcastSend,
+} = require('../src/modules/notifications/notification.validator');
 
 test('sanitizeText removes unsafe markup-like characters', () => {
   const result = sanitizeText('   <script>alert(1)</script>  ', 100);
@@ -110,4 +113,38 @@ test('isBlank handles null/undefined/whitespace', () => {
   assert.equal(isBlank(undefined), true);
   assert.equal(isBlank('   '), true);
   assert.equal(isBlank('x'), false);
+});
+
+test('validateBroadcastSend accepts a valid tenant role broadcast payload', () => {
+  const errors = validateBroadcastSend({
+    body: {
+      audience: 'roles_in_tenant',
+      tenantId: '11111111-1111-1111-8111-111111111111',
+      roleCodes: ['field_worker', 'supervisor'],
+      template: 'alert',
+      title: 'Critical hygiene alert',
+      body: 'Please inspect immediately.',
+      priority: 'HIGH',
+      notificationType: 'ALERT',
+      payload: { source: 'unit-test' },
+      metadata: { requestedBy: 'tester' },
+    },
+  });
+  assert.deepEqual(errors, []);
+});
+
+test('validateBroadcastSend enforces audience-specific required fields', () => {
+  const errors = validateBroadcastSend({
+    body: {
+      audience: 'roles_in_tenant',
+      title: 'x',
+      body: 'y',
+      roleCodes: [],
+      userIds: ['not-a-uuid'],
+    },
+  });
+  assert.deepEqual(errors, [
+    'roleCodes is required when audience=roles_in_tenant',
+    'userIds must only contain valid UUID values',
+  ]);
 });
