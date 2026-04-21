@@ -64,6 +64,24 @@ test('scope rules enforce scoped role requirements', () => {
     assignments: [],
   });
   assert.equal(missingSupervisorFacilityScope.length > 0, true);
+  const invalidSupervisorFacilityScope = collectRoleScopeValidationErrors({
+    roleCodes: ['supervisor'],
+    geographyId: null,
+    assignments: [{ assignmentLevel: 'facility', facilityId: 'facility-1' }],
+  });
+  assert.equal(
+    invalidSupervisorFacilityScope.some((error) =>
+      error.includes('supervisor role requires zone/ward scope')
+    ),
+    true,
+  );
+
+  const validSupervisorGeographyScope = collectRoleScopeValidationErrors({
+    roleCodes: ['supervisor'],
+    geographyId: 'geo-1',
+    assignments: [],
+  });
+  assert.equal(validSupervisorGeographyScope.length, 0);
 });
 
 test('role access profile resolves strict route, widget, and action keys for supervisors', () => {

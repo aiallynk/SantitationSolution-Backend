@@ -12,10 +12,14 @@ const hasScopedAssignment = (assignments = []) => {
   });
 };
 
-const hasFacilityScopedAssignment = (assignments = []) => {
+const hasSupervisorGeographyScopedInput = ({ geographyId = null, assignments = [] }) => {
+  if (geographyId) return true;
   return (Array.isArray(assignments) ? assignments : []).some((assignment) => {
     if (!assignment || typeof assignment !== 'object') return false;
-    return Boolean(assignment.facilityId || assignment.toiletUnitId);
+    const assignmentLevel = String(assignment.assignmentLevel || '').trim().toLowerCase();
+    if (!assignment.geographyId) return false;
+    if (!assignmentLevel) return true;
+    return ['zone', 'ward', 'geography'].includes(assignmentLevel);
   });
 };
 
@@ -28,28 +32,27 @@ const collectRoleScopeValidationErrors = ({ roleCodes = [], geographyId = null, 
   );
   if (hasGeographyScopedRole && !geographyId && !hasScopedAssignment(assignments)) {
     errors.push(
-      'Scoped ops admin roles (country/state/district/city/zone) require geographyId or scoped assignment'
+      'Scoped ops admin roles (country/state/district/city) require geographyId or scoped assignment'
     );
   }
 
-  const hasFacilityManagerRole = normalizedRoleCodes.includes(ROLE_CODES.FACILITY_MANAGER);
   const hasSupervisorRole = normalizedRoleCodes.includes(ROLE_CODES.SUPERVISOR);
   const hasWorkerRole = normalizedRoleCodes.includes(ROLE_CODES.FIELD_WORKER);
-  const hasFacilityAssignment = hasFacilityScopedAssignment(assignments);
+  const hasGeographyScope = Boolean(geographyId);
+  const hasScopedInput = hasGeographyScope || hasScopedAssignment(assignments);
+  const hasSupervisorGeographyScope = hasSupervisorGeographyScopedInput({
+    geographyId,
+    assignments,
+  });
 
-  if (hasSupervisorRole && !hasScopedAssignment(assignments)) {
+  if (hasSupervisorRole && !hasSupervisorGeographyScope) {
     errors.push(
-      'supervisor role requires zone/ward or facility assignment (geographyId/facilityId/toiletUnitId)'
+      'supervisor role requires zone/ward scope (geographyId or zone/ward geography assignment)'
     );
   }
-  if (hasWorkerRole && !hasScopedAssignment(assignments)) {
+  if (hasWorkerRole && !hasScopedInput) {
     errors.push(
-      'field_worker role requires zone/ward or facility assignment (geographyId/facilityId/toiletUnitId)'
-    );
-  }
-  if (hasFacilityManagerRole && !hasFacilityAssignment) {
-    errors.push(
-      'facility_manager role requires facility-scoped assignment (facilityId/toiletUnitId)'
+      'field_worker role requires zone/ward/facility scope (geographyId or geographyId/facilityId/toiletUnitId assignment)'
     );
   }
 

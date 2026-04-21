@@ -4,14 +4,22 @@ const {
   PlatformUser,
   Tenant,
   Facility,
+  ToiletBlock,
   ToiletUnit,
   Inspection,
+  InspectionMedia,
   InspectionTask,
+  Alert,
+  Complaint,
+  SensorDevice,
+  WorkerAssignment,
   SuperAdminProject,
   SuperAdminSupportTicket,
 } = require('../../models');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const {
+  EMPTY_SCOPE_UUID,
+  uniqueIds,
   buildAccessContextFromUser,
   applyScopeToQuery,
 } = require('../../core/rbac/scopeWhere');
@@ -89,6 +97,183 @@ const summarizeDetails = (details) => {
     .slice(0, 3)
     .map(([key, value]) => `${toTitleCase(key)}: ${String(value)}`)
     .join(' | ');
+};
+
+const addEntityIds = (bucketMap, entityType, values = []) => {
+  const ids = uniqueIds(values);
+  if (!entityType || ids.length === 0) return;
+  const bucket = bucketMap.get(entityType) || new Set();
+  ids.forEach((id) => bucket.add(String(id)));
+  bucketMap.set(entityType, bucket);
+};
+
+const buildScopedAuditEntityClauses = async (req) => {
+  if (req?.user?.isSuperAdmin) return [];
+
+  const accessContext = buildAccessContextFromUser(req?.user || {});
+  const scopeLevel = String(accessContext.scopeLevel || '').trim().toLowerCase();
+  const tenantId = String(req?.user?.tenantId || '').trim() || null;
+  const tenantWhere = tenantId ? { tenant_id: tenantId } : {};
+
+  let geographyIds = uniqueIds(accessContext.geographyIds || []);
+  let facilityIds = uniqueIds(accessContext.facilityIds || []);
+
+  // Fallback: derive facilities from scoped geographies when facility scope ids are not pre-populated.
+  if (facilityIds.length === 0 && geographyIds.length > 0) {
+    const derivedFacilityRows = await Facility.findAll({
+      where: {
+        ...tenantWhere,
+        [Op.or]: [
+          { geography_id: { [Op.in]: geographyIds } },
+          { zone_geography_id: { [Op.in]: geographyIds } },
+          { ward_geography_id: { [Op.in]: geographyIds } },
+        ],
+      },
+      attributes: ['id'],
+      raw: true,
+    });
+    facilityIds = uniqueIds(derivedFacilityRows.map((row) => row.id));
+  }
+
+  const enforceGeographyScope =
+    geographyIds.length > 0 || (scopeLevel && !['organization', 'facility', 'platform'].includes(scopeLevel));
+  const enforceFacilityScope =
+    facilityIds.length > 0 || scopeLevel === 'facility';
+
+  if (!enforceGeographyScope && !enforceFacilityScope) {
+    return [];
+  }
+
+  if (enforceGeographyScope && geographyIds.length === 0) {
+    geographyIds = [EMPTY_SCOPE_UUID];
+  }
+  if (enforceFacilityScope && facilityIds.length === 0) {
+    facilityIds = [EMPTY_SCOPE_UUID];
+  }
+
+  const entityIdsByType = new Map();
+  addEntityIds(entityIdsByType, 'geography', geographyIds);
+  addEntityIds(entityIdsByType, 'facility', facilityIds);
+
+  if (facilityIds.length > 0) {
+    const [
+      blockRows,
+      unitRows,
+      inspectionRows,
+      taskRows,
+      alertRows,
+      complaintRows,
+      sensorRows,
+    ] = await Promise.all([
+      ToiletBlock.findAll({
+        where: { facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      ToiletUnit.findAll({
+        where: { facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      Inspection.findAll({
+        where: { ...tenantWhere, facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      InspectionTask.findAll({
+        where: { ...tenantWhere, facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      Alert.findAll({
+        where: { ...tenantWhere, facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      Complaint.findAll({
+        where: { ...tenantWhere, facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+      SensorDevice.findAll({
+        where: { ...tenantWhere, facility_id: { [Op.in]: facilityIds } },
+        attributes: ['id'],
+        raw: true,
+      }),
+    ]);
+
+    const inspectionIds = uniqueIds(inspectionRows.map((row) => row.id));
+    const inspectionMediaRows =
+      inspectionIds.length > 0
+        ? await InspectionMedia.findAll({
+            where: { inspection_id: { [Op.in]: inspectionIds } },
+            attributes: ['id'],
+            raw: true,
+          })
+        : [];
+
+    addEntityIds(entityIdsByType, 'toilet_block', blockRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'toilet_unit', unitRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'inspection', inspectionIds);
+    addEntityIds(entityIdsByType, 'inspection_task', taskRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'inspection_media', inspectionMediaRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'alert', alertRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'complaint', complaintRows.map((row) => row.id));
+    addEntityIds(entityIdsByType, 'sensor_device', sensorRows.map((row) => row.id));
+  }
+
+  const platformUserIds = new Set();
+  if (geographyIds.length > 0) {
+    const geographyUsers = await PlatformUser.findAll({
+      where: {
+        ...tenantWhere,
+        geography_id: { [Op.in]: geographyIds },
+      },
+      attributes: ['id'],
+      raw: true,
+    });
+    geographyUsers.forEach((row) => platformUserIds.add(String(row.id)));
+  }
+
+  const assignmentScopeClauses = [];
+  if (geographyIds.length > 0) {
+    assignmentScopeClauses.push({ geography_id: { [Op.in]: geographyIds } });
+  }
+  if (facilityIds.length > 0) {
+    assignmentScopeClauses.push({ facility_id: { [Op.in]: facilityIds } });
+  }
+  if (assignmentScopeClauses.length > 0) {
+    const assignmentRows = await WorkerAssignment.findAll({
+      where: {
+        ...tenantWhere,
+        status: 'active',
+        [Op.or]: assignmentScopeClauses,
+      },
+      attributes: ['user_id'],
+      raw: true,
+    });
+    assignmentRows.forEach((row) => {
+      if (row.user_id) {
+        platformUserIds.add(String(row.user_id));
+      }
+    });
+  }
+  addEntityIds(entityIdsByType, 'platform_user', [...platformUserIds]);
+
+  const clauses = [];
+  if (req?.user?.id) {
+    clauses.push({ actor_user_id: req.user.id });
+  }
+  for (const [entityType, ids] of entityIdsByType.entries()) {
+    const normalizedIds = uniqueIds([...ids]);
+    if (normalizedIds.length === 0) continue;
+    clauses.push({
+      entity_type: entityType,
+      entity_id: { [Op.in]: normalizedIds },
+    });
+  }
+
+  return clauses;
 };
 
 const resolveTargetLabels = async (rows) => {
@@ -283,6 +468,7 @@ const listAuditLogs = async (req) => {
       tenantKey: 'tenant_id',
     },
   );
+  const andClauses = [];
 
   if (req.user?.isSuperAdmin && req.query.tenantId) {
     where.tenant_id = req.query.tenantId;
@@ -299,11 +485,24 @@ const listAuditLogs = async (req) => {
   }
   if (req.query.search) {
     const q = sanitizeText(req.query.search, 120);
-    where[Op.or] = [
-      { action: { [Op.iLike]: `%${q}%` } },
-      { entity_type: { [Op.iLike]: `%${q}%` } },
-      { entity_id: { [Op.iLike]: `%${q}%` } },
-    ];
+    andClauses.push({
+      [Op.or]: [
+        { action: { [Op.iLike]: `%${q}%` } },
+        { entity_type: { [Op.iLike]: `%${q}%` } },
+        { entity_id: { [Op.iLike]: `%${q}%` } },
+      ],
+    });
+  }
+
+  const scopedEntityClauses = await buildScopedAuditEntityClauses(req);
+  if (scopedEntityClauses.length > 0) {
+    andClauses.push({
+      [Op.or]: scopedEntityClauses,
+    });
+  }
+
+  if (andClauses.length > 0) {
+    where[Op.and] = [...(Array.isArray(where[Op.and]) ? where[Op.and] : []), ...andClauses];
   }
 
   const { rows, count } = await AuditLog.findAndCountAll({

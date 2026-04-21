@@ -195,6 +195,19 @@ const resolveEffectiveScope = async ({
     null;
 
   if (!geographySeed) {
+    const roleFacilityIds = assignmentFacilityIds(assignments, roleCode);
+    const fallbackFacilityIds =
+      roleFacilityIds.length > 0 ? roleFacilityIds : assignmentFacilityIds(assignments);
+    if (fallbackFacilityIds.length > 0) {
+      const fallbackGeographyIds = assignmentGeographyIds(assignments, roleCode);
+      return {
+        scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
+        scopeId: fallbackFacilityIds[0],
+        scopeIds: fallbackFacilityIds,
+        scopeGeographyIds: fallbackGeographyIds,
+        scopeFacilityIds: fallbackFacilityIds,
+      };
+    }
     return {
       scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
       scopeId: null,

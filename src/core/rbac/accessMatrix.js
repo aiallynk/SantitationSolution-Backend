@@ -261,6 +261,8 @@ const SUPERVISOR_PERMISSION_CODES = [
   'task.manage',
   'alerts.manage',
   'reports.read',
+  'users.manage',
+  'audit.read',
 ];
 
 const VIEWER_PERMISSION_CODES = ['auth.read', 'dashboard.read', 'reports.read'];
@@ -488,9 +490,9 @@ const ROLE_ACCESS_MATRIX = {
     personaFamily: PersonaFamilies.SUPERVISOR,
     hierarchyLevel: 80,
     surfaceType: SurfaceTypes.OPS_WEB_AND_MOBILE,
-    scopeType: ScopeTypes.FACILITY,
-    scopeLevel: ScopeLevels.FACILITY,
-    managementLevel: ManagementLevels.FACILITY,
+    scopeType: ScopeTypes.GEOGRAPHY,
+    scopeLevel: ScopeLevels.ZONE,
+    managementLevel: ManagementLevels.GEOGRAPHY,
     primaryLandingRoute: '/ops/overview',
     allowedRouteKeys: [
       RouteKeys.OPS_OVERVIEW,
@@ -499,9 +501,15 @@ const ROLE_ACCESS_MATRIX = {
       RouteKeys.OPS_ALERTS,
       RouteKeys.OPS_TASKS,
       RouteKeys.OPS_REPORTS,
+      RouteKeys.OPS_ADMINOPS,
+      RouteKeys.OPS_USERS,
+      RouteKeys.OPS_AUDIT,
       RouteKeys.OPS_PROFILE,
     ],
     allowedActionKeys: [
+      'hierarchy.manage',
+      'user.manage',
+      'facility.manage',
       'task.assign',
       'task.reassign',
       'task.verify',
@@ -511,11 +519,12 @@ const ROLE_ACCESS_MATRIX = {
     ],
     allowedWidgetKeys: [...SUPERVISOR_WIDGET_KEYS],
     allowedDataDomains: [
-      'facility.dashboard',
-      'facility.alerts',
-      'facility.tasks',
-      'facility.inspections',
-      'facility.reports',
+      'geography.dashboard',
+      'geography.users',
+      'geography.alerts',
+      'geography.tasks',
+      'geography.reports',
+      'geography.audit',
     ],
     permissionCodes: [...SUPERVISOR_PERMISSION_CODES],
     readOnly: false,
@@ -768,7 +777,7 @@ const ROLE_SCOPE_BY_ROLE_CODE = {
   [ROLE_CODES.CITY_ADMIN]: ScopeLevels.CITY,
   [ROLE_CODES.ZONE_ADMIN]: ScopeLevels.ZONE,
   [ROLE_CODES.FACILITY_MANAGER]: ScopeLevels.FACILITY,
-  [ROLE_CODES.SUPERVISOR]: ScopeLevels.FACILITY,
+  [ROLE_CODES.SUPERVISOR]: ScopeLevels.ZONE,
   [ROLE_CODES.FIELD_WORKER]: ScopeLevels.FACILITY,
 };
 

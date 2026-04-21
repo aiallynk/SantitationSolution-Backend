@@ -2,6 +2,7 @@ const { isBlank, isUuid, parsePositiveInteger } = require('../../utils/validator
 const { collectRoleScopeValidationErrors } = require('../../core/rbac/roleScopeRules');
 
 const ALLOWED_USER_STATUSES = new Set(['active', 'inactive', 'locked']);
+const DISALLOWED_USER_ROLE_CODES = new Set(['viewer', 'zone_admin', 'facility_manager']);
 const ALLOWED_ASSIGNMENT_LEVELS = new Set([
   'tenant',
   'geography',
@@ -73,6 +74,11 @@ const validateAssignments = (assignments, errors, prefix = 'assignments') => {
   });
 };
 
+const collectDisallowedRoleCodes = (roleCodes = []) =>
+  [...new Set((Array.isArray(roleCodes) ? roleCodes : [])
+    .map((code) => String(code || '').trim().toLowerCase())
+    .filter((code) => DISALLOWED_USER_ROLE_CODES.has(code)))];
+
 const validateUserListQuery = (req) => {
   const errors = [];
   if (Number.isNaN(parsePositiveInteger(req.query.page, 1))) {
@@ -106,6 +112,13 @@ const validateCreateUser = (req) => {
     errors.push('roleCodes must be a non-empty array');
   } else if (req.body.roleCodes.some((code) => isBlank(code))) {
     errors.push('roleCodes must not contain blank values');
+  } else {
+    const disallowedRoleCodes = collectDisallowedRoleCodes(req.body.roleCodes);
+    if (disallowedRoleCodes.length > 0) {
+      errors.push(
+        `roleCodes contain unsupported values: ${disallowedRoleCodes.join(', ')}`
+      );
+    }
   }
   if (req.body.employeeCode && String(req.body.employeeCode).trim().length > 64) {
     errors.push('employeeCode must be 64 characters or fewer');
@@ -175,6 +188,13 @@ const validatePatchUser = (req) => {
       errors.push('roleCodes must be a non-empty array when provided');
     } else if (req.body.roleCodes.some((code) => isBlank(code))) {
       errors.push('roleCodes must not contain blank values');
+    } else {
+      const disallowedRoleCodes = collectDisallowedRoleCodes(req.body.roleCodes);
+      if (disallowedRoleCodes.length > 0) {
+        errors.push(
+          `roleCodes contain unsupported values: ${disallowedRoleCodes.join(', ')}`
+        );
+      }
     }
   }
   if (req.body.metadata !== undefined && (typeof req.body.metadata !== 'object' || Array.isArray(req.body.metadata))) {

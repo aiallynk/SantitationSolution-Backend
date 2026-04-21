@@ -13,7 +13,7 @@ const {
   ToiletUnit,
   WorkerAssignment,
 } = require('../../models');
-const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { assertRoleScopeRequirements } = require('../../core/rbac/roleScopeRules');
 const {
@@ -34,7 +34,12 @@ const {
 } = require('../../core/rbac/scopeWhere');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
-const SUPERVISOR_ROLE_CODES = new Set([ROLE_CODES.SUPERVISOR, ROLE_CODES.FACILITY_MANAGER]);
+const SUPERVISOR_ROLE_CODES = new Set([ROLE_CODES.SUPERVISOR]);
+const DISALLOWED_USER_ROLE_CODES = new Set([
+  ROLE_CODES.VIEWER,
+  ROLE_CODES.ZONE_ADMIN,
+  ROLE_CODES.FACILITY_MANAGER,
+]);
 const TENANT_SCOPE_FIELD_MAP = {
   country: ['countryName'],
   state: ['countryName', 'stateName'],
@@ -75,6 +80,18 @@ const ALLOWED_ASSIGNMENT_LEVELS = new Set([
 const unique = (values) => [...new Set(values)];
 const normalizeRoleCodes = (roleCodes = []) =>
   uniqueNormalizedRoleCodes(roleCodes).map((roleCode) => normalizeRoleCode(roleCode));
+
+const assertSupportedUserRoleCodes = (roleCodes = []) => {
+  const disallowedRoleCodes = [...new Set((Array.isArray(roleCodes) ? roleCodes : [])
+    .map((roleCode) => normalizeRoleCode(roleCode))
+    .filter((roleCode) => DISALLOWED_USER_ROLE_CODES.has(roleCode)))];
+  if (disallowedRoleCodes.length > 0) {
+    throw new AppError('One or more role codes are no longer supported for assignment', 400, {
+      code: 'ROLE_NOT_SUPPORTED',
+      details: { roleCodes: disallowedRoleCodes },
+    });
+  }
+};
 
 const toStatus = (value, fallback = 'active') => {
   const normalized = String(value || fallback).toLowerCase();
@@ -206,6 +223,27 @@ const normalizeAssignmentLevel = (assignmentLevel, { geography, facility, toilet
   if (facility) return 'facility';
   if (geography) return 'geography';
   return 'tenant';
+};
+
+const toPersistedAssignmentLevel = (assignmentLevel) => {
+  const normalized = String(assignmentLevel || '')
+    .trim()
+    .toLowerCase();
+
+  // Backward compatibility:
+  // Older databases may still carry the original worker_assignments enum
+  // that only supports tenant|geography|facility|toilet_unit.
+  // We keep zone/ward/city/etc scope via geography_id and persist the enum
+  // value as "geography" so user creation does not fail on enum casts.
+  if (GEOGRAPHY_LIKE_ASSIGNMENT_LEVELS.has(normalized)) {
+    return 'geography';
+  }
+
+  if (ALLOWED_ASSIGNMENT_LEVELS.has(normalized)) {
+    return normalized;
+  }
+
+  return sanitizeText(normalized, 40) || 'tenant';
 };
 
 const buildUserInclude = ({ roleCode } = {}) => {
@@ -406,8 +444,18 @@ const assertUserScope = (req, user, assignments = []) => {
 const hasGlobalRole = (roleCodes) => roleCodes.some((code) => GLOBAL_ROLE_CODES.has(code));
 const hasTenantRole = (roleCodes) => roleCodes.some((code) => !GLOBAL_ROLE_CODES.has(code));
 
+const assertUuidInput = (value, field) => {
+  if (!value) return;
+  if (isUuid(value)) return;
+  throw new AppError(`${field} must be a valid UUID`, 400, {
+    code: 'VALIDATION_ERROR',
+    details: { field },
+  });
+};
+
 const ensureTenantExists = async (tenantId, { transaction } = {}) => {
   if (!tenantId) return null;
+  assertUuidInput(tenantId, 'tenantId');
   const tenant = await Tenant.findByPk(tenantId, {
     attributes: [
       'id',
@@ -432,6 +480,7 @@ const ensureTenantExists = async (tenantId, { transaction } = {}) => {
 
 const ensureGeographyScope = async ({ geographyId, tenantId, transaction }) => {
   if (!geographyId) return null;
+  assertUuidInput(geographyId, 'geographyId');
   const geography = await Geography.findByPk(geographyId, { transaction });
   if (!geography || geography.tenant_id !== tenantId) {
     throw new AppError('geographyId is outside tenant scope', 400, {
@@ -439,6 +488,19 @@ const ensureGeographyScope = async ({ geographyId, tenantId, transaction }) => {
     });
   }
   return geography;
+};
+
+const resolveImplicitGeographyScope = async ({ geographyId, tenantId, transaction }) => {
+  if (!geographyId) return null;
+  try {
+    return await ensureGeographyScope({ geographyId, tenantId, transaction });
+  } catch (error) {
+    // Keep backward compatibility for legacy tenants that carry stale root/user geography links.
+    if (error?.code === 'GEOGRAPHY_SCOPE_INVALID') {
+      return null;
+    }
+    throw error;
+  }
 };
 
 const resolveLocationNamesFromGeography = async ({ geographyId, transaction }) => {
@@ -517,6 +579,12 @@ const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
 
   const scopeLevel = String(tenant.scope_level || '').trim().toLowerCase();
   const requiredFields = TENANT_SCOPE_FIELD_MAP[scopeLevel] || [];
+  const hasCompleteTenantBaseline =
+    requiredFields.length === 0 ||
+    requiredFields.every((field) => Boolean(String(tenantLocationNames[field] || '').trim()));
+  if (!hasCompleteTenantBaseline) {
+    return;
+  }
   for (const field of requiredFields) {
     const value = String(locationNames[field] || '').trim();
     if (!value) {
@@ -604,6 +672,7 @@ const loadSupervisorCandidate = async ({
   transaction = null,
 }) => {
   if (!supervisorUserId) return null;
+  assertUuidInput(supervisorUserId, 'supervisorUserId');
   const supervisor = await PlatformUser.findByPk(supervisorUserId, {
     include: [
       {
@@ -663,6 +732,7 @@ const loadSupervisorCandidate = async ({
 
 const ensureFacilityScope = async ({ facilityId, tenantId, transaction }) => {
   if (!facilityId) return null;
+  assertUuidInput(facilityId, 'facilityId');
   const facility = await Facility.findByPk(facilityId, { transaction });
   if (!facility || facility.tenant_id !== tenantId) {
     throw new AppError('facilityId is outside tenant scope', 400, {
@@ -674,6 +744,7 @@ const ensureFacilityScope = async ({ facilityId, tenantId, transaction }) => {
 
 const ensureToiletUnitScope = async ({ toiletUnitId, tenantId, transaction }) => {
   if (!toiletUnitId) return null;
+  assertUuidInput(toiletUnitId, 'toiletUnitId');
   const toiletUnit = await ToiletUnit.findByPk(toiletUnitId, {
     include: [{ model: Facility, attributes: ['id', 'tenant_id', 'geography_id'] }],
     transaction,
@@ -861,9 +932,7 @@ const replaceAssignments = async ({
       geography_id: assignmentGeographyId,
       facility_id: assignmentFacilityId,
       toilet_unit_id: toiletUnit?.id || null,
-      assignment_level: GEOGRAPHY_LIKE_ASSIGNMENT_LEVELS.has(inferredLevel)
-        ? inferredLevel
-        : sanitizeText(inferredLevel, 40) || 'tenant',
+      assignment_level: toPersistedAssignmentLevel(inferredLevel),
       assignment_role: sanitizeText(assignment.assignmentRole || roleCodes[0] || 'worker', 80),
       status: assignment.status === 'inactive' ? 'inactive' : 'active',
       created_by_user_id: actorUserId,
@@ -956,6 +1025,7 @@ const createUser = async (req) => {
       code: 'VALIDATION_ERROR',
     });
   }
+  assertSupportedUserRoleCodes(roleCodes);
 
   assertRoleDelegationAllowed({
     actorRoleCodes: req.user.roleCodes || req.user.allRoleCodes || [],
@@ -979,11 +1049,17 @@ const createUser = async (req) => {
       requestedGeographyId ||
       (tenantId && hasTenantRole(roleCodes) ? fallbackTenantGeographyId : null);
 
-    const resolvedGeography = await ensureGeographyScope({
-      geographyId,
-      tenantId,
-      transaction,
-    });
+    const resolvedGeography = requestedGeographyId
+      ? await ensureGeographyScope({
+          geographyId: requestedGeographyId,
+          tenantId,
+          transaction,
+        })
+      : await resolveImplicitGeographyScope({
+          geographyId,
+          tenantId,
+          transaction,
+        });
     if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
       throw new AppError('geographyId is outside actor scope', 403, {
         code: 'SCOPE_FORBIDDEN',
@@ -1144,18 +1220,25 @@ const patchUser = async (req) => {
 
   return sequelize.transaction(async (transaction) => {
     const tenant = await ensureTenantExists(nextTenantId, { transaction });
+    const hasExplicitGeographyInput = req.body.geographyId !== undefined;
     const requestedGeographyId =
-      req.body.geographyId !== undefined ? req.body.geographyId || null : user.geography_id;
+      hasExplicitGeographyInput ? req.body.geographyId || null : user.geography_id;
     const geographyId =
       requestedGeographyId ||
       (nextTenantId && hasTenantRole(unique((user.Roles || []).map((role) => role.code)))
         ? tenant?.root_geography_id || null
         : null);
-    const resolvedGeography = await ensureGeographyScope({
-      geographyId,
-      tenantId: nextTenantId,
-      transaction,
-    });
+    const resolvedGeography = hasExplicitGeographyInput
+      ? await ensureGeographyScope({
+          geographyId: requestedGeographyId,
+          tenantId: nextTenantId,
+          transaction,
+        })
+      : await resolveImplicitGeographyScope({
+          geographyId,
+          tenantId: nextTenantId,
+          transaction,
+        });
     if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
       throw new AppError('geographyId is outside actor scope', 403, {
         code: 'SCOPE_FORBIDDEN',
@@ -1250,6 +1333,7 @@ const patchUser = async (req) => {
     let roleCodes = unique((user.Roles || []).map((role) => role.code));
     if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
       roleCodes = normalizeRoleCodes(req.body.roleCodes);
+      assertSupportedUserRoleCodes(roleCodes);
       if (!req.user.isSuperAdmin && hasGlobalRole(roleCodes)) {
         throw new AppError('Only super admin can assign platform roles', 403, {
           code: 'ROLE_SCOPE_FORBIDDEN',

@@ -49,7 +49,6 @@ const GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES = new Set([
 ]);
 const FACILITY_SCOPED_ROLE_CODES = new Set([
   ROLE_CODES.FACILITY_MANAGER,
-  ROLE_CODES.SUPERVISOR,
   ROLE_CODES.FIELD_WORKER,
 ]);
 const FACILITY_SCOPED_ADMIN_ROLE_CODES = new Set([ROLE_CODES.FACILITY_MANAGER]);
@@ -77,6 +76,7 @@ const isLegacyCompatRole = (roleCode) => getPersonaFamily(roleCode) === PersonaF
 
 const getRequiredScopeType = (roleCode) => {
   const normalizedRoleCode = normalizeRoleCode(roleCode);
+  if (SUPERVISOR_ROLE_CODES.has(normalizedRoleCode)) return 'geography';
   if (GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES.has(normalizedRoleCode)) return 'geography';
   if (FACILITY_SCOPED_ROLE_CODES.has(normalizedRoleCode)) return 'facility';
   return 'none';
