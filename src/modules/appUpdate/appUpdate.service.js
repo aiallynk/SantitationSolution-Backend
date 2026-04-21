@@ -30,16 +30,70 @@ const sanitizeApkFileName = (value) => {
   return normalized;
 };
 
+const normalizeAbsoluteHttpUrl = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return '';
+    }
+    return parsed.toString();
+  } catch (_) {
+    return '';
+  }
+};
+
+const normalizePublicBaseUrl = (value) => {
+  const absolute = normalizeAbsoluteHttpUrl(value);
+  if (!absolute) {
+    return '';
+  }
+  const parsed = new URL(absolute);
+  return `${parsed.protocol}//${parsed.host}`;
+};
+
+const looksLikeHostPath = (value) =>
+  /^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(:\d+)?($|\/)/.test(String(value || '').trim());
+
 const resolvePublicApiBaseUrl = (req) => {
-  const configured = String(
-    process.env.APP_API_BASE_URL || runtimeConfig.urls.apiPublicBaseUrl || ''
-  )
-    .trim()
-    .replace(/\/+$/, '');
+  const configured =
+    normalizePublicBaseUrl(process.env.APP_API_BASE_URL) ||
+    normalizePublicBaseUrl(runtimeConfig.urls.apiPublicBaseUrl);
   if (configured) {
     return configured;
   }
-  return `${req.protocol}://${req.get('host')}`;
+  const protocol = req.protocol === 'https' ? 'https' : 'http';
+  return `${protocol}://${req.get('host')}`;
+};
+
+const resolveApkUrl = ({ req, config }) => {
+  const defaultPath = `/api/v1/app/apk/${encodeURIComponent(config.latestVersion)}`;
+  const explicit = String(config.explicitApkUrl || '').trim();
+  if (!explicit) {
+    return `${resolvePublicApiBaseUrl(req)}${defaultPath}`;
+  }
+
+  const absoluteExplicit = normalizeAbsoluteHttpUrl(explicit);
+  if (absoluteExplicit) {
+    return absoluteExplicit;
+  }
+
+  if (explicit.startsWith('//')) {
+    const scheme = req.protocol === 'https' ? 'https' : 'http';
+    return `${scheme}:${explicit}`;
+  }
+
+  if (looksLikeHostPath(explicit)) {
+    const base = resolvePublicApiBaseUrl(req);
+    const scheme = base.startsWith('https://') ? 'https' : 'http';
+    return `${scheme}://${explicit}`;
+  }
+
+  const relativePath = explicit.startsWith('/') ? explicit : `/${explicit}`;
+  return `${resolvePublicApiBaseUrl(req)}${relativePath}`;
 };
 
 const readConfigPayload = () => {
@@ -129,9 +183,7 @@ const resolveVersionedApkPath = ({ apkDir, fileName }) => {
 
 const getAppUpdateMetadata = (req) => {
   const config = readConfigPayload();
-  const apkUrl =
-    config.explicitApkUrl ||
-    `${resolvePublicApiBaseUrl(req)}/api/v1/app/apk/${encodeURIComponent(config.latestVersion)}`;
+  const apkUrl = resolveApkUrl({ req, config });
 
   return {
     latestVersion: config.latestVersion,

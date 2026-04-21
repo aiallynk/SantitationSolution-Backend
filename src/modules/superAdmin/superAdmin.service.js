@@ -704,7 +704,12 @@ const getNotificationsFeed = async (req) => {
   ensureSuperAdmin(req);
   const where = {};
   if (req.query.tenantId) where.tenant_id = req.query.tenantId;
-  if (req.query.status) where.status = req.query.status;
+  if (req.query.status) {
+    where[Op.or] = [
+      { status: req.query.status },
+      { delivery_state: String(req.query.status).toUpperCase() },
+    ];
+  }
   const rows = await NotificationEvent.findAll({
     where,
     order: [['created_at', 'DESC']],
@@ -715,9 +720,14 @@ const getNotificationsFeed = async (req) => {
     tenantId: row.tenant_id,
     userId: row.user_id,
     eventType: row.event_type,
+    notificationType: row.notification_type || null,
+    priority: row.priority || null,
+    title: row.title || row.payload?.title || null,
+    body: row.body || row.payload?.body || row.payload?.message || null,
+    route: row.route || row.payload?.route || null,
     channel: row.channel,
     payload: row.payload,
-    status: row.status,
+    status: row.delivery_state || row.status,
     createdAt: row.created_at,
   }));
 };

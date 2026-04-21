@@ -10,6 +10,7 @@ const EVENTS = Object.freeze({
   ALERT_UPDATED: 'alert.updated',
   SENSOR_READING: 'sensor.reading',
   FACILITY_METRICS_UPDATED: 'facility.metrics.updated',
+  NOTIFICATION_CREATED: 'notification.created',
 });
 
 module.exports = {

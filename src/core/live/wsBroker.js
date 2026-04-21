@@ -9,7 +9,17 @@ let clientCounter = 0;
 
 const shouldDeliver = (clientScope, payloadScope) => {
   if (!payloadScope) return true;
-  if (clientScope.isSuperAdmin || clientScope.roleCode === 'super_admin') return true;
+
+  if (payloadScope.userId) {
+    if (!clientScope.userId) return false;
+    if (String(payloadScope.userId) !== String(clientScope.userId)) {
+      return false;
+    }
+  }
+
+  if ((clientScope.isSuperAdmin || clientScope.roleCode === 'super_admin') && !payloadScope.userId) {
+    return true;
+  }
 
   if (payloadScope.tenantId && clientScope.tenantId && payloadScope.tenantId !== clientScope.tenantId) {
     return false;

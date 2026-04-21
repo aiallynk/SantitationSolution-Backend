@@ -32,6 +32,12 @@ const registerLiveForwarders = () => {
   eventBus.on(EVENTS.FACILITY_METRICS_UPDATED, (payload) => {
     void forwardEvent(EVENTS.FACILITY_METRICS_UPDATED, payload, { tenantId: payload.tenantId || null });
   });
+  eventBus.on(EVENTS.NOTIFICATION_CREATED, (payload) => {
+    void forwardEvent(EVENTS.NOTIFICATION_CREATED, payload, {
+      tenantId: payload.tenantId || null,
+      userId: payload.userId || null,
+    });
+  });
 };
 
 module.exports = {

@@ -6,6 +6,7 @@ const router = express.Router();
 
 router.get('/live/stream', protect, (req, res) => {
   registerClient(req, res, {
+    userId: req.user.id,
     tenantId: req.user.tenantId,
     roleCode: req.user.roleCodes?.[0] || null,
   });

@@ -697,12 +697,88 @@ const NotificationEvent = sequelize.define(
     user_id: { type: DataTypes.UUID, allowNull: true },
     event_type: { type: DataTypes.STRING(120), allowNull: false },
     channel: { type: DataTypes.STRING(60), allowNull: false, defaultValue: 'in_app' },
+    notification_type: { type: DataTypes.STRING(80), allowNull: true },
+    priority: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'MEDIUM' },
+    title: { type: DataTypes.STRING(200), allowNull: true },
+    body: { type: DataTypes.STRING(1200), allowNull: true },
+    short_body: { type: DataTypes.STRING(280), allowNull: true },
+    entity_type: { type: DataTypes.STRING(120), allowNull: true },
+    entity_id: { type: DataTypes.STRING(120), allowNull: true },
+    route: { type: DataTypes.STRING(320), allowNull: true },
+    icon_key: { type: DataTypes.STRING(80), allowNull: true },
+    severity: { type: DataTypes.STRING(20), allowNull: true },
+    created_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    geography_id: { type: DataTypes.UUID, allowNull: true },
+    facility_id: { type: DataTypes.UUID, allowNull: true },
+    audience_kind: { type: DataTypes.STRING(40), allowNull: true },
     payload: { type: DataTypes.JSONB, allowNull: false },
     status: { type: DataTypes.ENUM('queued', 'sent', 'failed'), allowNull: false, defaultValue: 'queued' },
+    delivery_state: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'PENDING' },
+    read_at: { type: DataTypes.DATE, allowNull: true },
+    dismissed_at: { type: DataTypes.DATE, allowNull: true },
+    dedupe_key: { type: DataTypes.STRING(220), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
     sent_at: { type: DataTypes.DATE, allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'notification_events', timestamps: false }
+);
+
+const NotificationPreference = sequelize.define(
+  'NotificationPreference',
+  {
+    id: defineUuidId(),
+    user_id: { type: DataTypes.UUID, allowNull: false },
+    notification_type: { type: DataTypes.STRING(80), allowNull: false },
+    in_app_web_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    in_app_mobile_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    push_mobile_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    push_web_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    email_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    sms_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    ...commonTimestamps,
+  },
+  { tableName: 'notification_preferences', timestamps: false }
+);
+
+const NotificationDeviceToken = sequelize.define(
+  'NotificationDeviceToken',
+  {
+    id: defineUuidId(),
+    user_id: { type: DataTypes.UUID, allowNull: false },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    platform: { type: DataTypes.STRING(20), allowNull: false },
+    token: { type: DataTypes.STRING(600), allowNull: false },
+    device_id: { type: DataTypes.STRING(180), allowNull: true },
+    app_version: { type: DataTypes.STRING(80), allowNull: true },
+    locale: { type: DataTypes.STRING(32), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    last_active_at: { type: DataTypes.DATE, allowNull: true },
+    disabled_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'notification_device_tokens', timestamps: false }
+);
+
+const NotificationDeliveryLog = sequelize.define(
+  'NotificationDeliveryLog',
+  {
+    id: defineUuidId(),
+    notification_id: { type: DataTypes.UUID, allowNull: false },
+    user_id: { type: DataTypes.UUID, allowNull: true },
+    channel: { type: DataTypes.STRING(60), allowNull: false },
+    provider: { type: DataTypes.STRING(80), allowNull: true },
+    provider_message_id: { type: DataTypes.STRING(220), allowNull: true },
+    device_token_id: { type: DataTypes.UUID, allowNull: true },
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'PENDING' },
+    error_code: { type: DataTypes.STRING(120), allowNull: true },
+    error_message: { type: DataTypes.STRING(2000), allowNull: true },
+    attempted_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    delivered_at: { type: DataTypes.DATE, allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'notification_delivery_logs', timestamps: false }
 );
 
 const AuditLog = sequelize.define(
@@ -1072,6 +1148,43 @@ Complaint.belongsTo(PlatformUser, {
   foreignKey: 'dispatch_requested_by_user_id',
   as: 'dispatchRequestedBy',
 });
+PlatformUser.hasMany(NotificationEvent, { foreignKey: 'user_id', as: 'notifications' });
+NotificationEvent.belongsTo(PlatformUser, { foreignKey: 'user_id', as: 'user' });
+Tenant.hasMany(NotificationEvent, { foreignKey: 'tenant_id', as: 'notificationEvents' });
+NotificationEvent.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+PlatformUser.hasMany(NotificationEvent, { foreignKey: 'created_by_user_id', as: 'createdNotifications' });
+NotificationEvent.belongsTo(PlatformUser, { foreignKey: 'created_by_user_id', as: 'createdByUser' });
+Geography.hasMany(NotificationEvent, { foreignKey: 'geography_id', as: 'notificationEvents' });
+NotificationEvent.belongsTo(Geography, { foreignKey: 'geography_id', as: 'geography' });
+Facility.hasMany(NotificationEvent, { foreignKey: 'facility_id', as: 'notificationEvents' });
+NotificationEvent.belongsTo(Facility, { foreignKey: 'facility_id', as: 'facility' });
+
+PlatformUser.hasMany(NotificationPreference, { foreignKey: 'user_id', as: 'notificationPreferences' });
+NotificationPreference.belongsTo(PlatformUser, { foreignKey: 'user_id', as: 'user' });
+
+PlatformUser.hasMany(NotificationDeviceToken, { foreignKey: 'user_id', as: 'notificationDeviceTokens' });
+NotificationDeviceToken.belongsTo(PlatformUser, { foreignKey: 'user_id', as: 'user' });
+Tenant.hasMany(NotificationDeviceToken, { foreignKey: 'tenant_id', as: 'notificationDeviceTokens' });
+NotificationDeviceToken.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+
+NotificationEvent.hasMany(NotificationDeliveryLog, {
+  foreignKey: 'notification_id',
+  as: 'deliveryLogs',
+});
+NotificationDeliveryLog.belongsTo(NotificationEvent, {
+  foreignKey: 'notification_id',
+  as: 'notification',
+});
+PlatformUser.hasMany(NotificationDeliveryLog, { foreignKey: 'user_id', as: 'notificationDeliveryLogs' });
+NotificationDeliveryLog.belongsTo(PlatformUser, { foreignKey: 'user_id', as: 'user' });
+NotificationDeviceToken.hasMany(NotificationDeliveryLog, {
+  foreignKey: 'device_token_id',
+  as: 'deliveryLogs',
+});
+NotificationDeliveryLog.belongsTo(NotificationDeviceToken, {
+  foreignKey: 'device_token_id',
+  as: 'deviceToken',
+});
 AuditLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.hasMany(AuditLog, { foreignKey: 'tenant_id', as: 'auditLogs' });
 AuditLog.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
@@ -1121,6 +1234,9 @@ module.exports = {
   CleaningEvent,
   Complaint,
   NotificationEvent,
+  NotificationPreference,
+  NotificationDeviceToken,
+  NotificationDeliveryLog,
   AuditLog,
   LoginSession,
   DashboardAggregate,
