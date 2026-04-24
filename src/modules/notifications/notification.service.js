@@ -407,24 +407,33 @@ const mapPreferenceRow = (notificationType, row = null) => {
   return {
     notificationType,
     inAppWebEnabled:
-      row?.in_app_web_enabled !== undefined
+      row?.in_app_web_enabled !== undefined &&
+      row?.in_app_web_enabled !== null
         ? Boolean(row.in_app_web_enabled)
         : defaults.inAppWeb,
     inAppMobileEnabled:
-      row?.in_app_mobile_enabled !== undefined
+      row?.in_app_mobile_enabled !== undefined &&
+      row?.in_app_mobile_enabled !== null
         ? Boolean(row.in_app_mobile_enabled)
         : defaults.inAppMobile,
     pushMobileEnabled:
-      row?.push_mobile_enabled !== undefined
+      row?.push_mobile_enabled !== undefined &&
+      row?.push_mobile_enabled !== null
         ? Boolean(row.push_mobile_enabled)
         : defaults.pushMobile,
     pushWebEnabled:
-      row?.push_web_enabled !== undefined
+      row?.push_web_enabled !== undefined &&
+      row?.push_web_enabled !== null
         ? Boolean(row.push_web_enabled)
         : defaults.pushWeb,
     emailEnabled:
-      row?.email_enabled !== undefined ? Boolean(row.email_enabled) : defaults.email,
-    smsEnabled: row?.sms_enabled !== undefined ? Boolean(row.sms_enabled) : defaults.sms,
+      row?.email_enabled !== undefined && row?.email_enabled !== null
+        ? Boolean(row.email_enabled)
+        : defaults.email,
+    smsEnabled:
+      row?.sms_enabled !== undefined && row?.sms_enabled !== null
+        ? Boolean(row.sms_enabled)
+        : defaults.sms,
   };
 };
 
