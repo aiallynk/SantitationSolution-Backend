@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 const { ScopeLevels } = require('../src/core/rbac/accessProfiles');
 const { resolveEffectiveScope } = require('../src/core/rbac/scopeResolver');
-const { InspectionTask } = require('../src/models');
+const { Geography, Facility, InspectionTask } = require('../src/models');
 
 test('resolveEffectiveScope keeps assignment-based facility scope when assignments exist', async (t) => {
   const originalFindAll = InspectionTask.findAll;
@@ -83,4 +83,49 @@ test('resolveEffectiveScope returns empty facility scope when no assignments and
   assert.equal(scope.scopeLevel, ScopeLevels.FACILITY);
   assert.deepEqual(scope.scopeFacilityIds, []);
   assert.equal(scope.scopeId, null);
+});
+
+test('resolveEffectiveScope derives facility scope from geography assignments for facility-scoped workers', async (t) => {
+  const originalGeographyFindAll = Geography.findAll;
+  const originalFacilityFindAll = Facility.findAll;
+  const originalTaskFindAll = InspectionTask.findAll;
+  let taskLookupCalled = false;
+
+  Geography.findAll = async () => [
+    { id: 'geo-zone-1', parent_id: null },
+    { id: 'geo-ward-1', parent_id: 'geo-zone-1' },
+  ];
+  Facility.findAll = async () => [{ id: 'facility-1' }, { id: 'facility-2' }];
+  InspectionTask.findAll = async () => {
+    taskLookupCalled = true;
+    return [];
+  };
+
+  t.after(() => {
+    Geography.findAll = originalGeographyFindAll;
+    Facility.findAll = originalFacilityFindAll;
+    InspectionTask.findAll = originalTaskFindAll;
+  });
+
+  const scope = await resolveEffectiveScope({
+    roleCode: 'field_worker',
+    roleProfile: { scopeLevel: ScopeLevels.FACILITY },
+    memberships: [],
+    assignments: [
+      {
+        status: 'active',
+        assignment_role: 'field_worker',
+        geography_id: 'geo-zone-1',
+      },
+    ],
+    activeTenantId: 'tenant-1',
+    userId: 'worker-3',
+    fallbackGeographyId: null,
+  });
+
+  assert.equal(scope.scopeLevel, ScopeLevels.FACILITY);
+  assert.deepEqual(scope.scopeGeographyIds, ['geo-zone-1', 'geo-ward-1']);
+  assert.deepEqual(scope.scopeFacilityIds, ['facility-1', 'facility-2']);
+  assert.equal(scope.scopeId, 'facility-1');
+  assert.equal(taskLookupCalled, false);
 });

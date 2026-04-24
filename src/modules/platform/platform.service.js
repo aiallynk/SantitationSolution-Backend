@@ -1093,9 +1093,60 @@ const classifyResolvedToilet = ({ row, req }) => {
   return QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY;
 };
 
+const BASELINE_MIN_INSPECTIONS = 3;
+
+const resolveBaselineConfidence = (inspectionCount) => {
+  const count = Number(inspectionCount || 0);
+  if (!Number.isFinite(count) || count < BASELINE_MIN_INSPECTIONS) return 'insufficient';
+  if (count >= 20) return 'high';
+  if (count >= 8) return 'medium';
+  return 'low';
+};
+
+const resolveBaselineScore = ({ totalInspections, avgAfterScore, latestScore }) => {
+  const avgAfter = Number.isFinite(Number(avgAfterScore)) ? Number(avgAfterScore) : null;
+  const latest = Number.isFinite(Number(latestScore)) ? Number(latestScore) : null;
+  const count = Number(totalInspections || 0);
+  if (count >= BASELINE_MIN_INSPECTIONS) {
+    return avgAfter ?? latest;
+  }
+  return latest ?? avgAfter;
+};
+
 const mapUnitRow = (row, options = {}) => {
   const resolvedQrCode = String(options.resolvedQrCode || row.qr_code || row.code || '').trim();
   const legacyQrCode = String(options.legacyQrCode || row.qr_code || row.code || '').trim();
+  const latestScore =
+    row.latest_score !== null && row.latest_score !== undefined
+      ? Number(row.latest_score)
+      : null;
+  const latestBeforeScore =
+    row.latest_before_score !== null && row.latest_before_score !== undefined
+      ? Number(row.latest_before_score)
+      : null;
+  const latestAfterScore =
+    row.latest_after_score !== null && row.latest_after_score !== undefined
+      ? Number(row.latest_after_score)
+      : null;
+  const avgBeforeScore =
+    row.avg_before_score !== null && row.avg_before_score !== undefined
+      ? Number(row.avg_before_score)
+      : null;
+  const avgAfterScore =
+    row.avg_after_score !== null && row.avg_after_score !== undefined
+      ? Number(row.avg_after_score)
+      : null;
+  const avgImprovementScore =
+    row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
+      ? Number(row.avg_improvement_score)
+      : null;
+  const totalInspections = Number(row.total_inspections || 0);
+  const baselineScore = resolveBaselineScore({
+    totalInspections,
+    avgAfterScore,
+    latestScore,
+  });
+
   return {
     id: row.id,
     facilityId: row.facility_id,
@@ -1136,31 +1187,28 @@ const mapUnitRow = (row, options = {}) => {
         : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
           ? Number(row.Facility.longitude)
           : null,
-    latestScore:
-      row.latest_score !== null && row.latest_score !== undefined
-        ? Number(row.latest_score)
-        : null,
-    latestBeforeScore:
-      row.latest_before_score !== null && row.latest_before_score !== undefined
-        ? Number(row.latest_before_score)
-        : null,
-    latestAfterScore:
-      row.latest_after_score !== null && row.latest_after_score !== undefined
-        ? Number(row.latest_after_score)
-        : null,
-    avgBeforeScore:
-      row.avg_before_score !== null && row.avg_before_score !== undefined
-        ? Number(row.avg_before_score)
-        : null,
-    avgAfterScore:
-      row.avg_after_score !== null && row.avg_after_score !== undefined
-        ? Number(row.avg_after_score)
-        : null,
-    avgImprovementScore:
-      row.avg_improvement_score !== null && row.avg_improvement_score !== undefined
-        ? Number(row.avg_improvement_score)
-        : null,
-    totalInspections: Number(row.total_inspections || 0),
+    latestScore,
+    latestBeforeScore,
+    latestAfterScore,
+    avgBeforeScore,
+    avgAfterScore,
+    avgImprovementScore,
+    baselineScore,
+    baselineScoreLabel:
+      baselineScore !== null && baselineScore !== undefined
+        ? baselineScore <= 30
+          ? 'Very Dirty'
+          : baselineScore <= 50
+            ? 'Dirty'
+            : baselineScore <= 70
+              ? 'Moderate'
+              : baselineScore <= 85
+                ? 'Clean'
+                : 'Very Clean'
+        : 'Unknown',
+    baselineMinInspections: BASELINE_MIN_INSPECTIONS,
+    baselineConfidence: resolveBaselineConfidence(totalInspections),
+    totalInspections,
     lastInspectionAt: row.last_inspection_at || null,
     dirtyFrequency:
       row.dirty_frequency !== null && row.dirty_frequency !== undefined

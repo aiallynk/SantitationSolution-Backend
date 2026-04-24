@@ -56,6 +56,26 @@ const scoreLabel = (score) => {
   return 'Very Clean';
 };
 
+const BASELINE_MIN_INSPECTIONS = 3;
+
+const resolveBaselineConfidence = (inspectionCount) => {
+  const count = Number(inspectionCount || 0);
+  if (!Number.isFinite(count) || count < BASELINE_MIN_INSPECTIONS) return 'insufficient';
+  if (count >= 20) return 'high';
+  if (count >= 8) return 'medium';
+  return 'low';
+};
+
+const resolveBaselineScore = ({ totalInspections, avgAfterScore, latestScore }) => {
+  const avgAfter = toNumber(avgAfterScore, null);
+  const latest = toNumber(latestScore, null);
+  const count = Number(totalInspections || 0);
+  if (count >= BASELINE_MIN_INSPECTIONS) {
+    return avgAfter ?? latest;
+  }
+  return latest ?? avgAfter;
+};
+
 const canViewAdminDiagnostics = (req) => {
   if (req?.user?.isSuperAdmin) return true;
   const permissions = new Set(
@@ -1876,6 +1896,14 @@ const getToiletDetails = async (toiletId, req) => {
       ? null
       : toNumber(unit.avg_improvement_score, null)) ?? historyImprovementAvg;
 
+  const baselineScore = resolveBaselineScore({
+    totalInspections,
+    avgAfterScore,
+    latestScore,
+  });
+  const baselineScoreLabel = scoreLabel(baselineScore);
+  const baselineConfidence = resolveBaselineConfidence(totalInspections);
+
   const historyDirtyCount = historyItems.filter((item) => {
     const value = toNumber(item.avgBeforeScore, null);
     return value !== null && value <= 50;
@@ -2001,6 +2029,10 @@ const getToiletDetails = async (toiletId, req) => {
       status: unit.status,
       latestScore,
       latestScoreLabel: scoreLabel(latestScore),
+      baselineScore,
+      baselineScoreLabel,
+      baselineConfidence,
+      baselineMinInspections: BASELINE_MIN_INSPECTIONS,
       latestBeforeScore,
       latestAfterScore,
       avgBeforeScore,

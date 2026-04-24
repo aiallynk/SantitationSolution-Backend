@@ -816,6 +816,8 @@ const classifyAuditAction = ({ action, details = {} }) => {
   const normalizedAction = String(action || '').trim().toLowerCase();
   if (!normalizedAction) return null;
   if (normalizedAction === 'complaint.dispatch') return null;
+  if (normalizedAction.startsWith('inspection.media_upload')) return null;
+  if (normalizedAction === 'analysis.inspection_run') return null;
 
   if (normalizedAction.startsWith('task.')) {
     return {
