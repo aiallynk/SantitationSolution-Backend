@@ -165,15 +165,32 @@ const resolveEffectiveScope = async ({
     const roleFacilityIds = assignmentFacilityIds(assignments, roleCode);
     let fallbackFacilityIds =
       roleFacilityIds.length > 0 ? roleFacilityIds : assignmentFacilityIds(assignments);
+    const roleGeographyIds = assignmentGeographyIds(assignments, roleCode);
+    let fallbackGeographyIds =
+      roleGeographyIds.length > 0 ? roleGeographyIds : assignmentGeographyIds(assignments);
+
+    if (fallbackGeographyIds.length > 0) {
+      fallbackGeographyIds = await expandDescendantGeographies({
+        tenantId: activeTenantId,
+        seedGeographyIds: fallbackGeographyIds,
+      });
+    }
+
+    // Support zone/ward geography assignments for facility-scoped personas
+    // by deriving the reachable facilities in that geography tree.
+    if (fallbackFacilityIds.length === 0 && fallbackGeographyIds.length > 0) {
+      fallbackFacilityIds = await resolveFacilitiesFromGeographyScope({
+        tenantId: activeTenantId,
+        geographyIds: fallbackGeographyIds,
+      });
+    }
+
     if (fallbackFacilityIds.length === 0) {
       fallbackFacilityIds = await resolveFacilitiesFromAssignedTasks({
         tenantId: activeTenantId,
         userId,
       });
     }
-    const roleGeographyIds = assignmentGeographyIds(assignments, roleCode);
-    const fallbackGeographyIds =
-      roleGeographyIds.length > 0 ? roleGeographyIds : assignmentGeographyIds(assignments);
     return {
       scopeLevel: ScopeLevels.FACILITY,
       scopeId: fallbackFacilityIds[0] || null,
