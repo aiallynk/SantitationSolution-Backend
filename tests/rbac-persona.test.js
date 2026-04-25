@@ -36,6 +36,7 @@ test('role bundles keep geography admins aligned and enforce facility/supervisor
   assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('audit.read'), false);
 
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('audit.read'), true);
+  assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('inspection.create'), true);
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('task.manage'), false);
 });
 
@@ -93,9 +94,41 @@ test('role access profile resolves strict route, widget, and action keys for sup
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_ADMINOPS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_SETTINGS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), true);
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_MONITORING), true);
   assert.equal(profile.actionKeys.includes('task.assign'), true);
   assert.equal(profile.actionKeys.includes('user.manage'), false);
   assert.equal(profile.widgetKeys.includes('W_WORKER_PRODUCTIVITY'), true);
+});
+
+test('monitoring route key remains supervisor-only', () => {
+  const tenantAdminProfile = resolveRoleAccessProfile({ roleCodes: ['tenant_admin'] });
+  const viewerProfile = resolveRoleAccessProfile({ roleCodes: ['viewer'] });
+  const auditorProfile = resolveRoleAccessProfile({ roleCodes: ['auditor'] });
+  const fieldWorkerProfile = resolveRoleAccessProfile({ roleCodes: ['field_worker'] });
+
+  assert.equal(tenantAdminProfile.routeKeys.includes(RouteKeys.OPS_MONITORING), false);
+  assert.equal(viewerProfile.routeKeys.includes(RouteKeys.OPS_MONITORING), false);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_MONITORING), false);
+  assert.equal(fieldWorkerProfile.routeKeys.includes(RouteKeys.OPS_MONITORING), false);
+});
+
+test('auditor gets dedicated auditor route keys only', () => {
+  const auditorProfile = resolveRoleAccessProfile({ roleCodes: ['auditor'] });
+  const supervisorProfile = resolveRoleAccessProfile({ roleCodes: ['supervisor'] });
+  const tenantAdminProfile = resolveRoleAccessProfile({ roleCodes: ['tenant_admin'] });
+
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_DASHBOARD), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_AUDITS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_ASSETS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_MONITORING), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_ATTENDANCE), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_ALERTS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_EVIDENCE), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_REPORTS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), false);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_USERS), false);
+  assert.equal(supervisorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_DASHBOARD), false);
+  assert.equal(tenantAdminProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_DASHBOARD), false);
 });
 
 test('primary role resolution prefers web persona over field_worker when both exist', () => {

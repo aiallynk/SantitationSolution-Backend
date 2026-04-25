@@ -15,7 +15,7 @@ router.use(
   '/reports',
   protect,
   requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
-  requireRouteKey(RouteKeys.OPS_REPORTS),
+  requireRouteKey(RouteKeys.OPS_REPORTS, RouteKeys.OPS_AUDITOR_REPORTS),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
   requirePermissions('reports.read'),
 );

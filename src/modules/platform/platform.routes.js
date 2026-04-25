@@ -45,7 +45,12 @@ const OPS_WEB_SURFACES = [SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE]
 const OPS_AND_PLATFORM_WEB_SURFACES = [...OPS_WEB_SURFACES, SurfaceTypes.PLATFORM_WEB];
 const OPS_AND_MOBILE_SURFACES = [...OPS_WEB_SURFACES, SurfaceTypes.MOBILE_ONLY];
 const ADMINOPS_ROUTE_KEYS = [RouteKeys.OPS_ADMINOPS, RouteKeys.SA_TENANTS, RouteKeys.SA_GLOBAL_USERS];
-const TOILETS_ROUTE_KEYS = [RouteKeys.OPS_TOILETS, RouteKeys.SA_TENANTS, RouteKeys.SA_GLOBAL_USERS];
+const TOILETS_ROUTE_KEYS = [
+  RouteKeys.OPS_TOILETS,
+  RouteKeys.OPS_AUDITOR_ASSETS,
+  RouteKeys.SA_TENANTS,
+  RouteKeys.SA_GLOBAL_USERS,
+];
 
 router.use(PLATFORM_ROUTE_PREFIXES, protect);
 
@@ -143,7 +148,7 @@ router.post(
 router.get(
   '/facilities/:id',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getFacilityById
@@ -170,7 +175,7 @@ router.delete(
 router.get(
   '/toilet-blocks',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletBlocks
@@ -189,7 +194,7 @@ router.post(
 router.get(
   '/toilet-units',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletUnits
@@ -199,7 +204,7 @@ router.get(
 router.get(
   '/toilet-units/resolve',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requireAnyPermissions('dashboard.read', 'inspection.create'),
   platformController.getToiletUnitByQr
@@ -207,7 +212,7 @@ router.get(
 router.post(
   '/toilet-units/resolve',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requireAnyPermissions('dashboard.read', 'inspection.create'),
   validate(validateQrResolve),
@@ -226,7 +231,7 @@ router.post(
 router.get(
   '/toilets/:toiletId/inspections',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletInspections
@@ -234,7 +239,7 @@ router.get(
 router.get(
   '/toilets/:id/details',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletDetails
@@ -242,7 +247,7 @@ router.get(
 router.get(
   '/toilets/:id/latest-inspection',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletLatestInspection
@@ -250,7 +255,7 @@ router.get(
 router.get(
   '/toilets/:id/score-trends',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletScoreTrends
@@ -258,7 +263,7 @@ router.get(
 router.get(
   '/toilets/:id/inspection-history',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_TOILETS),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getToiletInspectionHistory

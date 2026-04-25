@@ -19,7 +19,12 @@ router.use(
     SurfaceTypes.OPS_WEB_AND_MOBILE,
     SurfaceTypes.MOBILE_ONLY,
   ),
-  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireRouteKey(
+    RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_AUDITOR_DASHBOARD,
+    RouteKeys.OPS_AUDITOR_MONITORING,
+    RouteKeys.OPS_AUDITOR_ATTENDANCE,
+  ),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
   requirePermissions('dashboard.read'),
 );

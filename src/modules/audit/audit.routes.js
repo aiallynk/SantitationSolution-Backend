@@ -19,7 +19,7 @@ router.use(
     SurfaceTypes.OPS_WEB_AND_MOBILE,
     SurfaceTypes.PLATFORM_WEB,
   ),
-  requireRouteKey(RouteKeys.OPS_AUDIT, RouteKeys.SA_GLOBAL_USERS),
+  requireRouteKey(RouteKeys.OPS_AUDIT, RouteKeys.OPS_AUDITOR_REPORTS, RouteKeys.SA_GLOBAL_USERS),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
 );
 

@@ -17,6 +17,7 @@ const {
   UserRole,
   Role,
   ToiletUnit,
+  Geography,
 } = require('../../models');
 const {
   EMPTY_SCOPE_UUID,
@@ -53,6 +54,12 @@ const toNumber = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const toBoundedNumber = (value, { fallback = 0, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) => {
+  const parsed = Number(value);
+  const resolved = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(Math.max(resolved, min), max);
+};
+
 const toTimestamp = (value) => {
   if (!value) return null;
   const parsed = new Date(value);
@@ -82,6 +89,24 @@ const isOnOrAfter = (isoValue, thresholdDate) => {
   const threshold = toTimestamp(thresholdDate);
   if (ts == null || threshold == null) return false;
   return ts >= threshold;
+};
+
+const resolveWorkforceStatus = ({
+  attendanceStatus = 'Absent',
+  activityAt = null,
+  activeThresholdMinutes = 20,
+  idleThresholdMinutes = 120,
+}) => {
+  // Derived status from attendance + recency because dedicated heartbeat tables are not present.
+  const normalizedAttendance = String(attendanceStatus || '').toLowerCase();
+  const activityTs = toTimestamp(activityAt);
+  if (!activityTs || normalizedAttendance.includes('absent') || normalizedAttendance.includes('checked out')) {
+    return 'Offline';
+  }
+  const ageMinutes = Math.max(0, Math.floor((Date.now() - activityTs) / 60000));
+  if (ageMinutes <= activeThresholdMinutes) return 'Active';
+  if (ageMinutes <= idleThresholdMinutes) return 'Idle';
+  return 'Offline';
 };
 
 const getOverview = async (req) => {
@@ -376,6 +401,26 @@ const getWorkforce = async (req) => {
     : 7;
   const activityStart = new Date(todayStart);
   activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
+  const activeThresholdMinutes = toBoundedNumber(req.query.activeThresholdMinutes, {
+    fallback: 20,
+    min: 5,
+    max: 240,
+  });
+  const idleThresholdMinutes = toBoundedNumber(req.query.idleThresholdMinutes, {
+    fallback: 120,
+    min: activeThresholdMinutes + 1,
+    max: 720,
+  });
+  const shiftStartHour = toBoundedNumber(req.query.shiftStartHour, {
+    fallback: 9,
+    min: 0,
+    max: 23,
+  });
+  const minShiftHoursForEarlyExit = toBoundedNumber(req.query.minShiftHours, {
+    fallback: 8,
+    min: 1,
+    max: 16,
+  });
 
   const scopedTaskRows = await InspectionTask.findAll({
     where: scopedFacilityWhere(req),
@@ -662,11 +707,23 @@ const getWorkforce = async (req) => {
     allFacilityIds.length > 0
       ? await Facility.findAll({
           where: { id: { [Op.in]: allFacilityIds } },
-          attributes: ['id', 'name', 'address_line'],
+          attributes: ['id', 'name', 'address_line', 'ward_geography_id'],
           raw: true,
         })
       : [];
   const facilityById = new Map(facilityRows.map((row) => [String(row.id), row]));
+  const wardGeographyIds = uniqueIds(
+    facilityRows.map((row) => row.ward_geography_id)
+  );
+  const wardRows =
+    wardGeographyIds.length > 0
+      ? await Geography.findAll({
+          where: { id: { [Op.in]: wardGeographyIds } },
+          attributes: ['id', 'name'],
+          raw: true,
+        })
+      : [];
+  const wardById = new Map(wardRows.map((row) => [String(row.id), row]));
 
   const sensorRows =
     allFacilityIds.length > 0
@@ -744,12 +801,45 @@ const getWorkforce = async (req) => {
       fallbackFacility?.name ||
       fallbackFacility?.address_line ||
       null;
+    const assignedWardNames = uniqueIds(
+      workerFacilityIds
+        .map((facilityId) => {
+          const wardId = facilityById.get(String(facilityId || ''))?.ward_geography_id;
+          if (!wardId) return null;
+          return wardById.get(String(wardId || ''))?.name || null;
+        })
+        .filter(Boolean)
+    );
+    const assignedWard = assignedWardNames.length > 0 ? assignedWardNames.join(', ') : null;
+    const recentActivityAt = row.lastSeenAt || checkOutAt || checkInAt || null;
+    const liveStatus = resolveWorkforceStatus({
+      attendanceStatus,
+      activityAt: recentActivityAt,
+      activeThresholdMinutes,
+      idleThresholdMinutes,
+    });
+    const checkInTsForShift = toTimestamp(checkInAt);
+    const shiftStartBoundary = checkInTsForShift != null ? new Date(checkInTsForShift) : null;
+    if (shiftStartBoundary) {
+      shiftStartBoundary.setHours(shiftStartHour, 0, 0, 0);
+    }
+    const lateArrival = Boolean(
+      checkInTsForShift != null &&
+        shiftStartBoundary &&
+        checkInTsForShift > shiftStartBoundary.getTime()
+    );
+    const earlyExit = Boolean(
+      checkOutAt &&
+        Number.isFinite(workingMinutes) &&
+        (workingMinutes / 60) < minShiftHoursForEarlyExit
+    );
 
     results.push({
       workerId: row.workerId,
       workerName: row.workerName,
       employeeCode: row.employeeCode,
       attendanceStatus,
+      liveStatus,
       checkInAt,
       checkOutAt,
       checkInLogs: checkInLogs.slice(0, 25),
@@ -771,7 +861,12 @@ const getWorkforce = async (req) => {
       gpsLng: row.latestLocationPoint?.gpsLng ?? null,
       locationLabel,
       locationTrail,
-      lastSeenAt: row.lastSeenAt || checkOutAt || checkInAt || null,
+      movementTrail: locationTrail,
+      recentActivityAt,
+      lastSeenAt: recentActivityAt,
+      lateArrival,
+      earlyExit,
+      assignedWard,
       assignedToSupervisor: row.assignedToSupervisor,
       supervisorId: row.supervisorId,
       facilityIds: workerFacilityIds,
