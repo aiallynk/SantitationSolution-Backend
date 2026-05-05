@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { Op } = require('sequelize');
 
 const { ScopeLevels } = require('../src/core/rbac/accessProfiles');
 const { resolveEffectiveScope } = require('../src/core/rbac/scopeResolver');
@@ -128,4 +129,49 @@ test('resolveEffectiveScope derives facility scope from geography assignments fo
   assert.deepEqual(scope.scopeFacilityIds, ['facility-1', 'facility-2']);
   assert.equal(scope.scopeId, 'facility-1');
   assert.equal(taskLookupCalled, false);
+});
+
+test('resolveEffectiveScope geography facility lookup matches geography, zone, and ward mapped facilities', async (t) => {
+  const originalGeographyFindAll = Geography.findAll;
+  const originalFacilityFindAll = Facility.findAll;
+  const originalTaskFindAll = InspectionTask.findAll;
+  let capturedWhere = null;
+
+  Geography.findAll = async () => [
+    { id: 'geo-zone-1', parent_id: null },
+  ];
+  Facility.findAll = async ({ where }) => {
+    capturedWhere = where;
+    return [{ id: 'facility-zone-mapped' }];
+  };
+  InspectionTask.findAll = async () => [];
+
+  t.after(() => {
+    Geography.findAll = originalGeographyFindAll;
+    Facility.findAll = originalFacilityFindAll;
+    InspectionTask.findAll = originalTaskFindAll;
+  });
+
+  const scope = await resolveEffectiveScope({
+    roleCode: 'field_worker',
+    roleProfile: { scopeLevel: ScopeLevels.FACILITY },
+    memberships: [],
+    assignments: [
+      {
+        status: 'active',
+        assignment_role: 'field_worker',
+        geography_id: 'geo-zone-1',
+      },
+    ],
+    activeTenantId: 'tenant-1',
+    userId: 'worker-4',
+    fallbackGeographyId: null,
+  });
+
+  assert.equal(scope.scopeLevel, ScopeLevels.FACILITY);
+  assert.deepEqual(scope.scopeFacilityIds, ['facility-zone-mapped']);
+  assert.ok(capturedWhere, 'facility lookup should build a where clause');
+  assert.equal(capturedWhere.tenant_id, 'tenant-1');
+  assert.ok(Array.isArray(capturedWhere[Op.or]), 'facility lookup should use OR geography mapping');
+  assert.equal(capturedWhere[Op.or].length, 3);
 });

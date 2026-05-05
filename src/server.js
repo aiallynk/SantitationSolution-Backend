@@ -267,6 +267,13 @@ const shouldFailOnAnalysisConfigError = () => Boolean(runtimeConfig.server.analy
 
 const isAnalysisTriggerOnUploadEnabled = () => Boolean(runtimeConfig.analysis.triggerOnUpload);
 
+const startHttpServer = () =>
+  new Promise((resolve, reject) => {
+    const candidate = app.listen(PORT);
+    candidate.once('error', (error) => reject(error));
+    candidate.once('listening', () => resolve(candidate));
+  });
+
 const validateAnalysisConfigAtBoot = () => {
   const state = getOpenAiAnalysisConfigState();
   if (state.ok) {
@@ -372,19 +379,24 @@ const bootstrap = async () => {
     startImageSessionReconciler();
     startTempFileJanitor();
 
-    server = app.listen(PORT, () => {
-      logger.info('Server is running', {
-        port: PORT,
-        requestTimeoutMs: SERVER_REQUEST_TIMEOUT_MS,
-        keepAliveTimeoutMs: SERVER_KEEPALIVE_TIMEOUT_MS,
-      });
-    });
+    server = await startHttpServer();
     server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
     server.headersTimeout = SERVER_HEADERS_TIMEOUT_MS;
     server.keepAliveTimeout = SERVER_KEEPALIVE_TIMEOUT_MS;
     startWebSocketServer(server);
+    logger.info('Server is running', {
+      port: PORT,
+      requestTimeoutMs: SERVER_REQUEST_TIMEOUT_MS,
+      keepAliveTimeoutMs: SERVER_KEEPALIVE_TIMEOUT_MS,
+    });
     markReady('serving');
   } catch (error) {
+    if (error?.code === 'EADDRINUSE') {
+      logger.error('Server bootstrap failed: configured port is already in use', {
+        port: PORT,
+        code: error.code,
+      });
+    }
     logger.error('Server bootstrap failed', { error });
     markNotReady('bootstrap_failed');
     process.exit(1);

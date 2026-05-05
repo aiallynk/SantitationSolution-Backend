@@ -45,6 +45,9 @@ const {
 } = require('./imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
 
+const uniqueIds = (values = []) =>
+  [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
+
 const REVIEW_LABELS = {
   reviewed: 'Reviewed',
   accepted: 'Accepted',
@@ -155,8 +158,23 @@ const assertInspectionScope = (req, inspection) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+    throw new AppError('Worker scope is not loaded for facility-level access', 403, {
+      code: 'SCOPE_NOT_LOADED',
+      details: {
+        reason: 'worker_scope_not_loaded',
+        facilityId: inspection.facility_id || null,
+      },
+    });
+  }
   if (!isFacilityInScope(req, inspection.facility_id || null)) {
-    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    throw new AppError('Inspection out of scope', 403, {
+      code: 'SCOPE_FORBIDDEN',
+      details: {
+        reason: 'facility_outside_assigned_scope',
+        facilityId: inspection.facility_id || null,
+      },
+    });
   }
 };
 
@@ -879,8 +897,23 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+    throw new AppError('Worker scope is not loaded for facility-level access', 403, {
+      code: 'SCOPE_NOT_LOADED',
+      details: {
+        reason: 'worker_scope_not_loaded',
+        facilityId: facility.id,
+      },
+    });
+  }
   if (!isFacilityInScope(req, facility.id)) {
-    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    throw new AppError('Facility out of scope', 403, {
+      code: 'SCOPE_FORBIDDEN',
+      details: {
+        reason: 'facility_outside_assigned_scope',
+        facilityId: facility.id,
+      },
+    });
   }
   if (req.body.toiletUnitId) {
     const unit = await ToiletUnit.findByPk(req.body.toiletUnitId);
@@ -1200,17 +1233,31 @@ const submitInspection = async (req) => {
   const hasAfter = inspection.InspectionMedia.some(
     (item) => item.capture_stage === 'after'
   );
-  if (!hasBefore || !hasAfter) {
-    throw new AppError('Before and after media are required before submission', 400, {
-      code: 'MEDIA_INCOMPLETE',
-    });
-  }
-
-  const confirmedCount = inspection.InspectionMedia.filter(
+  const confirmedMedia = inspection.InspectionMedia.filter(
     (item) =>
       item.upload_status === 'confirmed' ||
       item.upload_status === 'uploaded'
-  ).length;
+  );
+  const hasConfirmedBefore = confirmedMedia.some(
+    (item) => item.capture_stage === 'before'
+  );
+  const hasConfirmedAfter = confirmedMedia.some(
+    (item) => item.capture_stage === 'after'
+  );
+  if (!hasBefore || !hasAfter || !hasConfirmedBefore || !hasConfirmedAfter) {
+    throw new AppError('Before and after media are required before submission', 400, {
+      code: 'MEDIA_INCOMPLETE',
+      details: {
+        reason: 'evidence_upload_incomplete',
+        hasBefore,
+        hasAfter,
+        hasConfirmedBefore,
+        hasConfirmedAfter,
+      },
+    });
+  }
+
+  const confirmedCount = confirmedMedia.length;
   const pendingUploadCount = Math.max(inspection.InspectionMedia.length - confirmedCount, 0);
 
   const clientSubmissionId = String(req.body.clientSubmissionId || '').trim() || null;

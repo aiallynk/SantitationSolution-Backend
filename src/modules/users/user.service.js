@@ -504,9 +504,10 @@ const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
   if (!tenant) return;
 
   const tenantLocationNames = resolveTenantDefaultLocationNames(tenant);
+  const effectiveLocationNames = mergeLocationNames(locationNames, tenantLocationNames);
   for (const key of LOCATION_NAME_KEYS) {
     const tenantValue = tenantLocationNames[key];
-    const userValue = locationNames[key];
+    const userValue = effectiveLocationNames[key];
     if (!tenantValue || !userValue) continue;
     if (!isSameLabel(tenantValue, userValue)) {
       throw new AppError(`User ${key} must match tenant ${key}`, 400, {
@@ -518,12 +519,15 @@ const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
   const scopeLevel = String(tenant.scope_level || '').trim().toLowerCase();
   const requiredFields = TENANT_SCOPE_FIELD_MAP[scopeLevel] || [];
   for (const field of requiredFields) {
-    const value = String(locationNames[field] || '').trim();
-    if (!value) {
-      throw new AppError(`Missing required tenant-scoped location field: ${field}`, 400, {
-        code: 'LOCATION_SCOPE_INVALID',
-      });
-    }
+    const value = String(effectiveLocationNames[field] || '').trim();
+    if (value) continue;
+    const tenantScopedValue = String(tenantLocationNames[field] || '').trim();
+    // Legacy tenant records can be missing scope-level location labels.
+    // Allow persona creation in those cases and rely on explicit geography/user mapping.
+    if (!tenantScopedValue) continue;
+    throw new AppError(`Missing required tenant-scoped location field: ${field}`, 400, {
+      code: 'LOCATION_SCOPE_INVALID',
+    });
   }
 };
 

@@ -38,7 +38,7 @@ module.exports = {
     await queryInterface.bulkInsert('tenants', [
       {
         id: ids.tenant,
-        name: 'Nashik Municipal Corporation',
+        name: 'Smart Sanitation Solution',
         code: 'NMC',
         status: 'active',
         country_code: 'IN',
