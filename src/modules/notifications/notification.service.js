@@ -589,6 +589,14 @@ const maybeDeliverPushForNotification = async ({
     data: {
       notificationId: notification.id,
       tenantId: notification.tenant_id || '',
+      eventType: notification.event_type || '',
+      title: notification.title || notification.payload?.title || 'Notification',
+      body:
+        notification.short_body ||
+        notification.body ||
+        notification.payload?.body ||
+        notification.payload?.message ||
+        'You have a new update',
       route: notification.route || '',
       entityType: notification.entity_type || '',
       entityId: notification.entity_id || '',
@@ -829,21 +837,22 @@ const classifyAuditAction = ({ action, details = {} }) => {
   if (normalizedAction === 'analysis.inspection_run') return null;
 
   if (normalizedAction.startsWith('task.')) {
+    const isTaskCreate = normalizedAction === 'task.create';
     return {
       notificationType: NotificationTypes.TASK,
       priority:
-        normalizedAction === 'task.create'
+        isTaskCreate
           ? NotificationPriorities.HIGH
           : NotificationPriorities.MEDIUM,
       title:
-        normalizedAction === 'task.create'
-          ? 'New task assigned'
+        isTaskCreate
+          ? 'Task dispatched'
           : normalizedAction === 'task.complete'
             ? 'Task completed'
             : 'Task updated',
       body:
-        normalizedAction === 'task.create'
-          ? 'A new operational task has been created in your scope.'
+        isTaskCreate
+          ? 'A new operational task has been assigned to you.'
           : normalizedAction === 'task.complete'
             ? 'A task has been marked as completed.'
             : 'A task has changed status.',
@@ -912,14 +921,21 @@ const classifyAuditAction = ({ action, details = {} }) => {
   }
 
   if (normalizedAction.startsWith('alert.')) {
+    const isDispatched =
+      normalizedAction === 'alert.acknowledge' &&
+      Boolean(details?.assignedToUserId || details?.dispatched);
     return {
       notificationType: NotificationTypes.ALERT,
       priority: NotificationPriorities.HIGH,
       title:
         normalizedAction === 'alert.resolve'
           ? 'Alert resolved'
-          : 'Alert acknowledged',
-      body: 'Alert state changed in your operational scope.',
+          : isDispatched
+            ? 'Alert dispatched'
+            : 'Alert acknowledged',
+      body: isDispatched
+        ? 'An operational alert has been dispatched for field response.'
+        : 'Alert state changed in your operational scope.',
       iconKey: 'alert',
       severity: 'warning',
     };

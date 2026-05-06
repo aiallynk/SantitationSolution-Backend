@@ -186,6 +186,13 @@ const createTask = async (req) => {
     action: 'task.create',
     entityType: 'inspection_task',
     entityId: row.id,
+    details: {
+      assignedToUserId: row.assigned_to_user_id,
+      taskType: row.task_type,
+      facilityId: row.facility_id,
+      toiletUnitId: row.toilet_unit_id || null,
+      scheduledAt: row.scheduled_at,
+    },
   });
 
   return mapTask(task);
