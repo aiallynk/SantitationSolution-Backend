@@ -26,6 +26,10 @@ const {
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
+const {
+  resolveDateRange,
+  applyDateRangeToWhere,
+} = require('../../utils/dateRange');
 
 const scopedTenantWhere = (req, where = {}, key = 'tenant_id') => {
   return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
@@ -85,6 +89,7 @@ const isOnOrAfter = (isoValue, thresholdDate) => {
 };
 
 const getOverview = async (req) => {
+  const dateRange = resolveDateRange(req.query, { maxDays: 90 });
   const tenantFilter = scopedTenantWhere(req);
   const facilityEntityFilter = scopedFacilityEntityWhere(req);
   const inspectionTenantFilter = scopedFacilityWhere(req);
@@ -101,11 +106,26 @@ const getOverview = async (req) => {
 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
+  const inspectionActivityFilter = dateRange.provided
+    ? applyDateRangeToWhere(inspectionTenantFilter, 'captured_at', dateRange)
+    : { ...inspectionTenantFilter, created_at: { [Op.gte]: todayStart } };
+  const analysisInspectionFilter = dateRange.provided
+    ? applyDateRangeToWhere(inspectionTenantFilter, 'captured_at', dateRange)
+    : inspectionTenantFilter;
+  const alertActivityFilter = dateRange.provided
+    ? applyDateRangeToWhere(alertTenantFilter, 'created_at', dateRange)
+    : alertTenantFilter;
+  const complaintActivityFilter = dateRange.provided
+    ? applyDateRangeToWhere(complaintTenantFilter, 'created_at', dateRange)
+    : complaintTenantFilter;
+  const taskActivityFilter = dateRange.provided
+    ? applyDateRangeToWhere(taskTenantFilter, 'scheduled_at', dateRange)
+    : taskTenantFilter;
 
   const [
     totalFacilities,
     activeAlerts,
-    inspectionsToday,
+    inspectionsInRange,
     avgCleanlinessRow,
     sensorsOnline,
     totalSensors,
@@ -114,13 +134,8 @@ const getOverview = async (req) => {
     usersActive,
   ] = await Promise.all([
     Facility.count({ where: facilityEntityFilter }),
-    Alert.count({ where: { ...alertTenantFilter, status: { [Op.in]: ['open', 'acknowledged'] } } }),
-    Inspection.count({
-      where: {
-        ...inspectionTenantFilter,
-        created_at: { [Op.gte]: todayStart },
-      },
-    }),
+    Alert.count({ where: { ...alertActivityFilter, status: { [Op.in]: ['open', 'acknowledged'] } } }),
+    Inspection.count({ where: inspectionActivityFilter }),
     AiAnalysisResult.findOne({
       attributes: [[fn('AVG', col('cleanliness_score')), 'avgCleanliness']],
       include: [
@@ -128,22 +143,23 @@ const getOverview = async (req) => {
           model: Inspection,
           attributes: [],
           required: true,
-          where: inspectionTenantFilter,
+          where: analysisInspectionFilter,
         },
       ],
       raw: true,
     }),
     SensorDevice.count({ where: { ...sensorTenantFilter, status: 'active' } }),
     SensorDevice.count({ where: sensorTenantFilter }),
-    Complaint.count({ where: { ...complaintTenantFilter, status: { [Op.ne]: 'resolved' } } }),
-    InspectionTask.count({ where: { ...taskTenantFilter, status: 'in_progress' } }),
+    Complaint.count({ where: { ...complaintActivityFilter, status: { [Op.ne]: 'resolved' } } }),
+    InspectionTask.count({ where: { ...taskActivityFilter, status: 'in_progress' } }),
     PlatformUser.count({ where: { ...userScopeFilter, status: 'active' } }),
   ]);
 
   return {
     totalFacilities,
     activeAlerts,
-    inspectionsCompletedToday: inspectionsToday,
+    inspectionsCompletedToday: inspectionsInRange,
+    inspectionsInRange,
     cleanlinessAverage: Number(toNumber(avgCleanlinessRow?.avgCleanliness, 0).toFixed(2)),
     sensorHealth: {
       online: sensorsOnline,
@@ -154,6 +170,13 @@ const getOverview = async (req) => {
     workerProductivity: {
       tasksInProgress,
       activeUsers: usersActive,
+    },
+    dateRange: {
+      range: dateRange.range,
+      label: dateRange.label,
+      days: dateRange.days,
+      start: dateRange.start ? dateRange.start.toISOString() : null,
+      end: dateRange.end ? dateRange.end.toISOString() : null,
     },
   };
 };
@@ -199,16 +222,40 @@ const getMap = async (req) => {
 };
 
 const getHeatmap = async (req) => {
-  const inspections = await Inspection.findAll({
-    where: {
+  const dateRange = resolveDateRange(req.query, { maxDays: 90 });
+  const north = toNumber(req.query.north, null);
+  const south = toNumber(req.query.south, null);
+  const east = toNumber(req.query.east, null);
+  const west = toNumber(req.query.west, null);
+  const where = applyDateRangeToWhere(
+    {
       ...scopedFacilityWhere(req),
-      latitude: { [Op.ne]: null },
-      longitude: { [Op.ne]: null },
+      latitude: Number.isFinite(south) && Number.isFinite(north)
+        ? { [Op.between]: [Math.min(south, north), Math.max(south, north)] }
+        : { [Op.ne]: null },
+      longitude: Number.isFinite(west) && Number.isFinite(east)
+        ? { [Op.between]: [Math.min(west, east), Math.max(west, east)] }
+        : { [Op.ne]: null },
     },
+    'captured_at',
+    dateRange,
+  );
+
+  const inspections = await Inspection.findAll({
+    where,
     include: [{ model: AiAnalysisResult }],
     order: [['captured_at', 'DESC']],
     limit: Number(req.query.limit || 500),
   });
+
+  const severity = String(req.query.severity || 'all').trim().toLowerCase();
+  const matchesSeverity = (score) => {
+    if (!severity || severity === 'all') return true;
+    if (severity === 'critical') return score < 55;
+    if (severity === 'warning' || severity === 'moderate') return score >= 55 && score < 75;
+    if (severity === 'good' || severity === 'clean') return score >= 75;
+    return true;
+  };
 
   return inspections.map((inspection) => ({
     inspectionId: inspection.id,
@@ -218,7 +265,7 @@ const getHeatmap = async (req) => {
     avgScore: toNumber(inspection.AiAnalysisResults?.[0]?.cleanliness_score, 0),
     count: 1,
     label: inspection.overall_status || inspection.processing_status,
-  }));
+  })).filter((point) => matchesSeverity(toNumber(point.avgScore, 0)));
 };
 
 const getFacilityDashboard = async (req) => {
@@ -304,10 +351,10 @@ const getFacilityDashboard = async (req) => {
 };
 
 const getTrends = async (req) => {
-  const days = Math.min(Number(req.query.days || 14), 90);
-  const start = new Date();
+  const dateRange = resolveDateRange(req.query, { defaultDays: 14, maxDays: 90 });
+  const days = dateRange.days || 14;
+  const start = dateRange.start || new Date();
   start.setHours(0, 0, 0, 0);
-  start.setDate(start.getDate() - (days - 1));
 
   const replacements = {
     start,
@@ -374,11 +421,17 @@ const getWorkforce = async (req) => {
   const activityLookbackDays = Number.isFinite(lookbackRaw)
     ? Math.min(Math.max(lookbackRaw, 1), 30)
     : 7;
-  const activityStart = new Date(todayStart);
-  activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
+  const requestedRange = resolveDateRange(req.query, { maxDays: 30 });
+  const activityStart = requestedRange.start || new Date(todayStart);
+  if (!requestedRange.start) {
+    activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
+  }
+  const scopedTaskWhere = requestedRange.provided
+    ? applyDateRangeToWhere(scopedFacilityWhere(req), 'scheduled_at', requestedRange)
+    : scopedFacilityWhere(req);
 
   const scopedTaskRows = await InspectionTask.findAll({
-    where: scopedFacilityWhere(req),
+    where: scopedTaskWhere,
     attributes: [
       'assigned_to_user_id',
       'facility_id',
@@ -788,8 +841,11 @@ const getWorkforce = async (req) => {
 };
 
 const getSla = async (req) => {
+  const dateRange = resolveDateRange(req.query, { maxDays: 90 });
   const tasks = await InspectionTask.findAll({
-    where: scopedFacilityWhere(req),
+    where: dateRange.provided
+      ? applyDateRangeToWhere(scopedFacilityWhere(req), 'scheduled_at', dateRange)
+      : scopedFacilityWhere(req),
     order: [['scheduled_at', 'DESC']],
     limit: 500,
   });
@@ -840,6 +896,7 @@ const getStorageUsage = async (req) => {
 };
 
 const getPlatformHealth = async (req) => {
+  const dateRange = resolveDateRange(req.query, { maxDays: 90 });
   const latestAggregate = await DashboardAggregate.findOne({
     where: scopedTenantWhere(req),
     order: [['aggregate_date', 'DESC']],
@@ -848,7 +905,9 @@ const getPlatformHealth = async (req) => {
   const [alerts, sensorsFaulty] = await Promise.all([
     Alert.count({
       where: {
-        ...scopedFacilityWhere(req),
+        ...(dateRange.provided
+          ? applyDateRangeToWhere(scopedFacilityWhere(req), 'created_at', dateRange)
+          : scopedFacilityWhere(req)),
         status: 'open',
       },
     }),

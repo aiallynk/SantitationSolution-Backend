@@ -28,6 +28,10 @@ const {
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 const {
+  resolveDateRange,
+  applyDateRangeToWhere,
+} = require('../../utils/dateRange');
+const {
   recomputeInspectionAggregates,
   listInspectionImages,
   listInspectionImageJobs,
@@ -1458,7 +1462,7 @@ const reviewInspection = async (req) => {
 
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  const where = scopedWhere(req);
+  let where = scopedWhere(req);
   if (req.query.status) {
     const requestedStatus = String(req.query.status).trim().toLowerCase();
     const requestedUpper = String(req.query.status).trim().toUpperCase();
@@ -1479,6 +1483,7 @@ const listInspections = async (req, myOnly = false) => {
     }
     where.facility_id = req.query.facilityId;
   }
+  where = applyDateRangeToWhere(where, 'captured_at', resolveDateRange(req.query, { maxDays: 90 }));
 
   const { rows, count } = await Inspection.findAndCountAll({
     where,

@@ -9,9 +9,13 @@ const {
   applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
+const {
+  resolveDateRange,
+  applyDateRangeToWhere,
+} = require('../../utils/dateRange');
 
 const scopedWhere = (req) => {
-  const where = applyScopeToQuery(
+  let where = applyScopeToQuery(
     {},
     buildAccessContextFromUser(req?.user || {}),
     'alert',
@@ -26,6 +30,7 @@ const scopedWhere = (req) => {
     where.facility_id = req.query.facilityId;
   }
   if (req.query.sourceType) where.source_type = req.query.sourceType;
+  where = applyDateRangeToWhere(where, 'created_at', resolveDateRange(req.query, { maxDays: 90 }));
   return where;
 };
 
