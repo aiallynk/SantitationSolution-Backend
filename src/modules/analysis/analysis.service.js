@@ -48,7 +48,7 @@ const mean = (values = []) => {
   if (valid.length === 0) return null;
   return valid.reduce((sum, item) => sum + item, 0) / valid.length;
 };
-const ANALYSIS_SCHEMA_VERSION = 'analysis.v4';
+const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
 const FRAUD_SIMILARITY_THRESHOLD = runtimeConfig.analysis.fraudSimilarityThreshold;
 const AI_IMAGE_MAX_RETRIES = Math.max(runtimeConfig.analysis.aiImageMaxRetries, 1);
 const AI_RETRY_BASE_DELAY_MS = Math.max(runtimeConfig.analysis.aiRetryBaseDelayMs, 500);
@@ -337,6 +337,21 @@ const calibrateOverallScore = ({
   normalizedIssues = [],
   confidence = null,
 }) => {
+  if (String(strictJson?.scoring_rubric || '').trim() === 'hygiene_v1') {
+    const modelOverall = clamp(
+      toFiniteNumber(strictJson?.overall_cleanliness_score, 0),
+      0,
+      100
+    );
+    const confidenceValue = toFiniteNumber(
+      confidence,
+      toFiniteNumber(strictJson?.confidence_score, null)
+    );
+    const confidencePenalty =
+      confidenceValue === null ? 0 : clamp((0.58 - confidenceValue) * 5, 0, 5);
+    return round2(clamp(modelOverall - confidencePenalty, 0, 100));
+  }
+
   const weighted = weightedOverallScore(strictJson);
   const modelOverall = clamp(
     toFiniteNumber(strictJson?.overall_cleanliness_score, weighted),
@@ -1366,7 +1381,7 @@ const runInspectionAnalysis = async ({
     await inspection.update({
       processing_status: onlyTransientRetries ? 'queued' : processingStatus,
       pipeline_status: onlyTransientRetries ? 'queued_for_ai' : pipelineStatus,
-      submitted_at: inspection.submitted_at || processedAt,
+      submitted_at: inspection.submitted_at || (submissionId ? processedAt : null),
       review_required: onlyTransientRetries ? false : true,
       last_processing_error: onlyTransientRetries ? null : failureMessage,
       updated_at: processedAt,
@@ -1510,7 +1525,7 @@ const runInspectionAnalysis = async ({
   await inspection.update({
     processing_status: refreshedInspection?.processing_status || 'completed',
     pipeline_status: refreshedInspection?.pipeline_status || 'completed',
-    submitted_at: inspection.submitted_at || processedAt,
+    submitted_at: inspection.submitted_at || (submissionId ? processedAt : null),
     overall_status: result.overallStatus,
     review_required: Boolean(refreshedInspection?.review_required || result.reviewRequired),
     last_processing_error: imageFailures.length > 0 ? failureMessage : null,

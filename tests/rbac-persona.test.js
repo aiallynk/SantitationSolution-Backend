@@ -34,6 +34,9 @@ test('role bundles keep geography admins aligned and enforce facility/supervisor
   assert.equal(ROLE_PERMISSION_BUNDLES.facility_manager.includes('audit.read'), false);
   assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('users.manage'), false);
   assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('audit.read'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('task.manage'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('supervisor.workers.read'), true);
+  assert.equal(ROLE_PERMISSION_BUNDLES.supervisor.includes('worker.attendance.read'), true);
 
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('audit.read'), true);
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('task.manage'), false);
@@ -74,10 +77,17 @@ test('role access profile resolves strict route, widget, and action keys for sup
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_USERS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_ADMINOPS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_SETTINGS), false);
-  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), true);
-  assert.equal(profile.actionKeys.includes('task.assign'), true);
+  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), false);
+  assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_OVERVIEW), true);
+  assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_WORKERS), true);
+  assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_LIVE_LOCATION), true);
+  assert.equal(profile.actionKeys.includes('task.assign'), false);
+  assert.equal(profile.actionKeys.includes('supervisor.alerts.escalate'), true);
   assert.equal(profile.actionKeys.includes('user.manage'), false);
   assert.equal(profile.widgetKeys.includes('W_WORKER_PRODUCTIVITY'), true);
+  assert.equal(profile.permissionCodes.includes('supervisor.workers.read'), true);
+  assert.equal(profile.permissionCodes.includes('worker.location.read'), true);
+  assert.equal(profile.permissionCodes.includes('task.manage'), false);
 });
 
 test('primary role resolution prefers web persona over field_worker when both exist', () => {

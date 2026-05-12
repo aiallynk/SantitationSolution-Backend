@@ -211,6 +211,12 @@ const createInspectionEvent = async ({
 
 const includeInspectionRelations = ({ includeEvents = false } = {}) => [
   { model: InspectionMedia },
+  {
+    model: InspectionSubmission,
+    as: 'inspectionSubmissions',
+    attributes: ['id', 'status', 'submitted_at'],
+    required: false,
+  },
   ...(includeEvents
     ? [
         {
@@ -452,6 +458,18 @@ const mapInspection = (
   const afterMedia = media.filter((item) => item.capture_stage === 'after');
   const result = withAnalysis ? (inspection.AiAnalysisResults || [])[0] : null;
   const review = reviewByInspectionId.get(String(inspection.id)) || null;
+  const finalSubmissions = Array.from(
+    new Map(
+      (Array.isArray(inspection.inspectionSubmissions)
+        ? inspection.inspectionSubmissions
+        : [])
+        .filter((item) => item?.id)
+        .map((item) => [String(item.id), item])
+    ).values()
+  );
+  const latestSubmission = finalSubmissions
+    .slice()
+    .sort((a, b) => mediaTimestamp(b.submitted_at) - mediaTimestamp(a.submitted_at))[0] || null;
   const timeline = Array.isArray(inspection.events)
     ? [...inspection.events]
         .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime())
@@ -542,6 +560,9 @@ const mapInspection = (
     review,
     reviewStatus,
     reviewStatusLabel: reviewStatus ? REVIEW_LABELS[reviewStatus] : null,
+    finalSubmissionCompleted: finalSubmissions.length > 0,
+    submissionCount: finalSubmissions.length,
+    latestSubmissionStatus: latestSubmission?.status || null,
     requiresManualReview:
       Boolean(inspection.review_required) ||
       inspection.processing_status !== 'completed' ||
@@ -1463,6 +1484,9 @@ const reviewInspection = async (req) => {
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
   let where = scopedWhere(req);
+  const ongoingOnly = ['1', 'true', 'yes'].includes(
+    String(req.query.ongoing || '').trim().toLowerCase()
+  );
   if (req.query.status) {
     const requestedStatus = String(req.query.status).trim().toLowerCase();
     const requestedUpper = String(req.query.status).trim().toUpperCase();
@@ -1483,7 +1507,43 @@ const listInspections = async (req, myOnly = false) => {
     }
     where.facility_id = req.query.facilityId;
   }
-  where = applyDateRangeToWhere(where, 'captured_at', resolveDateRange(req.query, { maxDays: 90 }));
+  if (ongoingOnly) {
+    const beforeRows = await InspectionMedia.findAll({
+      attributes: ['inspection_id'],
+      where: {
+        capture_stage: 'before',
+        upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
+        inspection_id: { [Op.ne]: null },
+      },
+      group: ['inspection_id'],
+      raw: true,
+    });
+    const beforeInspectionIds = uniqueIds(
+      beforeRows.map((row) => row.inspection_id)
+    );
+    const submittedRows = beforeInspectionIds.length > 0
+      ? await InspectionSubmission.findAll({
+          attributes: ['inspection_id'],
+          where: { inspection_id: { [Op.in]: beforeInspectionIds } },
+          group: ['inspection_id'],
+          raw: true,
+        })
+      : [];
+    const submittedInspectionIds = uniqueIds(
+      submittedRows.map((row) => row.inspection_id)
+    );
+    where.id = {
+      [Op.in]: beforeInspectionIds,
+      ...(submittedInspectionIds.length > 0
+        ? { [Op.notIn]: submittedInspectionIds }
+        : {}),
+    };
+  }
+  where = applyDateRangeToWhere(
+    where,
+    'captured_at',
+    resolveDateRange(req.query, { maxDays: 90 })
+  );
 
   const { rows, count } = await Inspection.findAndCountAll({
     where,

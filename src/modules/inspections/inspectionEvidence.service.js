@@ -1145,6 +1145,33 @@ const recomputeInspectionAggregates = async (
     improvementScore,
   });
 
+  const scoredOverallScores = scoredRows
+    .map((row) => toNumber(row.overall_score, null))
+    .filter((s) => s !== null);
+  const hygieneAvgAllImages =
+    scoredOverallScores.length > 0 ? round2(mean(scoredOverallScores)) : null;
+  const hygieneWorstImageScore =
+    scoredOverallScores.length > 0 ? round2(Math.min(...scoredOverallScores)) : null;
+  const hygieneFailAnyBelow40 = scoredRows.some((row) => {
+    const s = toNumber(row.overall_score, null);
+    return s !== null && s < 40;
+  });
+
+  const existingPipelineCounters =
+    inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+      ? inspection.pipeline_counters
+      : {};
+  const mergedPipelineCounters = {
+    ...existingPipelineCounters,
+    ...lifecycleCounters,
+    hygiene_aggregate: {
+      avg_all_images: hygieneAvgAllImages,
+      worst_image_score: hygieneWorstImageScore,
+      fail_any_below_40: hygieneFailAnyBelow40,
+      scored_image_count: scoredRows.length,
+    },
+  };
+
   await inspection.update(
     {
       status,
@@ -1164,7 +1191,7 @@ const recomputeInspectionAggregates = async (
       suspicious_reasons: suspiciousReasons,
       validation_failed_count: validationFailedCount,
       rejected_image_count: rejectedImageCount,
-      pipeline_counters: lifecycleCounters,
+      pipeline_counters: mergedPipelineCounters,
       last_scored_at: completedImages > 0 ? new Date() : inspection.last_scored_at,
       pipeline_status: resolvePipelineStatus(status),
       processing_status: resolveProcessingStatus(status),

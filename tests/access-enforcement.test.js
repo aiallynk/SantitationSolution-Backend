@@ -68,6 +68,26 @@ test('field worker is denied admin route keys', async () => {
   assert.equal(error.statusCode, 403);
 });
 
+test('supervisor route keys are limited to dedicated supervisor routes', async () => {
+  const adminGuard = requireRouteKey(RouteKeys.OPS_OVERVIEW);
+  const supervisorGuard = requireRouteKey(RouteKeys.SUPERVISOR_OVERVIEW);
+  const workerRosterGuard = requireRouteKey(RouteKeys.SUPERVISOR_WORKERS);
+  const req = {
+    user: {
+      routeKeys: [RouteKeys.SUPERVISOR_OVERVIEW, RouteKeys.SUPERVISOR_WORKERS, RouteKeys.SUPERVISOR_ATTENDANCE],
+    },
+  };
+
+  const adminError = await runMiddleware(adminGuard, req);
+  const supervisorError = await runMiddleware(supervisorGuard, req);
+  const workerRosterError = await runMiddleware(workerRosterGuard, req);
+
+  assert.ok(adminError);
+  assert.equal(adminError.code, 'ROUTE_FORBIDDEN');
+  assert.equal(supervisorError, null);
+  assert.equal(workerRosterError, null);
+});
+
 test('tenant admin cannot cross tenant boundary in scoped query', () => {
   const accessContext = buildAccessContextFromUser({
     role: 'tenant_admin',
@@ -81,4 +101,3 @@ test('tenant admin cannot cross tenant boundary in scoped query', () => {
   assert.equal(Array.isArray(scoped[Op.and]), true);
   assert.deepEqual(scoped[Op.and][0], { tenant_id: 'tenant-a' });
 });
-
