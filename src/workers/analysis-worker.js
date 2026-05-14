@@ -19,6 +19,11 @@ const { runtimeConfig } = require('../config/runtime');
 let worker = null;
 let shuttingDown = false;
 
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 const probeRedisConnectivity = async () => {
   if (
     !runtimeConfig.redis.url ||
@@ -61,18 +66,26 @@ const bootstrap = async () => {
     await sequelize.authenticate();
     logger.info('Analysis worker DB connection established');
 
-    const redisReachable = await probeRedisConnectivity();
-    if (!redisReachable) {
-      logger.error(
-        'Redis is not reachable; analysis worker requires a running Redis instance.'
-      );
+    if (!isRedisEnabled()) {
+      logger.error('Redis is disabled; analysis worker requires REDIS_ENABLED=true');
       process.exit(1);
       return;
     }
 
-    if (!isRedisEnabled()) {
-      logger.error('Redis is disabled; analysis worker requires REDIS_ENABLED=true');
-      process.exit(1);
+    let redisReachable = await probeRedisConnectivity();
+    while (!redisReachable && !shuttingDown) {
+      logger.warn(
+        'Redis is not reachable; analysis worker will retry every 60s (avoid PM2 restart spam). Set REDIS_URL to a reachable instance.'
+      );
+      const chunkMs = 2000;
+      const chunks = 60_000 / chunkMs;
+      for (let i = 0; i < chunks && !shuttingDown; i += 1) {
+        await sleep(chunkMs);
+      }
+      if (shuttingDown) break;
+      redisReachable = await probeRedisConnectivity();
+    }
+    if (shuttingDown) {
       return;
     }
     assertQueueRuntimePolicy();
