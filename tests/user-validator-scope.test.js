@@ -23,17 +23,20 @@ test('validateCreateUser enforces geography for geography-scoped admin roles', (
   );
 });
 
-test('validateCreateUser accepts facility scope assignment for facility_manager', () => {
+test('validateCreateUser rejects removed role codes', () => {
   const errors = validateCreateUser({
     body: {
-      fullName: 'Facility Manager',
-      email: 'facility@example.com',
+      fullName: 'Removed Role User',
+      email: 'removed@example.com',
       password: 'Password@123',
       roleCodes: ['facility_manager'],
       assignments: [{ assignmentLevel: 'facility', facilityId: '11111111-1111-4111-8111-111111111111' }],
     },
   });
-  assert.equal(errors.some((error) => error.includes('facility_manager role requires')), false);
+  assert.equal(
+    errors.some((error) => error.includes('unsupported values: facility_manager')),
+    true,
+  );
 });
 
 test('validatePatchUser checks scoped role errors when roleCodes are supplied', () => {

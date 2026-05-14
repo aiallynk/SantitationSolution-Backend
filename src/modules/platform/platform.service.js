@@ -1332,6 +1332,8 @@ const mapUnitRow = (row, options = {}) => {
       row.Facility?.metadata?.sector ||
       row.Facility?.metadata?.zone ||
       null,
+    wardGeographyId: row.Facility?.ward_geography_id || null,
+    wardName: row.Facility?.ward?.name || null,
     locationLabel:
       row.location_label ||
       row.Facility?.address_line ||
@@ -2831,12 +2833,14 @@ const listUnits = async (req) => {
       'address_line',
       'latitude',
       'longitude',
+
       'geography_id',
       'zone_geography_id',
       'ward_geography_id',
       'metadata',
     ],
     include: [
+
       { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
       { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
     ],
@@ -2862,6 +2866,7 @@ const listUnits = async (req) => {
     if (!isGeographyInScope(req, req.query.wardGeographyId)) {
       throw new AppError('wardGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
+
     facilityInclude.where.ward_geography_id = req.query.wardGeographyId;
   }
   if (req.query.qrCode) {

@@ -58,6 +58,7 @@ const BROADCAST_ALLOWED_ROLE_CODES = new Set([
   ROLE_CODES.CITY_ADMIN,
   ROLE_CODES.ZONE_ADMIN,
   ROLE_CODES.FACILITY_MANAGER,
+  ROLE_CODES.SUPERVISOR,
 ]);
 
 const toShortId = (value) => String(value || '').trim().slice(0, 8).toUpperCase();
@@ -230,7 +231,7 @@ const assertCanBroadcastNotifications = (user) => {
   const allowed = roleCodes.some((roleCode) => BROADCAST_ALLOWED_ROLE_CODES.has(roleCode));
   if (!allowed) {
     throw new AppError(
-      'Only super admin and ops-admin personas can broadcast notifications',
+      'Only super admin, ops-admin, and supervisor personas can broadcast notifications',
       403,
       { code: 'NOTIFICATION_BROADCAST_FORBIDDEN' }
     );

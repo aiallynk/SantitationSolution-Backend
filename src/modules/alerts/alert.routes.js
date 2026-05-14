@@ -17,6 +17,7 @@ router.use('/alerts', protect);
 router.use(
   '/alerts',
   requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+
   requireRouteKey(RouteKeys.OPS_ALERTS, RouteKeys.SUPERVISOR_ALERTS),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
 );

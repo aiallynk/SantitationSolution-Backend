@@ -23,6 +23,7 @@ const NOTIFICATION_BROADCAST_ROLE_CODES = [
   'city_admin',
   'zone_admin',
   'facility_manager',
+  'supervisor',
 ];
 const BROADCAST_IMAGE_UPLOAD_MAX_BYTES = 2 * 1024 * 1024;
 const broadcastImageUpload = createImageDiskUpload({

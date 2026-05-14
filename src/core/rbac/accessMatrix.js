@@ -54,6 +54,15 @@ const RouteKeys = {
   SA_GLOBAL_USERS: 'SA_GLOBAL_USERS',
   SA_PLATFORM_HEALTH: 'SA_PLATFORM_HEALTH',
   OPS_OVERVIEW: 'OPS_OVERVIEW',
+  OPS_MONITORING: 'OPS_MONITORING',
+  OPS_AUDITOR_DASHBOARD: 'OPS_AUDITOR_DASHBOARD',
+  OPS_AUDITOR_AUDITS: 'OPS_AUDITOR_AUDITS',
+  OPS_AUDITOR_ASSETS: 'OPS_AUDITOR_ASSETS',
+  OPS_AUDITOR_MONITORING: 'OPS_AUDITOR_MONITORING',
+  OPS_AUDITOR_ATTENDANCE: 'OPS_AUDITOR_ATTENDANCE',
+  OPS_AUDITOR_ALERTS: 'OPS_AUDITOR_ALERTS',
+  OPS_AUDITOR_EVIDENCE: 'OPS_AUDITOR_EVIDENCE',
+  OPS_AUDITOR_REPORTS: 'OPS_AUDITOR_REPORTS',
   OPS_COMMAND_CENTER: 'OPS_COMMAND_CENTER',
   OPS_TOILETS: 'OPS_TOILETS',
   OPS_INSPECTIONS: 'OPS_INSPECTIONS',
@@ -122,6 +131,15 @@ const RouteKeyToPaths = {
     '/sa/settings',
   ],
   [RouteKeys.OPS_OVERVIEW]: ['/ops/overview'],
+  [RouteKeys.OPS_MONITORING]: ['/ops/monitoring'],
+  [RouteKeys.OPS_AUDITOR_DASHBOARD]: ['/ops/auditor/dashboard'],
+  [RouteKeys.OPS_AUDITOR_AUDITS]: ['/ops/auditor/audits'],
+  [RouteKeys.OPS_AUDITOR_ASSETS]: ['/ops/auditor/assets'],
+  [RouteKeys.OPS_AUDITOR_MONITORING]: ['/ops/auditor/monitoring'],
+  [RouteKeys.OPS_AUDITOR_ATTENDANCE]: ['/ops/auditor/attendance'],
+  [RouteKeys.OPS_AUDITOR_ALERTS]: ['/ops/auditor/alerts-review'],
+  [RouteKeys.OPS_AUDITOR_EVIDENCE]: ['/ops/auditor/evidence'],
+  [RouteKeys.OPS_AUDITOR_REPORTS]: ['/ops/auditor/reports'],
   [RouteKeys.OPS_COMMAND_CENTER]: ['/ops/command-center'],
   [RouteKeys.OPS_TOILETS]: ['/ops/toilets'],
   [RouteKeys.OPS_INSPECTIONS]: ['/ops/inspections'],
@@ -276,6 +294,7 @@ const FACILITY_MANAGER_PERMISSION_CODES = [
 
 const SUPERVISOR_PERMISSION_CODES = [
   'auth.read',
+
   'supervisor.overview.read',
   'supervisor.workers.read',
   'worker.attendance.read',
@@ -288,6 +307,7 @@ const SUPERVISOR_PERMISSION_CODES = [
   'supervisor.alerts.read',
   'supervisor.alerts.escalate',
   'supervisor.reports.read',
+
 ];
 
 const VIEWER_PERMISSION_CODES = ['auth.read', 'dashboard.read', 'reports.read'];
@@ -296,6 +316,7 @@ const AUDITOR_PERMISSION_CODES = [
   'auth.read',
   'dashboard.read',
   'inspection.review',
+  'inspection.create',
   'reports.read',
   'audit.read',
 ];
@@ -515,11 +536,13 @@ const ROLE_ACCESS_MATRIX = {
     personaFamily: PersonaFamilies.SUPERVISOR,
     hierarchyLevel: 80,
     surfaceType: SurfaceTypes.OPS_WEB_AND_MOBILE,
+
     scopeType: ScopeTypes.FACILITY,
     scopeLevel: ScopeLevels.FACILITY,
     managementLevel: ManagementLevels.FACILITY,
     primaryLandingRoute: '/ops/supervisor/overview',
     allowedRouteKeys: [
+
       RouteKeys.OPS_PROFILE,
       RouteKeys.SUPERVISOR_OVERVIEW,
       RouteKeys.SUPERVISOR_WORKERS,
@@ -533,12 +556,14 @@ const ROLE_ACCESS_MATRIX = {
       RouteKeys.SUPERVISOR_REPORTS,
     ],
     allowedActionKeys: [
+
       'task.reassign',
       'supervisor.alerts.escalate',
       'cleanliness.verification.review',
     ],
     allowedWidgetKeys: [...SUPERVISOR_WIDGET_KEYS],
     allowedDataDomains: [
+
       'supervisor.workers',
       'supervisor.attendance',
       'supervisor.locations',
@@ -590,13 +615,16 @@ const ROLE_ACCESS_MATRIX = {
     scopeType: ScopeTypes.NONE,
     scopeLevel: ScopeLevels.ORGANIZATION,
     managementLevel: ManagementLevels.EXECUTION,
-    primaryLandingRoute: '/ops/overview',
+    primaryLandingRoute: '/ops/auditor/dashboard',
     allowedRouteKeys: [
-      RouteKeys.OPS_OVERVIEW,
-      RouteKeys.OPS_TOILETS,
-      RouteKeys.OPS_INSPECTIONS,
-      RouteKeys.OPS_REPORTS,
-      RouteKeys.OPS_AUDIT,
+      RouteKeys.OPS_AUDITOR_DASHBOARD,
+      RouteKeys.OPS_AUDITOR_AUDITS,
+      RouteKeys.OPS_AUDITOR_ASSETS,
+      RouteKeys.OPS_AUDITOR_MONITORING,
+      RouteKeys.OPS_AUDITOR_ATTENDANCE,
+      RouteKeys.OPS_AUDITOR_ALERTS,
+      RouteKeys.OPS_AUDITOR_EVIDENCE,
+      RouteKeys.OPS_AUDITOR_REPORTS,
       RouteKeys.OPS_PROFILE,
     ],
     allowedActionKeys: [],
@@ -607,6 +635,8 @@ const ROLE_ACCESS_MATRIX = {
       'audit.logs',
       'audit.compliance',
       'audit.inspection_trail',
+      'audit.evidence',
+      'audit.attendance',
     ],
     permissionCodes: [...AUDITOR_PERMISSION_CODES],
     readOnly: true,
@@ -800,7 +830,7 @@ const ROLE_SCOPE_BY_ROLE_CODE = {
   [ROLE_CODES.CITY_ADMIN]: ScopeLevels.CITY,
   [ROLE_CODES.ZONE_ADMIN]: ScopeLevels.ZONE,
   [ROLE_CODES.FACILITY_MANAGER]: ScopeLevels.FACILITY,
-  [ROLE_CODES.SUPERVISOR]: ScopeLevels.FACILITY,
+  [ROLE_CODES.SUPERVISOR]: ScopeLevels.ZONE,
   [ROLE_CODES.FIELD_WORKER]: ScopeLevels.FACILITY,
 };
 

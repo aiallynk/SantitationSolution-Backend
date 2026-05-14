@@ -40,7 +40,11 @@ router.use(
     SurfaceTypes.OPS_WEB_AND_MOBILE,
     SurfaceTypes.MOBILE_ONLY,
   ),
-  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireRouteKey(
+    RouteKeys.OPS_INSPECTIONS,
+    RouteKeys.OPS_AUDITOR_AUDITS,
+    RouteKeys.OPS_AUDITOR_EVIDENCE,
+  ),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
 );
 
