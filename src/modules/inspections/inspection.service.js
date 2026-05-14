@@ -28,6 +28,10 @@ const {
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
 const {
+  resolveDateRange,
+  applyDateRangeToWhere,
+} = require('../../utils/dateRange');
+const {
   recomputeInspectionAggregates,
   listInspectionImages,
   listInspectionImageJobs,
@@ -44,6 +48,9 @@ const {
   IMAGE_PROCESSING_STATES,
 } = require('./imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
+
+const uniqueIds = (values = []) =>
+  [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
 
 const REVIEW_LABELS = {
   reviewed: 'Reviewed',
@@ -155,8 +162,23 @@ const assertInspectionScope = (req, inspection) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+    throw new AppError('Worker scope is not loaded for facility-level access', 403, {
+      code: 'SCOPE_NOT_LOADED',
+      details: {
+        reason: 'worker_scope_not_loaded',
+        facilityId: inspection.facility_id || null,
+      },
+    });
+  }
   if (!isFacilityInScope(req, inspection.facility_id || null)) {
-    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    throw new AppError('Inspection out of scope', 403, {
+      code: 'SCOPE_FORBIDDEN',
+      details: {
+        reason: 'facility_outside_assigned_scope',
+        facilityId: inspection.facility_id || null,
+      },
+    });
   }
 };
 
@@ -189,6 +211,12 @@ const createInspectionEvent = async ({
 
 const includeInspectionRelations = ({ includeEvents = false } = {}) => [
   { model: InspectionMedia },
+  {
+    model: InspectionSubmission,
+    as: 'inspectionSubmissions',
+    attributes: ['id', 'status', 'submitted_at'],
+    required: false,
+  },
   ...(includeEvents
     ? [
         {
@@ -430,6 +458,18 @@ const mapInspection = (
   const afterMedia = media.filter((item) => item.capture_stage === 'after');
   const result = withAnalysis ? (inspection.AiAnalysisResults || [])[0] : null;
   const review = reviewByInspectionId.get(String(inspection.id)) || null;
+  const finalSubmissions = Array.from(
+    new Map(
+      (Array.isArray(inspection.inspectionSubmissions)
+        ? inspection.inspectionSubmissions
+        : [])
+        .filter((item) => item?.id)
+        .map((item) => [String(item.id), item])
+    ).values()
+  );
+  const latestSubmission = finalSubmissions
+    .slice()
+    .sort((a, b) => mediaTimestamp(b.submitted_at) - mediaTimestamp(a.submitted_at))[0] || null;
   const timeline = Array.isArray(inspection.events)
     ? [...inspection.events]
         .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime())
@@ -520,6 +560,9 @@ const mapInspection = (
     review,
     reviewStatus,
     reviewStatusLabel: reviewStatus ? REVIEW_LABELS[reviewStatus] : null,
+    finalSubmissionCompleted: finalSubmissions.length > 0,
+    submissionCount: finalSubmissions.length,
+    latestSubmissionStatus: latestSubmission?.status || null,
     requiresManualReview:
       Boolean(inspection.review_required) ||
       inspection.processing_status !== 'completed' ||
@@ -879,8 +922,23 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
+  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+    throw new AppError('Worker scope is not loaded for facility-level access', 403, {
+      code: 'SCOPE_NOT_LOADED',
+      details: {
+        reason: 'worker_scope_not_loaded',
+        facilityId: facility.id,
+      },
+    });
+  }
   if (!isFacilityInScope(req, facility.id)) {
-    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    throw new AppError('Facility out of scope', 403, {
+      code: 'SCOPE_FORBIDDEN',
+      details: {
+        reason: 'facility_outside_assigned_scope',
+        facilityId: facility.id,
+      },
+    });
   }
   if (req.body.toiletUnitId) {
     const unit = await ToiletUnit.findByPk(req.body.toiletUnitId);
@@ -1200,17 +1258,31 @@ const submitInspection = async (req) => {
   const hasAfter = inspection.InspectionMedia.some(
     (item) => item.capture_stage === 'after'
   );
-  if (!hasBefore || !hasAfter) {
-    throw new AppError('Before and after media are required before submission', 400, {
-      code: 'MEDIA_INCOMPLETE',
-    });
-  }
-
-  const confirmedCount = inspection.InspectionMedia.filter(
+  const confirmedMedia = inspection.InspectionMedia.filter(
     (item) =>
       item.upload_status === 'confirmed' ||
       item.upload_status === 'uploaded'
-  ).length;
+  );
+  const hasConfirmedBefore = confirmedMedia.some(
+    (item) => item.capture_stage === 'before'
+  );
+  const hasConfirmedAfter = confirmedMedia.some(
+    (item) => item.capture_stage === 'after'
+  );
+  if (!hasBefore || !hasAfter || !hasConfirmedBefore || !hasConfirmedAfter) {
+    throw new AppError('Before and after media are required before submission', 400, {
+      code: 'MEDIA_INCOMPLETE',
+      details: {
+        reason: 'evidence_upload_incomplete',
+        hasBefore,
+        hasAfter,
+        hasConfirmedBefore,
+        hasConfirmedAfter,
+      },
+    });
+  }
+
+  const confirmedCount = confirmedMedia.length;
   const pendingUploadCount = Math.max(inspection.InspectionMedia.length - confirmedCount, 0);
 
   const clientSubmissionId = String(req.body.clientSubmissionId || '').trim() || null;
@@ -1411,7 +1483,10 @@ const reviewInspection = async (req) => {
 
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  const where = scopedWhere(req);
+  let where = scopedWhere(req);
+  const ongoingOnly = ['1', 'true', 'yes'].includes(
+    String(req.query.ongoing || '').trim().toLowerCase()
+  );
   if (req.query.status) {
     const requestedStatus = String(req.query.status).trim().toLowerCase();
     const requestedUpper = String(req.query.status).trim().toUpperCase();
@@ -1432,6 +1507,43 @@ const listInspections = async (req, myOnly = false) => {
     }
     where.facility_id = req.query.facilityId;
   }
+  if (ongoingOnly) {
+    const beforeRows = await InspectionMedia.findAll({
+      attributes: ['inspection_id'],
+      where: {
+        capture_stage: 'before',
+        upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
+        inspection_id: { [Op.ne]: null },
+      },
+      group: ['inspection_id'],
+      raw: true,
+    });
+    const beforeInspectionIds = uniqueIds(
+      beforeRows.map((row) => row.inspection_id)
+    );
+    const submittedRows = beforeInspectionIds.length > 0
+      ? await InspectionSubmission.findAll({
+          attributes: ['inspection_id'],
+          where: { inspection_id: { [Op.in]: beforeInspectionIds } },
+          group: ['inspection_id'],
+          raw: true,
+        })
+      : [];
+    const submittedInspectionIds = uniqueIds(
+      submittedRows.map((row) => row.inspection_id)
+    );
+    where.id = {
+      [Op.in]: beforeInspectionIds,
+      ...(submittedInspectionIds.length > 0
+        ? { [Op.notIn]: submittedInspectionIds }
+        : {}),
+    };
+  }
+  where = applyDateRangeToWhere(
+    where,
+    'captured_at',
+    resolveDateRange(req.query, { maxDays: 90 })
+  );
 
   const { rows, count } = await Inspection.findAndCountAll({
     where,

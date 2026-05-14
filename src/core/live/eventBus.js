@@ -11,6 +11,8 @@ const EVENTS = Object.freeze({
   SENSOR_READING: 'sensor.reading',
   FACILITY_METRICS_UPDATED: 'facility.metrics.updated',
   NOTIFICATION_CREATED: 'notification.created',
+  TASK_UPDATED: 'task.updated',
+  WORKER_HEARTBEAT: 'worker.heartbeat',
 });
 
 module.exports = {

@@ -38,6 +38,15 @@ const registerLiveForwarders = () => {
       userId: payload.userId || null,
     });
   });
+  eventBus.on(EVENTS.TASK_UPDATED, (payload) => {
+    void forwardEvent(EVENTS.TASK_UPDATED, payload, { tenantId: payload.tenantId || null });
+  });
+  eventBus.on(EVENTS.WORKER_HEARTBEAT, (payload) => {
+    void forwardEvent(EVENTS.WORKER_HEARTBEAT, payload, {
+      tenantId: payload.tenantId || null,
+      userId: payload.workerId || null,
+    });
+  });
 };
 
 module.exports = {

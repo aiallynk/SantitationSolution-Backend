@@ -12,6 +12,7 @@ const analysisRoutes = require('../../modules/analysis/analysis.routes');
 const sensorRoutes = require('../../modules/sensors/sensor.routes');
 const alertRoutes = require('../../modules/alerts/alert.routes');
 const dashboardRoutes = require('../../modules/dashboard/dashboard.routes');
+const supervisorRoutes = require('../../modules/supervisor/supervisor.routes');
 const superAdminRoutes = require('../../modules/superAdmin/superAdmin.routes');
 const reportRoutes = require('../../modules/reports/report.routes');
 const complaintRoutes = require('../../modules/complaints/complaint.routes');
@@ -19,6 +20,7 @@ const notificationRoutes = require('../../modules/notifications/notification.rou
 const liveRoutes = require('../../modules/live/live.routes');
 const auditRoutes = require('../../modules/audit/audit.routes');
 const appUpdateRoutes = require('../../modules/appUpdate/appUpdate.routes');
+const workerRoutes = require('../../modules/worker/worker.routes');
 const { protect } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 
@@ -39,10 +41,12 @@ router.use(analysisRoutes);
 router.use(sensorRoutes);
 router.use(alertRoutes);
 router.use(dashboardRoutes);
+router.use(supervisorRoutes);
 router.use('/super-admin', superAdminRoutes);
 router.use(reportRoutes);
 router.use(notificationRoutes);
 router.use(liveRoutes);
 router.use(auditRoutes);
+router.use(workerRoutes);
 
 module.exports = router;

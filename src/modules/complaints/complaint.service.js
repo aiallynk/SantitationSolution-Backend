@@ -18,6 +18,7 @@ const { resolveMediaUrl } = require('../media/mediaUrl.service');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const { getPublicFeedbackUrl } = require('../platform/toiletQr.service');
 const notificationService = require('../notifications/notification.service');
+const criticalComplaintService = require('../automation/criticalComplaint.service');
 const {
   buildAccessContextFromUser,
   applyScopeToQuery,
@@ -31,6 +32,13 @@ const allowedSourceChannels = new Set([
   'helpline',
   'admin_portal',
 ]);
+const PUBLIC_FEEDBACK_RATING_LABELS = {
+  1: 'Very poor',
+  2: 'Poor',
+  3: 'Average',
+  4: 'Good',
+  5: 'Excellent',
+};
 
 const toNumberOrNull = (value) => {
   const parsed = Number(value);
@@ -53,6 +61,43 @@ const normalizePriority = (value, fallback = 'medium') => {
 const normalizeSourceChannel = (value, fallback = 'field_app') => {
   const normalized = String(value || fallback).trim().toLowerCase();
   return allowedSourceChannels.has(normalized) ? normalized : fallback;
+};
+
+const normalizePublicFeedbackRating = (value) => {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 5) return null;
+  return parsed;
+};
+
+const derivePublicFeedbackPriority = ({
+  experienceRating,
+  cleanlinessRating,
+  airQualityRating,
+}) => {
+  const minRating = Math.min(experienceRating, cleanlinessRating, airQualityRating);
+  if (minRating <= 1) return 'critical';
+  if (minRating <= 2) return 'high';
+  if (minRating === 3) return 'medium';
+  return 'low';
+};
+
+const buildPublicFeedbackComplaintDescription = ({
+  experienceRating,
+  cleanlinessRating,
+  airQualityRating,
+  citizenNote,
+}) => {
+  const asLabel = (rating) => PUBLIC_FEEDBACK_RATING_LABELS[rating] || 'Unrated';
+  const parts = [
+    `Public feedback survey`,
+    `Q1 experience=${experienceRating}/5 (${asLabel(experienceRating)})`,
+    `Q2 toilet_cleanliness=${cleanlinessRating}/5 (${asLabel(cleanlinessRating)})`,
+    `Q3 air_quality=${airQualityRating}/5 (${asLabel(airQualityRating)})`,
+  ];
+  if (citizenNote) {
+    parts.push(`note=${citizenNote}`);
+  }
+  return sanitizeText(parts.join(' | '), 1000);
 };
 
 const complaintInclude = () => [
@@ -380,7 +425,12 @@ const createComplaint = async (req) => {
   const hydrated = await Complaint.findByPk(complaint.id, {
     include: complaintInclude(),
   });
-  return mapComplaint(hydrated || complaint);
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
 };
 
 const escapeHtml = (value) =>
@@ -515,6 +565,55 @@ const buildPublicFeedbackPage = ({
       min-height: 120px;
       resize: vertical;
     }
+    fieldset {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      display: grid;
+      gap: 8px;
+    }
+    legend {
+      padding: 0 4px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .rating-stars {
+      display: inline-flex;
+      flex-direction: row;
+      gap: 2px;
+      align-self: start;
+    }
+    .rating-stars input {
+      position: absolute;
+      opacity: 0;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+    }
+    .rating-stars label {
+      cursor: pointer;
+      font-size: 30px;
+      line-height: 1;
+      color: #cbd5e1;
+      font-weight: 400;
+      margin: 0;
+      display: inline-block;
+    }
+    .rating-stars label:hover,
+    .rating-stars input:checked + label {
+      color: #f59e0b;
+    }
+    .rating-hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .question-label {
+      font-size: 14px;
+      color: var(--text);
+      font-weight: 700;
+    }
     .row {
       display: grid;
       gap: 12px;
@@ -563,51 +662,69 @@ const buildPublicFeedbackPage = ({
       ${errorBlock}
 
       <form method="post" action="${escapeHtml(submitPath)}" enctype="multipart/form-data">
-        <div class="row two">
-          <label>
-            Your Name (Optional)
-            <input type="text" name="reporterName" maxlength="180" placeholder="Citizen name" />
-          </label>
-          <label>
-            Contact (Optional)
-            <input type="text" name="reporterContact" maxlength="120" placeholder="Phone or email" />
-          </label>
-        </div>
-        <div class="row two">
-          <label>
-            Issue Type
-            <select name="complaintType" required>
-              <option value="cleanliness">Cleanliness</option>
-              <option value="odor">Bad odor</option>
-              <option value="water_supply">Water supply issue</option>
-              <option value="damage">Damaged unit</option>
-              <option value="accessibility">Accessibility issue</option>
-              <option value="safety">Safety concern</option>
-              <option value="other">Other</option>
-            </select>
-          </label>
-          <label>
-            Priority
-            <select name="priority" required>
-              <option value="high">High</option>
-              <option value="critical">Critical</option>
-              <option value="medium" selected>Medium</option>
-              <option value="low">Low</option>
-            </select>
-          </label>
-        </div>
+        <fieldset>
+          <legend><span class="question-label">1. How was your experience?</span></legend>
+          <div class="rating-stars" role="radiogroup" aria-label="Overall experience rating">
+            <input id="experience-rating-1" type="radio" name="experienceRating" value="1" />
+            <label for="experience-rating-1" aria-label="1 star">&#9733;</label>
+            <input id="experience-rating-2" type="radio" name="experienceRating" value="2" />
+            <label for="experience-rating-2" aria-label="2 stars">&#9733;</label>
+            <input id="experience-rating-3" type="radio" name="experienceRating" value="3" />
+            <label for="experience-rating-3" aria-label="3 stars">&#9733;</label>
+            <input id="experience-rating-4" type="radio" name="experienceRating" value="4" />
+            <label for="experience-rating-4" aria-label="4 stars">&#9733;</label>
+            <input id="experience-rating-5" type="radio" name="experienceRating" value="5" required />
+            <label for="experience-rating-5" aria-label="5 stars">&#9733;</label>
+          </div>
+          <div class="rating-hint">Rate from 1 (very poor) to 5 (excellent).</div>
+        </fieldset>
+
+        <fieldset>
+          <legend><span class="question-label">2. How clean was the toilet?</span></legend>
+          <div class="rating-stars" role="radiogroup" aria-label="Toilet cleanliness rating">
+            <input id="cleanliness-rating-1" type="radio" name="cleanlinessRating" value="1" />
+            <label for="cleanliness-rating-1" aria-label="1 star">&#9733;</label>
+            <input id="cleanliness-rating-2" type="radio" name="cleanlinessRating" value="2" />
+            <label for="cleanliness-rating-2" aria-label="2 stars">&#9733;</label>
+            <input id="cleanliness-rating-3" type="radio" name="cleanlinessRating" value="3" />
+            <label for="cleanliness-rating-3" aria-label="3 stars">&#9733;</label>
+            <input id="cleanliness-rating-4" type="radio" name="cleanlinessRating" value="4" />
+            <label for="cleanliness-rating-4" aria-label="4 stars">&#9733;</label>
+            <input id="cleanliness-rating-5" type="radio" name="cleanlinessRating" value="5" required />
+            <label for="cleanliness-rating-5" aria-label="5 stars">&#9733;</label>
+          </div>
+          <div class="rating-hint">Consider floor, odor, stains, and usability.</div>
+        </fieldset>
+
+        <fieldset>
+          <legend><span class="question-label">3. Air quality rating</span></legend>
+          <div class="rating-stars" role="radiogroup" aria-label="Air quality rating">
+            <input id="air-rating-1" type="radio" name="airQualityRating" value="1" />
+            <label for="air-rating-1" aria-label="1 star">&#9733;</label>
+            <input id="air-rating-2" type="radio" name="airQualityRating" value="2" />
+            <label for="air-rating-2" aria-label="2 stars">&#9733;</label>
+            <input id="air-rating-3" type="radio" name="airQualityRating" value="3" />
+            <label for="air-rating-3" aria-label="3 stars">&#9733;</label>
+            <input id="air-rating-4" type="radio" name="airQualityRating" value="4" />
+            <label for="air-rating-4" aria-label="4 stars">&#9733;</label>
+            <input id="air-rating-5" type="radio" name="airQualityRating" value="5" required />
+            <label for="air-rating-5" aria-label="5 stars">&#9733;</label>
+          </div>
+          <div class="rating-hint">Rate smell and freshness inside the toilet area.</div>
+        </fieldset>
+
         <label>
-          Describe the issue
-          <textarea name="description" required maxlength="1000" placeholder="Please explain what issue you observed."></textarea>
+          Additional description (Optional)
+          <textarea name="description" maxlength="1000" placeholder="Share any extra details that can help the operations team."></textarea>
         </label>
         <label>
-          Photo evidence
-          <input type="file" name="photo" accept="image/*" capture="environment" required />
+          Photo (Optional)
+          <input type="file" name="photo" accept="image/*" capture="environment" />
         </label>
         <button type="submit">Submit Feedback</button>
       </form>
       <div class="footnote">
-        Your report is mapped to this toilet ID automatically so the operations team can act on the exact location.
+        Feedback is automatically mapped to this toilet so the operations team can take action quickly.
       </div>
     </div>
   </div>
@@ -636,20 +753,42 @@ const getPublicFeedbackFormPage = async (req) => {
 const createPublicComplaint = async (req) => {
   const unit = await resolvePublicToilet(req.params.toiletId);
   const facility = unit.Facility;
-  const description = sanitizeText(req.body.description, 1000);
-  if (!description) {
-    throw new AppError('description is required', 400, { code: 'DESCRIPTION_REQUIRED' });
+  const experienceRating = normalizePublicFeedbackRating(req.body.experienceRating);
+  const cleanlinessRating = normalizePublicFeedbackRating(req.body.cleanlinessRating);
+  const airQualityRating = normalizePublicFeedbackRating(req.body.airQualityRating);
+
+  if (!experienceRating) {
+    throw new AppError('experienceRating must be between 1 and 5', 400, {
+      code: 'FEEDBACK_Q1_REQUIRED',
+    });
   }
-  if (!req.file?.path) {
-    throw new AppError('photo is required', 400, { code: 'PHOTO_REQUIRED' });
+  if (!cleanlinessRating) {
+    throw new AppError('cleanlinessRating must be between 1 and 5', 400, {
+      code: 'FEEDBACK_Q2_REQUIRED',
+    });
   }
+  if (!airQualityRating) {
+    throw new AppError('airQualityRating must be between 1 and 5', 400, {
+      code: 'FEEDBACK_Q3_REQUIRED',
+    });
+  }
+
+  const citizenNote = sanitizeText(req.body.description, 1000);
+  const description = buildPublicFeedbackComplaintDescription({
+    experienceRating,
+    cleanlinessRating,
+    airQualityRating,
+    citizenNote: citizenNote || null,
+  });
 
   const folder = `sanitation/${facility.tenant_id}/public-feedback/${unit.id}`;
   let uploaded = null;
-  try {
-    uploaded = await uploadImage(req.file.path, folder);
-  } finally {
-    await removeTempFile(req.file.path);
+  if (req.file?.path) {
+    try {
+      uploaded = await uploadImage(req.file.path, folder);
+    } finally {
+      await removeTempFile(req.file.path);
+    }
   }
 
   const complaint = await Complaint.create({
@@ -658,15 +797,17 @@ const createPublicComplaint = async (req) => {
     toilet_unit_id: unit.id,
     reporter_user_id: null,
     source_channel: 'public_qr',
-    reporter_name: req.body.reporterName ? sanitizeText(req.body.reporterName, 180) : null,
-    reporter_contact: req.body.reporterContact
-      ? sanitizeText(req.body.reporterContact, 120)
-      : null,
-    complaint_type: sanitizeText(req.body.complaintType || 'public_feedback', 120),
+    reporter_name: null,
+    reporter_contact: null,
+    complaint_type: 'public_feedback',
     description,
     evidence_image_url: uploaded?.fileUrl || null,
     status: 'open',
-    priority: normalizePriority(req.body.priority, 'high'),
+    priority: derivePublicFeedbackPriority({
+      experienceRating,
+      cleanlinessRating,
+      airQualityRating,
+    }),
   });
 
   await createAuditLog({
@@ -679,13 +820,71 @@ const createPublicComplaint = async (req) => {
       sourceChannel: 'public_qr',
       facilityId: facility.id,
       toiletUnitId: unit.id,
+      experienceRating,
+      cleanlinessRating,
+      airQualityRating,
     },
   });
 
   const hydrated = await Complaint.findByPk(complaint.id, {
     include: complaintInclude(),
   });
-  return mapComplaint(hydrated || complaint);
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
+};
+
+const updateComplaint = async (req) => {
+  const complaint = await loadScopedComplaint(req);
+  const updates = {};
+
+  if (req.body.priority !== undefined) {
+    updates.priority = normalizePriority(req.body.priority, complaint.priority);
+  }
+  if (req.body.status !== undefined) {
+    const status = String(req.body.status || '').trim().toLowerCase();
+    if (['open', 'assigned', 'resolved', 'rejected'].includes(status)) {
+      updates.status = status;
+    }
+  }
+  if (req.body.complaintType !== undefined) {
+    updates.complaint_type = sanitizeText(req.body.complaintType || complaint.complaint_type, 120);
+  }
+  if (req.body.description !== undefined) {
+    updates.description = sanitizeText(req.body.description || complaint.description, 1000);
+  }
+
+  if (Object.keys(updates).length === 0) {
+    const hydratedExisting = await Complaint.findByPk(complaint.id, {
+      include: complaintInclude(),
+    });
+    return mapComplaint(hydratedExisting || complaint);
+  }
+
+  updates.updated_at = new Date();
+  await complaint.update(updates);
+
+  await createAuditLog({
+    req,
+    action: 'complaint.update',
+    entityType: 'complaint',
+    entityId: complaint.id,
+    tenantId: complaint.tenant_id,
+    details: updates,
+  });
+
+  const hydrated = await Complaint.findByPk(complaint.id, {
+    include: complaintInclude(),
+  });
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
 };
 
 const assignComplaint = async (req) => {
@@ -917,7 +1116,15 @@ const dispatchComplaint = async (req) => {
 
   const dispatchMessage =
     sanitizeText(req.body.message, 300) ||
-    'New issue reported via public feedback QR. Please inspect and resolve.';
+    `Complaint ${String(complaint.id || '').slice(0, 8).toUpperCase()} reported for ${
+      toilet?.code || facility?.name || 'assigned location'
+    }. Please inspect and resolve.`;
+  const dispatchShortBody = sanitizeText(
+    `Complaint ${String(complaint.id || '').slice(0, 8).toUpperCase()} | ${
+      facility?.name || facility?.code || 'Facility'
+    } | ${toilet?.code || 'Unit N/A'}`,
+    280
+  ) || dispatchMessage;
   const now = new Date();
   const dispatchEvidenceImageUrl = await resolveMediaUrl({
     fileUrl: complaint.evidence_image_url,
@@ -954,7 +1161,7 @@ const dispatchComplaint = async (req) => {
       priority: complaint.priority === 'critical' ? 'CRITICAL' : 'HIGH',
       title: 'Complaint assigned to worker',
       body: dispatchMessage,
-      shortBody: dispatchMessage,
+      shortBody: dispatchShortBody,
       entityType: 'complaint',
       entityId: complaint.id,
       route: `/ops/complaints/${complaint.id}`,
@@ -984,7 +1191,7 @@ const dispatchComplaint = async (req) => {
       priority: complaint.priority === 'critical' ? 'CRITICAL' : 'HIGH',
       title: 'Complaint escalated to supervisor',
       body: dispatchMessage,
-      shortBody: dispatchMessage,
+      shortBody: dispatchShortBody,
       entityType: 'complaint',
       entityId: complaint.id,
       route: `/ops/complaints/${complaint.id}`,
@@ -1048,6 +1255,7 @@ module.exports = {
   createComplaint,
   getPublicFeedbackFormPage,
   createPublicComplaint,
+  updateComplaint,
   assignComplaint,
   resolveComplaint,
   dispatchComplaint,

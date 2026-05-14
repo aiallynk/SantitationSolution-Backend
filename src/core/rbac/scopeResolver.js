@@ -61,7 +61,11 @@ const resolveFacilitiesFromGeographyScope = async ({ tenantId, geographyIds = []
   const rows = await Facility.findAll({
     where: {
       tenant_id: tenantId,
-      geography_id: { [Op.in]: geoIds },
+      [Op.or]: [
+        { geography_id: { [Op.in]: geoIds } },
+        { zone_geography_id: { [Op.in]: geoIds } },
+        { ward_geography_id: { [Op.in]: geoIds } },
+      ],
     },
     attributes: ['id'],
     raw: true,

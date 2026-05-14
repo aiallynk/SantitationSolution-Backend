@@ -707,6 +707,16 @@ const normalizeIdentifierPart = (value, fallback) => {
   return normalized || fallback;
 };
 
+/** Shorter segments for auto toilet codes (tenant + facility + block + suffix must fit DB limit). */
+const normalizeAutoToiletCodePart = (value, fallback, maxLen = 32) => {
+  const text = sanitizeText(value, maxLen);
+  const normalized = text
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+};
+
 const normalizeSectorCode = (value) => {
   const text = sanitizeText(value, 40)
     .toUpperCase()
@@ -722,29 +732,55 @@ const toOptionalCoordinate = (value) => {
   return numeric;
 };
 
-const buildAutoToiletId = async ({ facility, toiletBlock }) => {
-  const facilityPart = normalizeIdentifierPart(
+const findToiletUnitCodeConflict = async ({ facilityId, code, transaction = null }) => {
+  const normalizedCode = normalizePermanentQrCode(code);
+  if (!facilityId || !normalizedCode) return null;
+
+  const rows = await sequelize.query(
+    `
+      SELECT id
+      FROM toilet_units
+      WHERE facility_id = :facilityId
+        AND UPPER(TRIM(code)) = :normalizedCode
+      LIMIT 1
+      ${transaction ? 'FOR UPDATE' : ''}
+    `,
+    {
+      replacements: { facilityId, normalizedCode },
+      transaction,
+      type: QueryTypes.SELECT,
+    }
+  );
+  return rows[0] || null;
+};
+
+const buildAutoToiletId = async ({ facility, toiletBlock, tenant = null, transaction = null }) => {
+  const tenantPart = tenant
+    ? normalizeAutoToiletCodePart(tenant.code || tenant.name, 'TEN', 24)
+    : null;
+  const facilityPart = normalizeAutoToiletCodePart(
     facility.code || facility.name,
-    'FAC'
+    'FAC',
+    32
   );
-  const blockPart = normalizeIdentifierPart(toiletBlock.code || toiletBlock.name, 'BLK');
-  const prefix = `${facilityPart}-${blockPart}-T`;
-
-  const rows = await ToiletUnit.findAll({
-    where: { toilet_block_id: toiletBlock.id },
-    attributes: ['code'],
-  });
-
-  const usedCodes = new Set(
-    rows
-      .map((row) => String(row.code || '').toUpperCase())
-      .filter(Boolean)
+  const blockPart = normalizeAutoToiletCodePart(
+    toiletBlock.code || toiletBlock.name,
+    'BLK',
+    32
   );
+  const prefix = tenantPart
+    ? `${tenantPart}-${facilityPart}-${blockPart}-T`
+    : `${facilityPart}-${blockPart}-T`;
 
   let sequence = 1;
   while (sequence <= 9999) {
     const candidate = `${prefix}${String(sequence).padStart(3, '0')}`;
-    if (!usedCodes.has(candidate)) {
+    const conflict = await findToiletUnitCodeConflict({
+      facilityId: facility.id,
+      code: candidate,
+      transaction,
+    });
+    if (!conflict) {
       return candidate;
     }
     sequence += 1;
@@ -1113,6 +1149,107 @@ const resolveBaselineScore = ({ totalInspections, avgAfterScore, latestScore }) 
   return latest ?? avgAfter;
 };
 
+const toNumberOrNull = (value) =>
+  value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value) : null;
+
+const scoreLabelFromScore = (score) => {
+  const value = toNumberOrNull(score);
+  if (value === null) return 'Unknown';
+  if (value <= 30) return 'Very Dirty';
+  if (value <= 50) return 'Dirty';
+  if (value <= 70) return 'Moderate';
+  if (value <= 85) return 'Clean';
+  return 'Very Clean';
+};
+
+const mapInspectionSummaryRow = (row = {}) => {
+  const avgBeforeScore = toNumberOrNull(row.avgBeforeScore);
+  const avgAfterScore = toNumberOrNull(row.avgAfterScore);
+  const cleanlinessScore = toNumberOrNull(row.cleanlinessScore);
+  const improvementScore =
+    toNumberOrNull(row.improvementScore) ??
+    (avgBeforeScore !== null && avgAfterScore !== null
+      ? Number((avgAfterScore - avgBeforeScore).toFixed(2))
+      : null);
+  const score = avgAfterScore ?? cleanlinessScore ?? avgBeforeScore;
+  return {
+    id: row.id || null,
+    toiletUnitId: row.toiletUnitId || null,
+    capturedAt: row.capturedAt || null,
+    submittedAt: row.submittedAt || null,
+    score,
+    scoreLabel: scoreLabelFromScore(score),
+    avgBeforeScore,
+    avgAfterScore,
+    cleanlinessScore,
+    improvementScore,
+    inspectionResult: row.inspectionResult || null,
+    overallStatus: row.overallStatus || null,
+    processingStatus: row.processingStatus || null,
+    status: row.overallStatus || row.inspectionResult || row.processingStatus || null,
+  };
+};
+
+const loadInspectionSummariesForToiletIds = async (toiletIds = []) => {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(toiletIds) ? toiletIds : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  );
+  if (ids.length === 0) return new Map();
+
+  const rows = await sequelize.query(
+    `
+      SELECT *
+      FROM (
+        SELECT
+          i.id,
+          i.toilet_unit_id AS "toiletUnitId",
+          i.captured_at AS "capturedAt",
+          i.submitted_at AS "submittedAt",
+          i.avg_before_score AS "avgBeforeScore",
+          i.avg_after_score AS "avgAfterScore",
+          i.improvement_score AS "improvementScore",
+          i.inspection_result AS "inspectionResult",
+          i.overall_status AS "overallStatus",
+          i.processing_status AS "processingStatus",
+          ai.cleanliness_score AS "cleanlinessScore",
+          ROW_NUMBER() OVER (
+            PARTITION BY i.toilet_unit_id
+            ORDER BY COALESCE(i.submitted_at, i.captured_at, i.created_at) DESC, i.created_at DESC
+          ) AS rn
+        FROM inspections i
+        LEFT JOIN (
+          SELECT inspection_id, AVG(cleanliness_score) AS cleanliness_score
+          FROM ai_analysis_results
+          GROUP BY inspection_id
+        ) ai ON ai.inspection_id = i.id
+        WHERE i.toilet_unit_id IN (:ids)
+      ) ranked
+      WHERE rn <= 2
+      ORDER BY "toiletUnitId" ASC, rn ASC
+    `,
+    {
+      replacements: { ids },
+      type: QueryTypes.SELECT,
+    }
+  );
+
+  const map = new Map();
+  for (const row of rows) {
+    const toiletId = String(row.toiletUnitId || '').trim();
+    if (!toiletId) continue;
+    const current = map.get(toiletId) || { latest: null, previous: null };
+    const summary = mapInspectionSummaryRow(row);
+    if (Number(row.rn) === 1) current.latest = summary;
+    if (Number(row.rn) === 2) current.previous = summary;
+    map.set(toiletId, current);
+  }
+  return map;
+};
+
 const mapUnitRow = (row, options = {}) => {
   const resolvedQrCode = String(options.resolvedQrCode || row.qr_code || row.code || '').trim();
   const legacyQrCode = String(options.legacyQrCode || row.qr_code || row.code || '').trim();
@@ -1146,12 +1283,37 @@ const mapUnitRow = (row, options = {}) => {
     avgAfterScore,
     latestScore,
   });
+  const latestInspection =
+    options.latestInspection ||
+    (row.last_inspection_at
+      ? {
+          id: null,
+          toiletUnitId: row.id,
+          submittedAt: row.last_inspection_at,
+          capturedAt: row.last_inspection_at,
+          score: latestScore,
+          scoreLabel: scoreLabelFromScore(latestScore),
+          avgBeforeScore: latestBeforeScore,
+          avgAfterScore: latestAfterScore,
+          improvementScore:
+            latestBeforeScore !== null && latestAfterScore !== null
+              ? Number((latestAfterScore - latestBeforeScore).toFixed(2))
+              : null,
+          status: row.status || null,
+        }
+      : null);
+  const previousInspection = options.previousInspection || null;
 
   return {
     id: row.id,
     facilityId: row.facility_id,
     facilityCode: row.Facility?.code || null,
     facilityName: row.Facility?.name || null,
+    geographyId: row.Facility?.geography_id || null,
+    zoneGeographyId: row.Facility?.zone_geography_id || null,
+    wardGeographyId: row.Facility?.ward_geography_id || null,
+    zoneName: row.Facility?.zone?.name || null,
+    wardName: row.Facility?.ward?.name || null,
     toiletBlockId: row.toilet_block_id,
     code: row.code,
     qrId: options.qrId || null,
@@ -1192,22 +1354,19 @@ const mapUnitRow = (row, options = {}) => {
     latestScore,
     latestBeforeScore,
     latestAfterScore,
+    latestInspection,
     avgBeforeScore,
     avgAfterScore,
     avgImprovementScore,
+    previousInspection,
+    previousInspectionAt: previousInspection?.submittedAt || previousInspection?.capturedAt || null,
+    previousScore: previousInspection?.score ?? null,
+    previousScoreLabel: scoreLabelFromScore(previousInspection?.score),
+    previousBeforeScore: previousInspection?.avgBeforeScore ?? null,
+    previousAfterScore: previousInspection?.avgAfterScore ?? null,
+    previousImprovementScore: previousInspection?.improvementScore ?? null,
     baselineScore,
-    baselineScoreLabel:
-      baselineScore !== null && baselineScore !== undefined
-        ? baselineScore <= 30
-          ? 'Very Dirty'
-          : baselineScore <= 50
-            ? 'Dirty'
-            : baselineScore <= 70
-              ? 'Moderate'
-              : baselineScore <= 85
-                ? 'Clean'
-                : 'Very Clean'
-        : 'Unknown',
+    baselineScoreLabel: scoreLabelFromScore(baselineScore),
     baselineMinInspections: BASELINE_MIN_INSPECTIONS,
     baselineConfidence: resolveBaselineConfidence(totalInspections),
     totalInspections,
@@ -2674,16 +2833,16 @@ const listUnits = async (req) => {
       'address_line',
       'latitude',
       'longitude',
+
+      'geography_id',
+      'zone_geography_id',
       'ward_geography_id',
       'metadata',
     ],
     include: [
-      {
-        model: Geography,
-        as: 'ward',
-        attributes: ['id', 'name', 'level'],
-        required: false,
-      },
+
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
     ],
     required: true,
   };
@@ -2707,10 +2866,8 @@ const listUnits = async (req) => {
     if (!isGeographyInScope(req, req.query.wardGeographyId)) {
       throw new AppError('wardGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
-    facilityInclude.where = {
-      ...(facilityInclude.where || {}),
-      ward_geography_id: req.query.wardGeographyId,
-    };
+
+    facilityInclude.where.ward_geography_id = req.query.wardGeographyId;
   }
   if (req.query.qrCode) {
     const qrCode = normalizePermanentQrCode(req.query.qrCode);
@@ -2725,6 +2882,7 @@ const listUnits = async (req) => {
     order: [['code', 'ASC']],
   });
   const primaryQrMap = await loadPrimaryQrMapForToiletIds(rows.map((row) => row.id));
+  const inspectionSummaryMap = await loadInspectionSummariesForToiletIds(rows.map((row) => row.id));
   const qrImageSeedRows = rows.map((row) => ({
     id: row.id,
     qr_code: primaryQrMap.get(String(row.id))?.qr_code || row.qr_code || row.code,
@@ -2733,11 +2891,14 @@ const listUnits = async (req) => {
   await ensureQrImagesForToilets(qrImageSeedRows).catch(() => null);
   return rows.map((row) => {
     const primaryQr = primaryQrMap.get(String(row.id)) || null;
+    const inspectionSummary = inspectionSummaryMap.get(String(row.id)) || null;
     return mapUnitRow(row, {
       resolvedQrCode: primaryQr?.qr_code || row.qr_code || row.code,
       legacyQrCode: row.qr_code || row.code,
       qrId: primaryQr?.id || null,
       qrSchemaVersion: primaryQr?.schema_version || null,
+      latestInspection: inspectionSummary?.latest || null,
+      previousInspection: inspectionSummary?.previous || null,
     });
   });
 };
@@ -2778,8 +2939,17 @@ const createUnit = async (req) => {
       throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
 
+    const tenant = await Tenant.findByPk(facility.tenant_id, {
+      attributes: ['id', 'code', 'name'],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (!tenant) {
+      throw new AppError('Tenant not found for facility', 404, { code: 'TENANT_NOT_FOUND' });
+    }
+
     const toiletBlock = await ToiletBlock.findByPk(req.body.toiletBlockId, {
-      attributes: ['id', 'facility_id'],
+      attributes: ['id', 'facility_id', 'code', 'name'],
       transaction,
       lock: transaction.LOCK.UPDATE,
     });
@@ -2792,23 +2962,30 @@ const createUnit = async (req) => {
       });
     }
 
-    const unitCode = requestedCode
+    const isAutoGeneratedCode = !requestedCode;
+    let unitCode = requestedCode
       ? requestedCode.toUpperCase()
-      : await buildAutoToiletId({ facility, toiletBlock });
+      : await buildAutoToiletId({ facility, toiletBlock, tenant, transaction });
 
     const legacyQrCode = normalizePermanentQrCode(
       req.body.permanentQrCode || req.body.qrCode || unitCode
     );
 
-    const duplicateCode = await ToiletUnit.findOne({
-      where: {
-        facility_id: facility.id,
-        code: unitCode,
-      },
-      attributes: ['id'],
+    let duplicateCode = await findToiletUnitCodeConflict({
+      facilityId: facility.id,
+      code: unitCode,
       transaction,
-      lock: transaction.LOCK.UPDATE,
     });
+    if (duplicateCode && isAutoGeneratedCode) {
+      for (let attempt = 0; attempt < 32 && duplicateCode; attempt += 1) {
+        unitCode = await buildAutoToiletId({ facility, toiletBlock, tenant, transaction });
+        duplicateCode = await findToiletUnitCodeConflict({
+          facilityId: facility.id,
+          code: unitCode,
+          transaction,
+        });
+      }
+    }
     if (duplicateCode) {
       throw new AppError('Toilet unit code already exists in this facility', 409, {
         code: 'TOILET_UNIT_CODE_EXISTS',
@@ -3010,5 +3187,6 @@ module.exports = {
   tryParseCanonicalQrPayload,
   validateCanonicalQrPayload,
   QR_RESOLVE_REASON_CODES,
+  buildAutoToiletId,
   createUnit,
 };

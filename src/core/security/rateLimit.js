@@ -8,16 +8,41 @@ const isInfraPath = (req) => {
   return path === '/health' || path === '/ready' || path === '/';
 };
 
+/** Supervisor UI can issue many parallel GETs; count them separately (see supervisorApiRateLimit). */
+const isSupervisorApiPath = (req) => {
+  const path = String(req.originalUrl || req.url || req.path || '')
+    .split('?')[0]
+    .toLowerCase();
+  return path.includes('/api/v1/supervisor/');
+};
+
 const apiRateLimit = rateLimit({
   windowMs: Number(runtimeConfig.security.rateLimitWindowMs || 60_000),
   max: Number(runtimeConfig.security.rateLimitMax || 300),
-  skip: (req) => isIngestionPath(req) || isInfraPath(req),
+  skip: (req) => isIngestionPath(req) || isInfraPath(req) || isSupervisorApiPath(req),
   standardHeaders: true,
   legacyHeaders: false,
   message: {
     success: false,
     code: 'RATE_LIMIT_EXCEEDED',
     message: 'Too many requests, please retry later',
+  },
+});
+
+/** Applied after JWT `protect` on supervisor routes; keyed by user id so NAT/office IP is not shared. */
+const supervisorApiRateLimit = rateLimit({
+  windowMs: Number(runtimeConfig.security.rateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.supervisorRateLimitMax || 2000),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = req.user?.id || req.user?.userId || null;
+    return userId ? `supuid:${userId}` : `supip:${req.ip || 'anon'}`;
+  },
+  message: {
+    success: false,
+    code: 'SUPERVISOR_RATE_LIMIT_EXCEEDED',
+    message: 'Too many supervisor requests, please retry shortly',
   },
 });
 
@@ -33,4 +58,4 @@ const ingestionRateLimit = rateLimit({
   },
 });
 
-module.exports = { apiRateLimit, ingestionRateLimit };
+module.exports = { apiRateLimit, ingestionRateLimit, supervisorApiRateLimit };

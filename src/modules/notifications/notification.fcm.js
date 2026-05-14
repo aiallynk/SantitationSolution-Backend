@@ -3,6 +3,8 @@ const {
   getFirebaseMessaging,
 } = require('../../config/firebase-admin');
 
+const ANDROID_CHANNEL_ID = 'green_toilet_alerts';
+
 const ensureFirebaseAdmin = () => {
   const state = initializeFirebaseAdmin();
   return {
@@ -80,13 +82,11 @@ const sendPushBatch = async ({ tokens = [], title = '', body = '', data = {}, im
       data: normalizeData(data),
       android: {
         priority: 'high',
-        ...(normalizedImageUrl
-          ? {
-              notification: {
-                imageUrl: normalizedImageUrl,
-              },
-            }
-          : {}),
+        notification: {
+          channelId: ANDROID_CHANNEL_ID,
+          sound: 'default',
+          ...(normalizedImageUrl ? { imageUrl: normalizedImageUrl } : {}),
+        },
       },
       apns: {
         headers: {

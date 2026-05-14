@@ -128,6 +128,18 @@ const patchComplaintAssign = async (req, res, next) => {
   }
 };
 
+const patchComplaint = async (req, res, next) => {
+  try {
+    const data = await complaintService.updateComplaint(req);
+    return sendSuccess(res, {
+      message: 'Complaint updated successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const patchComplaintResolve = async (req, res, next) => {
   try {
     const data = await complaintService.resolveComplaint(req);
@@ -159,7 +171,7 @@ module.exports = {
   getPublicFeedbackForm,
   postPublicFeedback,
   patchComplaintAssign,
+  patchComplaint,
   patchComplaintResolve,
   postComplaintDispatch,
 };
-

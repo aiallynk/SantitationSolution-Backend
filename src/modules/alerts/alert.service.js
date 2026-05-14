@@ -9,9 +9,13 @@ const {
   applyScopeToQuery,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
+const {
+  resolveDateRange,
+  applyDateRangeToWhere,
+} = require('../../utils/dateRange');
 
 const scopedWhere = (req) => {
-  const where = applyScopeToQuery(
+  let where = applyScopeToQuery(
     {},
     buildAccessContextFromUser(req?.user || {}),
     'alert',
@@ -26,6 +30,7 @@ const scopedWhere = (req) => {
     where.facility_id = req.query.facilityId;
   }
   if (req.query.sourceType) where.source_type = req.query.sourceType;
+  where = applyDateRangeToWhere(where, 'created_at', resolveDateRange(req.query, { maxDays: 90 }));
   return where;
 };
 
@@ -163,10 +168,12 @@ const acknowledgeAlert = async (req) => {
     throw new AppError('Alert out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
 
+  const assignedToUserId = req.body.assignedToUserId || alert.assigned_to_user_id || null;
+
   await alert.update({
     status: 'acknowledged',
     acknowledged_at: new Date(),
-    assigned_to_user_id: req.body.assignedToUserId || alert.assigned_to_user_id,
+    assigned_to_user_id: assignedToUserId,
     updated_at: new Date(),
   });
 
@@ -176,6 +183,13 @@ const acknowledgeAlert = async (req) => {
     action: 'alert.acknowledge',
     entityType: 'alert',
     entityId: alert.id,
+    details: {
+      assignedToUserId,
+      facilityId: alert.facility_id || null,
+      severity: alert.severity,
+      alertType: alert.alert_type,
+      dispatched: Boolean(assignedToUserId),
+    },
   });
 
   eventBus.emit(EVENTS.ALERT_UPDATED, {

@@ -7,8 +7,9 @@ const {
   classifyResolvedToilet,
   QR_RESOLVE_REASON_CODES,
   resolveToiletFromQr,
+  buildAutoToiletId,
 } = require('../src/modules/platform/platform.service');
-const { ToiletUnit } = require('../src/models');
+const { ToiletUnit, sequelize } = require('../src/models');
 
 test('extractQrCandidates handles malformed payload safely', () => {
   const malformed = '{"qrCode":"FAC-1"';
@@ -44,6 +45,27 @@ test('findDuplicateExactMatchIds detects duplicate mappings', () => {
   assert.equal(duplicates.length, 2);
   assert.ok(duplicates.includes('unit-1'));
   assert.ok(duplicates.includes('unit-2'));
+});
+
+test('buildAutoToiletId skips codes already used anywhere in facility', async () => {
+  const originalQuery = sequelize.query.bind(sequelize);
+  sequelize.query = async (sql, opts) => {
+    const normalizedCode = opts?.replacements?.normalizedCode;
+    if (normalizedCode === 'FAC-BLK-T001' || normalizedCode === 'FAC-BLK-T002') {
+      return [{ id: 'existing' }];
+    }
+    return [];
+  };
+
+  try {
+    const code = await buildAutoToiletId({
+      facility: { id: 'facility-1', code: 'fac' },
+      toiletBlock: { id: 'block-1', code: 'blk' },
+    });
+    assert.equal(code, 'FAC-BLK-T003');
+  } finally {
+    sequelize.query = originalQuery;
+  }
 });
 
 test('classifyResolvedToilet returns inactive reason', () => {
