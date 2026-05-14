@@ -152,6 +152,12 @@ const runtimeConfig = Object.freeze({
   logging: {
     level: asText(rawEnv.LOG_LEVEL, defaultLogLevel).toLowerCase(),
     serviceName: asText(rawEnv.LOG_SERVICE_NAME, 'sanitation-backend'),
+    /** `pretty` = short human lines (default in development). `json` = one-line JSON (default in production). */
+    format: (() => {
+      const v = asText(rawEnv.LOG_FORMAT, '').toLowerCase();
+      if (v === 'pretty' || v === 'json') return v;
+      return isProduction ? 'json' : 'pretty';
+    })(),
     requestLoggingEnabled: defaults.logging.requestLoggingEnabled,
     requestLoggingVerbose: defaults.logging.requestLoggingVerbose,
     requestLoggingSlowMs: defaults.logging.requestLoggingSlowMs,

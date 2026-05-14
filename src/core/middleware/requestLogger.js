@@ -32,10 +32,11 @@ const requestLogger = (req, res, next) => {
       return;
     }
 
+    const path = getSanitizedPath(req);
     const meta = {
       requestId: req.requestId || null,
       method: req.method,
-      path: getSanitizedPath(req),
+      path,
       status,
       durationMs,
       tenantId: req.user?.tenantId || null,
@@ -46,11 +47,13 @@ const requestLogger = (req, res, next) => {
         : null,
     };
 
+    const summary = `${req.method} ${path} ${status} ${durationMs}ms`;
+
     if (isWarn) {
-      logger.warn('Request warning', meta);
+      logger.warn(summary, meta);
       return;
     }
-    logger.info(isSlow ? 'Slow request' : 'Request completed', meta);
+    logger.info(isSlow ? `Slow ${summary}` : summary, meta);
   });
 
   return next();
