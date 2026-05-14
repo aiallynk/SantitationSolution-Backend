@@ -441,6 +441,21 @@ const escapeHtml = (value) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
+/** When radio N is checked, stars 1..N must look selected (gold). Pure CSS :has fallback if inline script is blocked. */
+const buildPublicFeedbackRatingHasCss = (idPrefix) => {
+  const blocks = [];
+  for (let selected = 1; selected <= 5; selected += 1) {
+    const selectors = [];
+    for (let star = 1; star <= selected; star += 1) {
+      selectors.push(
+        `.rating-stars:has(#${idPrefix}-${selected}:checked) label[for="${idPrefix}-${star}"]`
+      );
+    }
+    blocks.push(`${selectors.join(',\n')} {\n      color: #f59e0b;\n    }`);
+  }
+  return `@supports selector(:has(*)) {\n  ${blocks.join('\n  ')}\n}\n`;
+};
+
 const buildPublicFeedbackPage = ({
   toilet,
   facility,
@@ -601,10 +616,13 @@ const buildPublicFeedbackPage = ({
       margin: 0;
       display: inline-block;
     }
-    .rating-stars label:hover,
-    .rating-stars input:checked + label {
+    /* Filled state: JS adds .is-filled; :has rules below cover the same when CSP blocks script. */
+    .rating-stars label.is-filled {
       color: #f59e0b;
     }
+    ${buildPublicFeedbackRatingHasCss('experience-rating')}
+    ${buildPublicFeedbackRatingHasCss('cleanliness-rating')}
+    ${buildPublicFeedbackRatingHasCss('air-rating')}
     .rating-hint {
       font-size: 12px;
       color: var(--muted);
@@ -728,6 +746,55 @@ const buildPublicFeedbackPage = ({
       </div>
     </div>
   </div>
+  <script>
+    (function () {
+      function starValueFromLabel(label) {
+        var id = label.getAttribute('for');
+        if (!id) return 0;
+        var inp = document.getElementById(id);
+        if (!inp || !inp.value) return 0;
+        var v = parseInt(String(inp.value), 10);
+        return v >= 1 && v <= 5 ? v : 0;
+      }
+      function applyStarDisplay(group, n) {
+        var labels = group.querySelectorAll('label');
+        var v = Math.max(0, Math.min(5, n || 0));
+        labels.forEach(function (lab, idx) {
+          lab.classList.toggle('is-filled', idx < v);
+        });
+      }
+      function syncFromChecked(group) {
+        var checked = group.querySelector('input[type="radio"]:checked');
+        applyStarDisplay(group, checked ? parseInt(String(checked.value), 10) : 0);
+      }
+      function wireStarGroups() {
+        document.querySelectorAll('.rating-stars').forEach(function (group) {
+          if (group.getAttribute('data-ssms-stars-wired') === '1') return;
+          group.setAttribute('data-ssms-stars-wired', '1');
+          syncFromChecked(group);
+          group.addEventListener('change', function () {
+            syncFromChecked(group);
+          });
+          group.addEventListener('input', function () {
+            syncFromChecked(group);
+          });
+          group.querySelectorAll('label').forEach(function (label) {
+            label.addEventListener('mouseenter', function () {
+              applyStarDisplay(group, starValueFromLabel(label));
+            });
+          });
+          group.addEventListener('mouseleave', function () {
+            syncFromChecked(group);
+          });
+        });
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', wireStarGroups);
+      } else {
+        wireStarGroups();
+      }
+    })();
+  <\/script>
 </body>
 </html>`;
 };
