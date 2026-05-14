@@ -13,10 +13,12 @@ const {
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
 const { validateTaskReassign } = require('../tasks/task.validator');
+const { supervisorApiRateLimit } = require('../../core/security/rateLimit');
 
 const router = express.Router();
 
 router.use('/supervisor', protect);
+router.use('/supervisor', supervisorApiRateLimit);
 router.use(
   '/supervisor',
   requireRoles('supervisor'),

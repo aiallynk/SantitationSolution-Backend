@@ -159,6 +159,7 @@ const runtimeConfig = Object.freeze({
   security: {
     rateLimitWindowMs: asNumber(rawEnv.RATE_LIMIT_WINDOW_MS, 60_000, { min: 1_000 }),
     rateLimitMax: asNumber(rawEnv.RATE_LIMIT_MAX, 300, { min: 10 }),
+    supervisorRateLimitMax: asNumber(rawEnv.SUPERVISOR_RATE_LIMIT_MAX, 2000, { min: 50 }),
     ingestRateLimitMax: defaults.app.ingestRateLimitMax,
   },
   server: {
