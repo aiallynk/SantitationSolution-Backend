@@ -1,5 +1,6 @@
 const express = require('express');
 const supervisorController = require('./supervisor.controller');
+const taskController = require('../tasks/task.controller');
 const {
   protect,
   requireAction,
@@ -10,6 +11,8 @@ const {
   requireSurface,
 } = require('../../core/middleware/auth');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
+const { validate } = require('../../core/middleware/validate');
+const { validateTaskReassign } = require('../tasks/task.validator');
 
 const router = express.Router();
 
@@ -57,6 +60,13 @@ router.get(
 );
 
 router.get(
+  '/supervisor/live-map',
+  requireRouteKey(RouteKeys.SUPERVISOR_LIVE_LOCATION),
+  requirePermissions('worker.location.read'),
+  supervisorController.getLiveMap
+);
+
+router.get(
   '/supervisor/checkins',
   requireRouteKey(RouteKeys.SUPERVISOR_CHECKIN_CHECKOUT),
   requirePermissions('worker.checkin.read'),
@@ -75,6 +85,15 @@ router.get(
   requireRouteKey(RouteKeys.SUPERVISOR_WORK_PROGRESS),
   requirePermissions('worker.task_progress.read'),
   supervisorController.getWorkProgress
+);
+
+router.post(
+  '/supervisor/tasks/:id/reassign',
+  requireRouteKey(RouteKeys.SUPERVISOR_WORK_PROGRESS),
+  requirePermissions('worker.task_progress.read'),
+  requireAction('task.reassign'),
+  validate(validateTaskReassign),
+  taskController.postTaskReassign
 );
 
 router.get(

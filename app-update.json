@@ -1,8 +1,8 @@
 {
-    "latestVersion":  "1.0.15",
+    "latestVersion":  "1.0.16",
     "minimumSupportedVersion":  "1.0.14",
     "apkUrl":  "",
     "apkFileName":  "",
     "releaseNotes":  "- Improved performance and stability\n- Bug fixes and minor improvements",
-    "sha256":  "0577b8935d1d3977cf1494fb35017bb45f693a0c552def9c85ba25ecf55ed4d9"
+    "sha256":  "bc167bf172c2d0f79bc76e0e258b415b4b1e65f389097c7a8cbfdbfe391f334d"
 }

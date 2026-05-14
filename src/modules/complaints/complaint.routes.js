@@ -12,6 +12,7 @@ const { validate } = require('../../core/middleware/validate');
 const {
   validateComplaintListQuery,
   validateComplaintCreate,
+  validateComplaintUpdate,
   validateComplaintAssign,
   validateComplaintDispatch,
 } = require('./complaint.validator');
@@ -64,6 +65,13 @@ router.post(
   requireAction('task.execute'),
   validate(validateComplaintCreate),
   complaintController.postComplaint
+);
+router.patch(
+  '/complaints/:id',
+  requirePermissions('task.manage'),
+  requireAction('task.manage'),
+  validate(validateComplaintUpdate),
+  complaintController.patchComplaint
 );
 router.patch(
   '/complaints/:id/assign',

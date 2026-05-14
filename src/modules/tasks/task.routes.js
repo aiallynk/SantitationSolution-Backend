@@ -11,7 +11,7 @@ const {
 } = require('../../core/middleware/auth');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
-const { validateTaskCreate } = require('./task.validator');
+const { validateTaskCreate, validateTaskReassign } = require('./task.validator');
 
 const router = express.Router();
 
@@ -49,6 +49,12 @@ router.get(
   requireAnyPermissions('task.manage', 'inspection.create', 'dashboard.read'),
   taskController.getTaskById
 );
+router.post(
+  '/tasks/:id/accept',
+  requireAnyPermissions('inspection.create', 'task.manage'),
+  requireAction('task.execute'),
+  taskController.postTaskAccept
+);
 router.patch(
   '/tasks/:id/start',
   requireAnyPermissions('inspection.create', 'task.manage'),
@@ -60,6 +66,13 @@ router.patch(
   requireAnyPermissions('inspection.create', 'task.manage'),
   requireAction('task.execute'),
   taskController.patchTaskComplete
+);
+router.post(
+  '/tasks/:id/reassign',
+  requirePermissions('task.manage'),
+  requireAction('task.reassign'),
+  validate(validateTaskReassign),
+  taskController.postTaskReassign
 );
 
 module.exports = router;

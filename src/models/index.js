@@ -279,20 +279,106 @@ const InspectionTask = sequelize.define(
     tenant_id: { type: DataTypes.UUID, allowNull: false },
     facility_id: { type: DataTypes.UUID, allowNull: false },
     toilet_unit_id: { type: DataTypes.UUID, allowNull: true },
-    assigned_to_user_id: { type: DataTypes.UUID, allowNull: false },
+    complaint_id: { type: DataTypes.UUID, allowNull: true },
+    assigned_to_user_id: { type: DataTypes.UUID, allowNull: true },
+    assigned_by_user_id: { type: DataTypes.UUID, allowNull: true },
     task_type: { type: DataTypes.STRING(50), allowNull: false },
+    title: { type: DataTypes.STRING(220), allowNull: true },
+    description: { type: DataTypes.STRING(1200), allowNull: true },
+    priority: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'medium' },
     scheduled_at: { type: DataTypes.DATE, allowNull: false },
     sla_minutes: { type: DataTypes.INTEGER, allowNull: true },
     status: {
-      type: DataTypes.ENUM('pending', 'in_progress', 'completed', 'cancelled', 'overdue'),
+      type: DataTypes.ENUM(
+        'unassigned',
+        'assigned',
+        'accepted',
+        'pending',
+        'in_progress',
+        'completed',
+        'cancelled',
+        'overdue'
+      ),
       allowNull: false,
       defaultValue: 'pending',
     },
+    latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    due_at: { type: DataTypes.DATE, allowNull: true },
+    accepted_at: { type: DataTypes.DATE, allowNull: true },
     started_at: { type: DataTypes.DATE, allowNull: true },
     completed_at: { type: DataTypes.DATE, allowNull: true },
+    cancelled_at: { type: DataTypes.DATE, allowNull: true },
+    assignment_source: { type: DataTypes.STRING(40), allowNull: true },
+    assignment_reason: { type: DataTypes.STRING(600), allowNull: true },
+    distance_km: { type: DataTypes.DECIMAL(10, 3), allowNull: true },
+    worker_location_snapshot: { type: DataTypes.JSONB, allowNull: true },
+    critical_detected_at: { type: DataTypes.DATE, allowNull: true },
+    reminder_state: { type: DataTypes.JSONB, allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'inspection_tasks', timestamps: false }
+);
+
+const WorkerHeartbeat = sequelize.define(
+  'WorkerHeartbeat',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    worker_id: { type: DataTypes.UUID, allowNull: false },
+    latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: false },
+    longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: false },
+    accuracy: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+    speed: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+    heading: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+    mobile_battery_percentage: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+    is_charging: { type: DataTypes.BOOLEAN, allowNull: true },
+    source: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'mobile_app' },
+    captured_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'worker_heartbeats', timestamps: false }
+);
+
+const TaskAssignmentLog = sequelize.define(
+  'TaskAssignmentLog',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    task_id: { type: DataTypes.UUID, allowNull: false },
+    complaint_id: { type: DataTypes.UUID, allowNull: true },
+    toilet_unit_id: { type: DataTypes.UUID, allowNull: true },
+    worker_id: { type: DataTypes.UUID, allowNull: true },
+    supervisor_user_id: { type: DataTypes.UUID, allowNull: true },
+    assigned_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    assignment_source: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'automation' },
+    reason: { type: DataTypes.STRING(800), allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'created' },
+    distance_km: { type: DataTypes.DECIMAL(10, 3), allowNull: true },
+    worker_location_snapshot: { type: DataTypes.JSONB, allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'task_assignment_logs', timestamps: false }
+);
+
+const TaskReminderLog = sequelize.define(
+  'TaskReminderLog',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    task_id: { type: DataTypes.UUID, allowNull: false },
+    worker_id: { type: DataTypes.UUID, allowNull: true },
+    reminder_type: { type: DataTypes.STRING(60), allowNull: false },
+    sent_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'sent' },
+    channel: { type: DataTypes.STRING(60), allowNull: false, defaultValue: 'in_app' },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'task_reminder_logs', timestamps: false }
 );
 
 const Inspection = sequelize.define(
@@ -1075,8 +1161,11 @@ PlatformUser.hasMany(WorkerAssignment, { foreignKey: 'updated_by_user_id', as: '
 WorkerAssignment.belongsTo(PlatformUser, { foreignKey: 'updated_by_user_id', as: 'updatedBy' });
 
 InspectionTask.belongsTo(PlatformUser, { foreignKey: 'assigned_to_user_id', as: 'assignee' });
+InspectionTask.belongsTo(PlatformUser, { foreignKey: 'assigned_by_user_id', as: 'assignedBy' });
 InspectionTask.belongsTo(Facility, { foreignKey: 'facility_id' });
 InspectionTask.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id' });
+InspectionTask.belongsTo(Complaint, { foreignKey: 'complaint_id', as: 'complaint' });
+Complaint.hasMany(InspectionTask, { foreignKey: 'complaint_id', as: 'tasks' });
 Inspection.belongsTo(InspectionTask, { foreignKey: 'task_id' });
 Inspection.belongsTo(Facility, { foreignKey: 'facility_id' });
 Inspection.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id' });
@@ -1185,6 +1274,27 @@ NotificationDeliveryLog.belongsTo(NotificationDeviceToken, {
   foreignKey: 'device_token_id',
   as: 'deviceToken',
 });
+WorkerHeartbeat.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(WorkerHeartbeat, { foreignKey: 'tenant_id', as: 'workerHeartbeats' });
+WorkerHeartbeat.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
+PlatformUser.hasMany(WorkerHeartbeat, { foreignKey: 'worker_id', as: 'heartbeats' });
+
+TaskAssignmentLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(TaskAssignmentLog, { foreignKey: 'tenant_id', as: 'taskAssignmentLogs' });
+TaskAssignmentLog.belongsTo(InspectionTask, { foreignKey: 'task_id', as: 'task' });
+InspectionTask.hasMany(TaskAssignmentLog, { foreignKey: 'task_id', as: 'assignmentLogs' });
+TaskAssignmentLog.belongsTo(Complaint, { foreignKey: 'complaint_id', as: 'complaint' });
+Complaint.hasMany(TaskAssignmentLog, { foreignKey: 'complaint_id', as: 'assignmentLogs' });
+TaskAssignmentLog.belongsTo(ToiletUnit, { foreignKey: 'toilet_unit_id', as: 'toiletUnit' });
+TaskAssignmentLog.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
+TaskAssignmentLog.belongsTo(PlatformUser, { foreignKey: 'supervisor_user_id', as: 'supervisor' });
+TaskAssignmentLog.belongsTo(PlatformUser, { foreignKey: 'assigned_by_user_id', as: 'assignedBy' });
+
+TaskReminderLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(TaskReminderLog, { foreignKey: 'tenant_id', as: 'taskReminderLogs' });
+TaskReminderLog.belongsTo(InspectionTask, { foreignKey: 'task_id', as: 'task' });
+InspectionTask.hasMany(TaskReminderLog, { foreignKey: 'task_id', as: 'reminderLogs' });
+TaskReminderLog.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
 AuditLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.hasMany(AuditLog, { foreignKey: 'tenant_id', as: 'auditLogs' });
 AuditLog.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
@@ -1219,6 +1329,9 @@ module.exports = {
   ToiletUnit,
   ToiletQrCode,
   InspectionTask,
+  WorkerHeartbeat,
+  TaskAssignmentLog,
+  TaskReminderLog,
   Inspection,
   InspectionMedia,
   AiAnalysisResult,

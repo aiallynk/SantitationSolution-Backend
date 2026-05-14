@@ -63,6 +63,18 @@ const patchTaskStart = async (req, res, next) => {
   }
 };
 
+const postTaskAccept = async (req, res, next) => {
+  try {
+    const task = await taskService.acceptTask(req);
+    return sendSuccess(res, {
+      message: 'Task accepted successfully',
+      data: task,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const patchTaskComplete = async (req, res, next) => {
   try {
     const task = await taskService.completeTask(req);
@@ -75,11 +87,25 @@ const patchTaskComplete = async (req, res, next) => {
   }
 };
 
+const postTaskReassign = async (req, res, next) => {
+  try {
+    const task = await taskService.reassignTask(req);
+    return sendSuccess(res, {
+      message: 'Task reassigned successfully',
+      data: task,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   getTasks,
   getTaskById,
   getMyTasks,
   postTask,
+  postTaskAccept,
   patchTaskStart,
   patchTaskComplete,
+  postTaskReassign,
 };

@@ -1,7 +1,11 @@
-const { InspectionTask, Facility, ToiletUnit } = require('../../models');
+const { InspectionTask, Facility, ToiletUnit, PlatformUser, TaskAssignmentLog } = require('../../models');
 const AppError = require('../../core/errors/AppError');
 const { normalizePagination } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
+const { logger } = require('../../core/logging/logger');
+const notificationService = require('../notifications/notification.service');
+const { NotificationAudienceKinds, NotificationPriorities, NotificationTypes } = require('../notifications/notification.constants');
+const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const {
   buildAccessContextFromUser,
   applyScopeToQuery,
@@ -25,13 +29,34 @@ const mapTask = (task) => ({
   tenantId: task.tenant_id,
   facilityId: task.facility_id,
   toiletUnitId: task.toilet_unit_id,
+  complaintId: task.complaint_id || null,
   assignedToUserId: task.assigned_to_user_id,
+  assignedByUserId: task.assigned_by_user_id || null,
   taskType: task.task_type,
+  title: task.title || null,
+  description: task.description || null,
+  priority: task.priority || 'medium',
   scheduledAt: task.scheduled_at,
+  dueAt: task.due_at || null,
   slaMinutes: task.sla_minutes,
   status: task.status,
+  acceptedAt: task.accepted_at || null,
   startedAt: task.started_at,
   completedAt: task.completed_at,
+  cancelledAt: task.cancelled_at || null,
+  assignmentSource: task.assignment_source || null,
+  assignmentReason: task.assignment_reason || null,
+  distanceKm: task.distance_km || null,
+  latitude: task.latitude || null,
+  longitude: task.longitude || null,
+  assignee: task.assignee
+    ? {
+        id: task.assignee.id,
+        fullName: task.assignee.full_name,
+        email: task.assignee.email,
+        employeeCode: task.assignee.employee_code || null,
+      }
+    : null,
   facility: task.Facility
     ? {
         id: task.Facility.id,
@@ -76,7 +101,16 @@ const listTasks = async (req) => {
 
   const { rows, count } = await InspectionTask.findAndCountAll({
     where,
-    include: [{ model: Facility }, { model: ToiletUnit }],
+    include: [
+      { model: Facility },
+      { model: ToiletUnit },
+      {
+        model: PlatformUser,
+        as: 'assignee',
+        attributes: ['id', 'full_name', 'email', 'employee_code'],
+        required: false,
+      },
+    ],
     order: [['scheduled_at', 'DESC']],
     limit,
     offset,
@@ -95,7 +129,16 @@ const listTasks = async (req) => {
 
 const getTaskById = async (req) => {
   const task = await InspectionTask.findByPk(req.params.id, {
-    include: [{ model: Facility }, { model: ToiletUnit }],
+    include: [
+      { model: Facility },
+      { model: ToiletUnit },
+      {
+        model: PlatformUser,
+        as: 'assignee',
+        attributes: ['id', 'full_name', 'email', 'employee_code'],
+        required: false,
+      },
+    ],
   });
   if (!task) {
     throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
@@ -128,7 +171,16 @@ const getMyTasks = async (req) => {
 
   const { rows, count } = await InspectionTask.findAndCountAll({
     where,
-    include: [{ model: Facility }, { model: ToiletUnit }],
+    include: [
+      { model: Facility },
+      { model: ToiletUnit },
+      {
+        model: PlatformUser,
+        as: 'assignee',
+        attributes: ['id', 'full_name', 'email', 'employee_code'],
+        required: false,
+      },
+    ],
     order: [['scheduled_at', 'ASC']],
     limit,
     offset,
@@ -177,7 +229,16 @@ const createTask = async (req) => {
   });
 
   const task = await InspectionTask.findByPk(row.id, {
-    include: [{ model: Facility }, { model: ToiletUnit }],
+    include: [
+      { model: Facility },
+      { model: ToiletUnit },
+      {
+        model: PlatformUser,
+        as: 'assignee',
+        attributes: ['id', 'full_name', 'email', 'employee_code'],
+        required: false,
+      },
+    ],
   });
 
   await createAuditLog({
@@ -196,6 +257,65 @@ const createTask = async (req) => {
   });
 
   return mapTask(task);
+};
+
+const emitTaskUpdated = (task) => {
+  eventBus.emit(EVENTS.TASK_UPDATED, {
+    tenantId: task.tenant_id,
+    taskId: task.id,
+    status: task.status,
+    assignedToUserId: task.assigned_to_user_id || null,
+    complaintId: task.complaint_id || null,
+  });
+};
+
+const ensureTaskVisible = (req, task) => {
+  if (!req.user.isSuperAdmin && task.tenant_id !== req.user.tenantId) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, task.facility_id || null)) {
+    throw new AppError('Task out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+};
+
+const acceptTask = async (req) => {
+  const task = await InspectionTask.findByPk(req.params.id);
+  if (!task) {
+    throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
+  }
+  ensureTaskVisible(req, task);
+  if (task.assigned_to_user_id !== req.user.id && !req.user.isSuperAdmin) {
+    throw new AppError('Task can only be accepted by assigned user', 403, {
+      code: 'TASK_NOT_ASSIGNEE',
+    });
+  }
+  if (['completed', 'cancelled'].includes(task.status)) {
+    throw new AppError('Completed or cancelled task cannot be accepted', 409, {
+      code: 'TASK_TERMINAL',
+    });
+  }
+  if (!task.assigned_to_user_id) {
+    throw new AppError('Unassigned task must be assigned before it can be accepted', 409, {
+      code: 'TASK_UNASSIGNED',
+    });
+  }
+
+  await task.update({
+    status: 'accepted',
+    accepted_at: task.accepted_at || new Date(),
+    updated_at: new Date(),
+  });
+
+  await createAuditLog({
+    req,
+    tenantId: task.tenant_id,
+    action: 'task.accept',
+    entityType: 'inspection_task',
+    entityId: task.id,
+  });
+  emitTaskUpdated(task);
+
+  return getTaskById(req);
 };
 
 const startTask = async (req) => {
@@ -217,6 +337,7 @@ const startTask = async (req) => {
 
   await task.update({
     status: 'in_progress',
+    accepted_at: task.accepted_at || new Date(),
     started_at: task.started_at || new Date(),
     updated_at: new Date(),
   });
@@ -228,6 +349,7 @@ const startTask = async (req) => {
     entityType: 'inspection_task',
     entityId: task.id,
   });
+  emitTaskUpdated(task);
 
   return mapTask(task);
 };
@@ -262,8 +384,119 @@ const completeTask = async (req) => {
     entityType: 'inspection_task',
     entityId: task.id,
   });
+  emitTaskUpdated(task);
 
   return mapTask(task);
+};
+
+const notifyReassignedWorker = async ({ task, req }) => {
+  if (!task.assigned_to_user_id) return;
+  try {
+    await notificationService.publishNotification({
+      recipients: [task.assigned_to_user_id],
+      eventType: 'task.reassign',
+      notificationType: NotificationTypes.TASK,
+      priority: task.priority === 'critical' ? NotificationPriorities.CRITICAL : NotificationPriorities.HIGH,
+      title: task.priority === 'critical' ? 'Urgent task reassigned to you' : 'Task reassigned to you',
+      body: task.title || 'A sanitation task has been assigned to you.',
+      shortBody: task.title || 'Task assigned',
+      entityType: 'inspection_task',
+      entityId: task.id,
+      route: `/ops/tasks/${task.id}`,
+      iconKey: 'task',
+      severity: task.priority || 'info',
+      tenantId: task.tenant_id,
+      facilityId: task.facility_id || null,
+      audienceKind: NotificationAudienceKinds.TARGETED_LIST,
+      createdByUserId: req.user.id,
+      dedupeKey: `task-reassign:${task.id}:${task.assigned_to_user_id}:${Math.floor(Date.now() / 60000)}`,
+      metadata: { source: 'manual_reassign' },
+      payload: {
+        taskId: task.id,
+        complaintId: task.complaint_id || null,
+        priority: task.priority,
+        dueAt: task.due_at || null,
+      },
+    });
+  } catch (error) {
+    logger.warn('Failed to notify reassigned worker', {
+      taskId: task.id,
+      workerId: task.assigned_to_user_id,
+      error: error.message,
+    });
+  }
+};
+
+const reassignTask = async (req) => {
+  const task = await InspectionTask.findByPk(req.params.id);
+  if (!task) {
+    throw new AppError('Task not found', 404, { code: 'TASK_NOT_FOUND' });
+  }
+  ensureTaskVisible(req, task);
+  if (['completed', 'cancelled'].includes(task.status)) {
+    throw new AppError('Completed or cancelled task cannot be reassigned', 409, {
+      code: 'TASK_TERMINAL',
+    });
+  }
+
+  const assignedToUserId = req.body.assignedToUserId || null;
+  let assignee = null;
+  if (assignedToUserId) {
+    assignee = await PlatformUser.findByPk(assignedToUserId, {
+      attributes: ['id', 'tenant_id', 'status'],
+    });
+    if (!assignee || assignee.status !== 'active') {
+      throw new AppError('assignedToUserId is invalid', 400, {
+        code: 'ASSIGNEE_NOT_FOUND',
+      });
+    }
+    if (!req.user.isSuperAdmin && assignee.tenant_id !== req.user.tenantId) {
+      throw new AppError('assignedToUserId is out of tenant scope', 403, {
+        code: 'SCOPE_FORBIDDEN',
+      });
+    }
+  }
+
+  const nextStatus = assignedToUserId ? 'assigned' : 'unassigned';
+  await task.update({
+    assigned_to_user_id: assignedToUserId,
+    assigned_by_user_id: req.user.id,
+    status: nextStatus,
+    accepted_at: null,
+    started_at: nextStatus === 'unassigned' ? null : task.started_at,
+    assignment_source: assignedToUserId ? 'manual_reassign' : 'manual_unassign',
+    assignment_reason: req.body.reason || task.assignment_reason || null,
+    updated_at: new Date(),
+  });
+
+  await TaskAssignmentLog.create({
+    tenant_id: task.tenant_id,
+    task_id: task.id,
+    complaint_id: task.complaint_id || null,
+    toilet_unit_id: task.toilet_unit_id || null,
+    worker_id: assignedToUserId,
+    supervisor_user_id: req.user.id,
+    assigned_by_user_id: req.user.id,
+    assignment_source: assignedToUserId ? 'manual_reassign' : 'manual_unassign',
+    reason: req.body.reason || 'Manual task assignment update',
+    status: nextStatus,
+  });
+
+  await createAuditLog({
+    req,
+    tenantId: task.tenant_id,
+    action: 'task.reassign',
+    entityType: 'inspection_task',
+    entityId: task.id,
+    details: {
+      assignedToUserId,
+      reason: req.body.reason || null,
+    },
+  });
+
+  await notifyReassignedWorker({ task, req });
+  emitTaskUpdated(task);
+  return getTaskById(req);
 };
 
 module.exports = {
@@ -271,6 +504,8 @@ module.exports = {
   getTaskById,
   getMyTasks,
   createTask,
+  acceptTask,
   startTask,
   completeTask,
+  reassignTask,
 };

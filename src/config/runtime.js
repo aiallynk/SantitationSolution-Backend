@@ -326,6 +326,97 @@ const runtimeConfig = Object.freeze({
     h2sPpmThreshold: defaults.alerts.h2sPpmThreshold,
     methanePpmThreshold: defaults.alerts.methanePpmThreshold,
   },
+  automation: {
+    criticalComplaintValues: asText(
+      rawEnv.CRITICAL_COMPLAINT_VALUES,
+      defaults.automation.criticalComplaintValues.join(',')
+    )
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+    repeatedComplaintWindowMinutes: asNumber(
+      rawEnv.CRITICAL_REPEATED_COMPLAINT_WINDOW_MINUTES,
+      defaults.automation.repeatedComplaintWindowMinutes,
+      { min: 1 }
+    ),
+    repeatedComplaintThreshold: asNumber(
+      rawEnv.CRITICAL_REPEATED_COMPLAINT_THRESHOLD,
+      defaults.automation.repeatedComplaintThreshold,
+      { min: 2 }
+    ),
+    workerLocationFreshnessMinutes: asNumber(
+      rawEnv.WORKER_LOCATION_FRESHNESS_MINUTES,
+      defaults.automation.workerLocationFreshnessMinutes,
+      { min: 1 }
+    ),
+    maxActiveTasksPerWorker: asNumber(
+      rawEnv.WORKER_MAX_ACTIVE_TASKS,
+      defaults.automation.maxActiveTasksPerWorker,
+      { min: 1 }
+    ),
+    lowMobileBatteryThreshold: asNumber(
+      rawEnv.WORKER_LOW_BATTERY_THRESHOLD,
+      defaults.automation.lowMobileBatteryThreshold,
+      { min: 0, max: 100 }
+    ),
+    assignmentRadiusKm: asNumber(
+      rawEnv.WORKER_ASSIGNMENT_RADIUS_KM,
+      defaults.automation.assignmentRadiusKm,
+      { min: 0 }
+    ),
+    acceptReminderMinutes: asNumber(
+      rawEnv.TASK_ACCEPT_REMINDER_MINUTES,
+      defaults.automation.acceptReminderMinutes,
+      { min: 1 }
+    ),
+    startReminderMinutes: asNumber(
+      rawEnv.TASK_START_REMINDER_MINUTES,
+      defaults.automation.startReminderMinutes,
+      { min: 1 }
+    ),
+    slaWarningMinutes: asNumber(
+      rawEnv.TASK_SLA_WARNING_MINUTES,
+      defaults.automation.slaWarningMinutes,
+      { min: 1 }
+    ),
+    reminderJobIntervalMs: asNumber(
+      rawEnv.TASK_REMINDER_JOB_INTERVAL_MS,
+      defaults.automation.reminderJobIntervalMs,
+      { min: 10_000 }
+    ),
+    offlineEscalationMinutes: asNumber(
+      rawEnv.WORKER_OFFLINE_ESCALATION_MINUTES,
+      defaults.automation.offlineEscalationMinutes,
+      { min: 1 }
+    ),
+    mapPollingIntervalMs: asNumber(
+      rawEnv.SUPERVISOR_MAP_POLLING_INTERVAL_MS,
+      defaults.automation.mapPollingIntervalMs,
+      { min: 5_000 }
+    ),
+    slaMinutesByPriority: {
+      critical: asNumber(
+        rawEnv.TASK_SLA_CRITICAL_MINUTES,
+        defaults.automation.slaMinutesByPriority.critical,
+        { min: 1 }
+      ),
+      high: asNumber(
+        rawEnv.TASK_SLA_HIGH_MINUTES,
+        defaults.automation.slaMinutesByPriority.high,
+        { min: 1 }
+      ),
+      medium: asNumber(
+        rawEnv.TASK_SLA_MEDIUM_MINUTES,
+        defaults.automation.slaMinutesByPriority.medium,
+        { min: 1 }
+      ),
+      low: asNumber(
+        rawEnv.TASK_SLA_LOW_MINUTES,
+        defaults.automation.slaMinutesByPriority.low,
+        { min: 1 }
+      ),
+    },
+  },
   deprecated: {
     activeKeys: deprecatedEnvKeys.filter((key) => rawEnv[key] !== undefined),
   },

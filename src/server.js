@@ -32,6 +32,10 @@ const {
   startImageSessionReconciler,
   stopImageSessionReconciler,
 } = require('./modules/inspections/imageSessionReconciler.service');
+const {
+  startReminderScheduler,
+  stopReminderScheduler,
+} = require('./modules/automation/reminder.service');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -377,6 +381,7 @@ const bootstrap = async () => {
 
     startAnalysisJobWatchdog();
     startImageSessionReconciler();
+    startReminderScheduler();
     startTempFileJanitor();
 
     server = await startHttpServer();
@@ -429,6 +434,7 @@ const gracefulShutdown = async (signal, exitCode = 0) => {
     await closeLiveRedisBridge();
     stopAnalysisJobWatchdog();
     stopImageSessionReconciler();
+    stopReminderScheduler();
     stopTempFileJanitor();
     await closeQueues();
     await sequelize.close();

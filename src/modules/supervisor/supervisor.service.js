@@ -2,6 +2,7 @@ const { Op } = require('sequelize');
 const {
   AiAnalysisResult,
   Alert,
+  Complaint,
   Facility,
   Geography,
   Inspection,
@@ -12,14 +13,25 @@ const {
   Role,
   SensorDevice,
   SensorReading,
+  TaskAssignmentLog,
   ToiletUnit,
   UserRole,
   WorkerAssignment,
+  WorkerHeartbeat,
 } = require('../../models');
 const AppError = require('../../core/errors/AppError');
+const { runtimeConfig } = require('../../config/runtime');
 const { normalizePagination } = require('../../utils/validators');
 const { resolveDateRange } = require('../../utils/dateRange');
 const { createAuditLog } = require('../audit/audit.service');
+const { resolveMediaUrl } = require('../media/mediaUrl.service');
+const {
+  ACTIVE_TASK_STATUSES,
+  CRITICAL_COMPLAINT_TASK_TYPE,
+  getCriticalComplaintValueSet,
+  normalizeToken,
+  toNumberOrNull,
+} = require('../automation/automation.constants');
 
 const ROLE_CODES = {
   FIELD_WORKER: 'field_worker',
@@ -660,18 +672,14 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
   );
   const activeWorkerIds = [...workersById.keys()];
 
-  const facilityWhere = tenantWhere(req);
-  if (scope.facilityIds.length > 0) {
-    facilityWhere.id = { [Op.in]: scope.facilityIds };
-  } else {
-    facilityWhere.id = '__no_facilities__';
-  }
-
-  const facilityRows = await Facility.findAll({
-    where: facilityWhere,
-    attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude', 'geography_id', 'zone_geography_id', 'ward_geography_id'],
-    raw: true,
-  });
+  const facilityRows =
+    scope.facilityIds.length === 0
+      ? []
+      : await Facility.findAll({
+          where: tenantWhere(req, { id: { [Op.in]: scope.facilityIds } }),
+          attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude', 'geography_id', 'zone_geography_id', 'ward_geography_id'],
+          raw: true,
+        });
   const facilityById = new Map(facilityRows.map((facility) => [String(facility.id), facility]));
 
   const taskWhere = withDateField(
@@ -888,6 +896,25 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
     }
     setLatestLocation(worker, locationPoint);
   }
+
+  const presignCache = new Map();
+  const resolveEvidencePhotoUrl = async (raw) => {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) return null;
+    try {
+      const resolved = await resolveMediaUrl({ fileUrl: trimmed }, { cache: presignCache });
+      return resolved && String(resolved).trim() ? String(resolved).trim() : null;
+    } catch {
+      return trimmed;
+    }
+  };
+  const cleanlinessRows = [...workersById.values()].flatMap((worker) => worker.cleanliness || []);
+  await Promise.all(
+    cleanlinessRows.map(async (entry) => {
+      entry.beforePhotoUrl = await resolveEvidencePhotoUrl(entry.beforePhotoUrl);
+      entry.afterPhotoUrl = await resolveEvidencePhotoUrl(entry.afterPhotoUrl);
+    }),
+  );
 
   const facilityIdsForDevices = uniqueIds(
     [...workersById.values()].flatMap((worker) => [...worker.facilityIds.values()])
@@ -1276,6 +1303,503 @@ const getLiveLocations = async (req) => {
   return paginateArray(rows, req.query);
 };
 
+const ageMinutesFrom = (value) => {
+  const timestamp = toTimestamp(value);
+  if (timestamp === null) return null;
+  return Math.max(0, Math.round((Date.now() - timestamp) / 60000));
+};
+
+const resolveTaskDueAt = (task) => {
+  if (task.due_at) return toIsoOrNull(task.due_at);
+  if (!task.scheduled_at || !task.sla_minutes) return null;
+  return toIsoOrNull(new Date(new Date(task.scheduled_at).getTime() + Number(task.sla_minutes) * 60000));
+};
+
+const mapTaskStatusForMap = (status) => {
+  const normalized = String(status || '').toLowerCase();
+  if (normalized === 'assigned') return 'Assigned';
+  if (normalized === 'accepted') return 'Accepted';
+  if (normalized === 'unassigned') return 'Unassigned';
+  return mapTaskStatus(status);
+};
+
+const isCriticalComplaintPlain = (complaint = {}) => {
+  const criticalValues = getCriticalComplaintValueSet();
+  return ['priority', 'status', 'complaint_type']
+    .map((key) => complaint[key])
+    .some((value) => {
+      const raw = String(value || '').trim().toLowerCase();
+      return raw && (criticalValues.has(raw) || criticalValues.has(normalizeToken(raw)));
+    });
+};
+
+const latestHeartbeatByWorker = async ({ tenantId, workerIds }) => {
+  if (workerIds.length === 0) return new Map();
+  const rows = await WorkerHeartbeat.findAll({
+    where: {
+      tenant_id: tenantId,
+      worker_id: { [Op.in]: workerIds },
+    },
+    order: [
+      ['worker_id', 'ASC'],
+      ['captured_at', 'DESC'],
+      ['created_at', 'DESC'],
+    ],
+    raw: true,
+  });
+  const latest = new Map();
+  for (const row of rows) {
+    const key = String(row.worker_id || '');
+    if (key && !latest.has(key)) latest.set(key, row);
+  }
+  return latest;
+};
+
+const activeTaskCountByWorker = async ({ tenantId, workerIds }) => {
+  if (workerIds.length === 0) return new Map();
+  const rows = await InspectionTask.findAll({
+    where: {
+      tenant_id: tenantId,
+      assigned_to_user_id: { [Op.in]: workerIds },
+      status: { [Op.in]: ACTIVE_TASK_STATUSES },
+    },
+    attributes: ['assigned_to_user_id'],
+    raw: true,
+  });
+  const counts = new Map();
+  rows.forEach((row) => {
+    const key = String(row.assigned_to_user_id || '');
+    if (key) counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  return counts;
+};
+
+const buildDeviceStatusMaps = async (req, { facilityIds = [], toiletUnitIds = [] }) => {
+  const deviceOr = [];
+  if (facilityIds.length > 0) deviceOr.push({ facility_id: { [Op.in]: facilityIds } });
+  if (toiletUnitIds.length > 0) deviceOr.push({ toilet_unit_id: { [Op.in]: toiletUnitIds } });
+  if (deviceOr.length === 0) {
+    return { byToiletId: new Map(), byFacilityId: new Map() };
+  }
+
+  const devices = await SensorDevice.findAll({
+    where: tenantWhere(req, { [Op.or]: deviceOr }),
+    attributes: [
+      'id',
+      'facility_id',
+      'toilet_unit_id',
+      'device_id',
+      'serial_no',
+      'status',
+      'last_seen_at',
+      'metadata',
+    ],
+    raw: true,
+  });
+  const readingRows =
+    devices.length > 0
+      ? await SensorReading.findAll({
+          where: { device_id: { [Op.in]: uniqueIds(devices.map((device) => device.id)) } },
+          attributes: ['device_id', 'timestamp', 'battery_level', 'signal_strength'],
+          order: [['timestamp', 'DESC']],
+          raw: true,
+          limit: Math.max(100, devices.length * 5),
+        })
+      : [];
+
+  const latestReadingByDeviceId = new Map();
+  for (const reading of readingRows) {
+    const key = String(reading.device_id || '');
+    if (key && !latestReadingByDeviceId.has(key)) latestReadingByDeviceId.set(key, reading);
+  }
+
+  const lowBatteryThreshold = Number(runtimeConfig.automation.lowMobileBatteryThreshold || LOW_BATTERY_PERCENT);
+  const mapDevice = (device) => {
+    const reading = latestReadingByDeviceId.get(String(device.id)) || null;
+    const battery = toNumber(
+      reading?.battery_level ?? device?.metadata?.batteryLevel ?? device?.metadata?.battery_percentage,
+      null
+    );
+    const lastSeenAt = toIsoOrNull(reading?.timestamp || device.last_seen_at);
+    return {
+      deviceId: device.device_id || device.serial_no || device.id,
+      status: device.status || 'unknown',
+      batteryPercentage: battery,
+      lastSeenAt,
+      signalStrength: toNumber(reading?.signal_strength, null),
+      isLowBattery: battery !== null && battery < lowBatteryThreshold,
+      isStale: ageMinutesFrom(lastSeenAt) !== null && ageMinutesFrom(lastSeenAt) > 120,
+    };
+  };
+
+  const byToiletId = new Map();
+  const byFacilityId = new Map();
+  for (const device of devices) {
+    const status = mapDevice(device);
+    const toiletKey = String(device.toilet_unit_id || '');
+    const facilityKey = String(device.facility_id || '');
+    if (toiletKey && !byToiletId.has(toiletKey)) byToiletId.set(toiletKey, status);
+    if (facilityKey) {
+      const bucket = byFacilityId.get(facilityKey) || [];
+      bucket.push(status);
+      byFacilityId.set(facilityKey, bucket);
+    }
+  }
+
+  return { byToiletId, byFacilityId };
+};
+
+const resolveDeviceForToilet = (deviceMaps, toiletUnitId, facilityId) => {
+  const toiletDevice = deviceMaps.byToiletId.get(String(toiletUnitId || ''));
+  if (toiletDevice) return toiletDevice;
+  const facilityDevices = deviceMaps.byFacilityId.get(String(facilityId || '')) || [];
+  return facilityDevices[0] || null;
+};
+
+const summarizeSupervisorScopeForMap = (scope = {}) => ({
+  tenantId: scope.tenantId || null,
+  facilityIds: uniqueIds(scope.facilityIds || []),
+  geographyIds: uniqueIds(scope.geographyIds || []),
+  workerIds: uniqueIds(scope.workerIds || []),
+  facilityCount: uniqueIds(scope.facilityIds || []).length,
+  workerCount: uniqueIds(scope.workerIds || []).length,
+});
+
+const mapLocationForTask = (task = {}) => {
+  const lat = toNumberOrNull(task.latitude ?? task.ToiletUnit?.latitude ?? task.Facility?.latitude);
+  const lng = toNumberOrNull(task.longitude ?? task.ToiletUnit?.longitude ?? task.Facility?.longitude);
+  return {
+    latitude: lat,
+    longitude: lng,
+    label: task.ToiletUnit?.location_label || task.Facility?.name || task.Facility?.address_line || null,
+  };
+};
+
+const mapLocationForComplaint = (complaint = {}) => {
+  const lat = toNumberOrNull(complaint.ToiletUnit?.latitude ?? complaint.Facility?.latitude);
+  const lng = toNumberOrNull(complaint.ToiletUnit?.longitude ?? complaint.Facility?.longitude);
+  return {
+    latitude: lat,
+    longitude: lng,
+    label: complaint.ToiletUnit?.location_label || complaint.Facility?.name || complaint.Facility?.address_line || null,
+  };
+};
+
+const getLiveMap = async (req) => {
+  const scope = await resolveSupervisorScope(req);
+  const tenantId = scope.tenantId;
+  const emptyPayload = {
+    scope: summarizeSupervisorScopeForMap(scope),
+    summary: {
+      criticalComplaints: 0,
+      activeTasks: 0,
+      assignedTasks: 0,
+      unassignedTasks: 0,
+      workersOnline: 0,
+      lowBatteryWorkers: 0,
+      staleLocationWorkers: 0,
+      slaBreachedTasks: 0,
+    },
+    workers: [],
+    tasks: [],
+    toilets: [],
+    complaints: [],
+    config: {
+      pollingIntervalMs: runtimeConfig.automation.mapPollingIntervalMs,
+      lowBatteryThreshold: runtimeConfig.automation.lowMobileBatteryThreshold,
+      locationFreshnessMinutes: runtimeConfig.automation.workerLocationFreshnessMinutes,
+    },
+  };
+  if (!tenantId) return emptyPayload;
+
+  const scopedFacilityIds = uniqueIds(scope.facilityIds || []);
+  if (scopedFacilityIds.length === 0 && !req.user?.isSuperAdmin) {
+    return emptyPayload;
+  }
+
+  const facilityFilter =
+    scopedFacilityIds.length > 0 ? { facility_id: { [Op.in]: scopedFacilityIds } } : {};
+  const taskRows = await InspectionTask.findAll({
+    where: tenantWhere(req, {
+      ...facilityFilter,
+      status: { [Op.in]: ACTIVE_TASK_STATUSES },
+      [Op.or]: [
+        { task_type: CRITICAL_COMPLAINT_TASK_TYPE },
+        { priority: 'critical' },
+      ],
+    }),
+    include: [
+      { model: Facility, attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude'], required: false },
+      { model: ToiletUnit, attributes: ['id', 'code', 'location_label', 'latitude', 'longitude'], required: false },
+      { model: Complaint, as: 'complaint', attributes: ['id', 'priority', 'status', 'complaint_type', 'description', 'source_channel', 'created_at'], required: false },
+      {
+        model: PlatformUser,
+        as: 'assignee',
+        attributes: ['id', 'full_name', 'employee_code', 'email'],
+        required: false,
+      },
+    ],
+    order: [
+      ['due_at', 'ASC'],
+      ['scheduled_at', 'ASC'],
+    ],
+    limit: 500,
+  });
+
+  const complaintWhere = tenantWhere(req, {
+    ...facilityFilter,
+    status: { [Op.in]: ['open', 'assigned'] },
+  });
+  const complaintRows = await Complaint.findAll({
+    where: complaintWhere,
+    include: [
+      { model: Facility, attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude'], required: false },
+      { model: ToiletUnit, attributes: ['id', 'code', 'location_label', 'latitude', 'longitude'], required: false },
+      {
+        model: PlatformUser,
+        as: 'assignedTo',
+        attributes: ['id', 'full_name', 'employee_code', 'email'],
+        required: false,
+      },
+    ],
+    order: [['created_at', 'DESC']],
+    limit: 500,
+  });
+
+  const tasksPlain = taskRows.map(normalizePlain);
+  const complaintsPlain = complaintRows.map(normalizePlain).filter(isCriticalComplaintPlain);
+  const taskWorkerIds = uniqueIds(tasksPlain.map((task) => task.assigned_to_user_id));
+  const activeWorkerIds = uniqueIds([...(scope.workerIds || []), ...taskWorkerIds]);
+  const [workerRows, heartbeatMap, taskCountMap, assignmentRows] = await Promise.all([
+    activeWorkerIds.length > 0
+      ? PlatformUser.findAll({
+          where: {
+            id: { [Op.in]: activeWorkerIds },
+            tenant_id: tenantId,
+            status: 'active',
+          },
+          attributes: ['id', 'full_name', 'employee_code', 'email', 'metadata', 'last_login_at', 'updated_at'],
+          raw: true,
+        })
+      : [],
+    latestHeartbeatByWorker({ tenantId, workerIds: activeWorkerIds }),
+    activeTaskCountByWorker({ tenantId, workerIds: activeWorkerIds }),
+    tasksPlain.length > 0
+      ? TaskAssignmentLog.findAll({
+          where: {
+            tenant_id: tenantId,
+            task_id: { [Op.in]: tasksPlain.map((task) => task.id) },
+          },
+          order: [
+            ['task_id', 'ASC'],
+            ['created_at', 'DESC'],
+          ],
+          raw: true,
+        })
+      : [],
+  ]);
+
+  const latestAssignmentByTaskId = new Map();
+  for (const row of assignmentRows) {
+    const key = String(row.task_id || '');
+    if (key && !latestAssignmentByTaskId.has(key)) latestAssignmentByTaskId.set(key, row);
+  }
+
+  const toiletUnitIds = uniqueIds([
+    ...tasksPlain.map((task) => task.toilet_unit_id),
+    ...complaintsPlain.map((complaint) => complaint.toilet_unit_id),
+  ]);
+  const deviceMaps = await buildDeviceStatusMaps(req, {
+    facilityIds: scopedFacilityIds,
+    toiletUnitIds,
+  });
+
+  const lowBatteryThreshold = Number(runtimeConfig.automation.lowMobileBatteryThreshold || LOW_BATTERY_PERCENT);
+  const freshnessMinutes = Number(runtimeConfig.automation.workerLocationFreshnessMinutes || IDLE_THRESHOLD_MINUTES);
+  const workerTasksById = tasksPlain.reduce((acc, task) => {
+    const key = String(task.assigned_to_user_id || '');
+    if (!key) return acc;
+    const bucket = acc.get(key) || [];
+    bucket.push(task);
+    acc.set(key, bucket);
+    return acc;
+  }, new Map());
+
+  const workers = workerRows.map((worker) => {
+    const heartbeat = heartbeatMap.get(String(worker.id)) || null;
+    const heartbeatAgeMinutes = ageMinutesFrom(heartbeat?.captured_at);
+    const mobileBatteryPercentage = toNumber(
+      heartbeat?.mobile_battery_percentage ??
+        worker?.metadata?.mobileBatteryPct ??
+        worker?.metadata?.phoneBatteryPct,
+      null
+    );
+    const assignedTasks = workerTasksById.get(String(worker.id)) || [];
+    const latestTask = assignedTasks[0] || null;
+    const staleLocation =
+      heartbeatAgeMinutes === null || heartbeatAgeMinutes > freshnessMinutes;
+    return {
+      workerId: String(worker.id),
+      workerName: worker.full_name || `Worker-${String(worker.id).slice(0, 6).toUpperCase()}`,
+      employeeCode: worker.employee_code || null,
+      email: worker.email || null,
+      currentStatus: !heartbeat ? 'Offline' : staleLocation ? 'Stale' : 'Online',
+      activeTaskCount: taskCountMap.get(String(worker.id)) || 0,
+      latestTaskId: latestTask?.id || null,
+      latestTaskStatus: latestTask?.status || null,
+      location: heartbeat
+        ? {
+            latitude: toNumberOrNull(heartbeat.latitude),
+            longitude: toNumberOrNull(heartbeat.longitude),
+            accuracy: toNumber(heartbeat.accuracy, null),
+            capturedAt: toIsoOrNull(heartbeat.captured_at),
+            ageMinutes: heartbeatAgeMinutes,
+            isStale: staleLocation,
+            source: heartbeat.source || 'mobile_app',
+          }
+        : null,
+      mobileBatteryPercentage,
+      isCharging: heartbeat?.is_charging ?? worker?.metadata?.isCharging ?? null,
+      isLowBattery:
+        mobileBatteryPercentage !== null &&
+        mobileBatteryPercentage < lowBatteryThreshold &&
+        heartbeat?.is_charging !== true,
+      lastSeenAt: toIsoOrNull(heartbeat?.captured_at || worker.last_login_at || worker.updated_at),
+    };
+  });
+  const workerById = new Map(workers.map((worker) => [worker.workerId, worker]));
+
+  const tasks = tasksPlain.map((task) => {
+    const dueAt = resolveTaskDueAt(task);
+    const location = mapLocationForTask(task);
+    const device = resolveDeviceForToilet(deviceMaps, task.toilet_unit_id, task.facility_id);
+    const worker = task.assigned_to_user_id ? workerById.get(String(task.assigned_to_user_id)) : null;
+    const latestAssignment = latestAssignmentByTaskId.get(String(task.id)) || null;
+    return {
+      taskId: task.id,
+      complaintId: task.complaint_id || null,
+      facilityId: task.facility_id || null,
+      facilityName: task.Facility?.name || null,
+      facilityCode: task.Facility?.code || null,
+      toiletUnitId: task.toilet_unit_id || null,
+      toiletUnitCode: task.ToiletUnit?.code || null,
+      toiletLocationLabel: task.ToiletUnit?.location_label || null,
+      title: task.title || 'Critical complaint response',
+      description: task.description || task.complaint?.description || null,
+      taskType: task.task_type,
+      priority: task.priority || 'critical',
+      status: task.status,
+      statusLabel: mapTaskStatusForMap(task.status),
+      assignedWorkerId: task.assigned_to_user_id || null,
+      assignedWorkerName: task.assignee?.full_name || worker?.workerName || null,
+      assignedAt: toIsoOrNull(task.created_at),
+      dueAt,
+      slaMinutes: task.sla_minutes || null,
+      slaBreached: dueAt ? Date.now() > new Date(dueAt).getTime() : false,
+      acceptedAt: toIsoOrNull(task.accepted_at),
+      startedAt: toIsoOrNull(task.started_at),
+      completedAt: toIsoOrNull(task.completed_at),
+      assignmentSource: task.assignment_source || latestAssignment?.assignment_source || null,
+      assignmentReason: task.assignment_reason || latestAssignment?.reason || null,
+      distanceKm: toNumber(task.distance_km, null),
+      criticalDetectedAt: toIsoOrNull(task.critical_detected_at),
+      latitude: location.latitude,
+      longitude: location.longitude,
+      locationLabel: location.label,
+      workerLocation: worker?.location || null,
+      workerBatteryPercentage: worker?.mobileBatteryPercentage ?? null,
+      device,
+    };
+  });
+  const taskByComplaintId = new Map(
+    tasks.filter((task) => task.complaintId).map((task) => [String(task.complaintId), task])
+  );
+
+  const complaints = complaintsPlain.map((complaint) => {
+    const location = mapLocationForComplaint(complaint);
+    const task = taskByComplaintId.get(String(complaint.id)) || null;
+    const device = resolveDeviceForToilet(deviceMaps, complaint.toilet_unit_id, complaint.facility_id);
+    return {
+      complaintId: complaint.id,
+      facilityId: complaint.facility_id || null,
+      facilityName: complaint.Facility?.name || null,
+      facilityCode: complaint.Facility?.code || null,
+      toiletUnitId: complaint.toilet_unit_id || null,
+      toiletUnitCode: complaint.ToiletUnit?.code || null,
+      toiletLocationLabel: complaint.ToiletUnit?.location_label || null,
+      priority: complaint.priority,
+      status: complaint.status,
+      complaintType: complaint.complaint_type,
+      description: complaint.description,
+      sourceChannel: complaint.source_channel,
+      createdAt: toIsoOrNull(complaint.created_at),
+      latitude: location.latitude,
+      longitude: location.longitude,
+      locationLabel: location.label,
+      taskId: task?.taskId || null,
+      taskStatus: task?.status || null,
+      assignedWorkerId: task?.assignedWorkerId || complaint.assigned_to_user_id || null,
+      assignedWorkerName: task?.assignedWorkerName || complaint.assignedTo?.full_name || null,
+      device,
+    };
+  });
+
+  const toiletRows = new Map();
+  for (const complaint of complaints) {
+    const key = String(complaint.toiletUnitId || complaint.facilityId || complaint.complaintId);
+    toiletRows.set(key, {
+      toiletUnitId: complaint.toiletUnitId,
+      toiletUnitCode: complaint.toiletUnitCode,
+      locationLabel: complaint.locationLabel || complaint.toiletLocationLabel,
+      facilityId: complaint.facilityId,
+      facilityName: complaint.facilityName,
+      latitude: complaint.latitude,
+      longitude: complaint.longitude,
+      activeComplaint: complaint,
+      task: complaint.taskId ? taskByComplaintId.get(String(complaint.complaintId)) || null : null,
+      device: complaint.device,
+    });
+  }
+  for (const task of tasks) {
+    const key = String(task.toiletUnitId || task.facilityId || task.taskId);
+    if (!toiletRows.has(key)) {
+      toiletRows.set(key, {
+        toiletUnitId: task.toiletUnitId,
+        toiletUnitCode: task.toiletUnitCode,
+        locationLabel: task.locationLabel || task.toiletLocationLabel,
+        facilityId: task.facilityId,
+        facilityName: task.facilityName,
+        latitude: task.latitude,
+        longitude: task.longitude,
+        activeComplaint: task.complaintId ? complaints.find((item) => String(item.complaintId) === String(task.complaintId)) || null : null,
+        task,
+        device: task.device,
+      });
+    }
+  }
+
+  const summary = {
+    criticalComplaints: complaints.length,
+    activeTasks: tasks.length,
+    assignedTasks: tasks.filter((task) => task.assignedWorkerId).length,
+    unassignedTasks: tasks.filter((task) => !task.assignedWorkerId || task.status === 'unassigned').length,
+    workersOnline: workers.filter((worker) => worker.currentStatus === 'Online').length,
+    lowBatteryWorkers: workers.filter((worker) => worker.isLowBattery).length,
+    staleLocationWorkers: workers.filter((worker) => worker.location?.isStale || !worker.location).length,
+    slaBreachedTasks: tasks.filter((task) => task.slaBreached).length,
+  };
+
+  return {
+    scope: summarizeSupervisorScopeForMap(scope),
+    summary,
+    workers,
+    tasks,
+    toilets: [...toiletRows.values()].filter((row) => row.latitude !== null && row.longitude !== null),
+    complaints,
+    config: emptyPayload.config,
+  };
+};
+
 const getCheckins = async (req) => {
   const snapshot = await buildSupervisorSnapshot(req, { defaultDays: 1, maxDays: 31 });
   const rows = snapshot.workers.map((worker) => ({
@@ -1457,6 +1981,7 @@ module.exports = {
   getCleanliness,
   getDailyReport,
   getDeviceHealth,
+  getLiveMap,
   getLiveLocations,
   getOverview,
   getWorkerDetail,

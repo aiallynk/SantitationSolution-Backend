@@ -91,6 +91,27 @@ const defaults = Object.freeze({
     h2sPpmThreshold: 10,
     methanePpmThreshold: 90,
   },
+  automation: {
+    criticalComplaintValues: ['critical', 'emergency', 'very_bad', 'very bad'],
+    repeatedComplaintWindowMinutes: 120,
+    repeatedComplaintThreshold: 3,
+    workerLocationFreshnessMinutes: 30,
+    maxActiveTasksPerWorker: 3,
+    lowMobileBatteryThreshold: 20,
+    assignmentRadiusKm: 10,
+    acceptReminderMinutes: 10,
+    startReminderMinutes: 20,
+    slaWarningMinutes: 15,
+    reminderJobIntervalMs: 60_000,
+    offlineEscalationMinutes: 45,
+    mapPollingIntervalMs: 30_000,
+    slaMinutesByPriority: {
+      critical: 60,
+      high: 120,
+      medium: 240,
+      low: 480,
+    },
+  },
 });
 
 module.exports = {

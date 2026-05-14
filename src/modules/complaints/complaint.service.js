@@ -18,6 +18,7 @@ const { resolveMediaUrl } = require('../media/mediaUrl.service');
 const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const { getPublicFeedbackUrl } = require('../platform/toiletQr.service');
 const notificationService = require('../notifications/notification.service');
+const criticalComplaintService = require('../automation/criticalComplaint.service');
 const {
   buildAccessContextFromUser,
   applyScopeToQuery,
@@ -424,7 +425,12 @@ const createComplaint = async (req) => {
   const hydrated = await Complaint.findByPk(complaint.id, {
     include: complaintInclude(),
   });
-  return mapComplaint(hydrated || complaint);
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
 };
 
 const escapeHtml = (value) =>
@@ -823,7 +829,62 @@ const createPublicComplaint = async (req) => {
   const hydrated = await Complaint.findByPk(complaint.id, {
     include: complaintInclude(),
   });
-  return mapComplaint(hydrated || complaint);
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
+};
+
+const updateComplaint = async (req) => {
+  const complaint = await loadScopedComplaint(req);
+  const updates = {};
+
+  if (req.body.priority !== undefined) {
+    updates.priority = normalizePriority(req.body.priority, complaint.priority);
+  }
+  if (req.body.status !== undefined) {
+    const status = String(req.body.status || '').trim().toLowerCase();
+    if (['open', 'assigned', 'resolved', 'rejected'].includes(status)) {
+      updates.status = status;
+    }
+  }
+  if (req.body.complaintType !== undefined) {
+    updates.complaint_type = sanitizeText(req.body.complaintType || complaint.complaint_type, 120);
+  }
+  if (req.body.description !== undefined) {
+    updates.description = sanitizeText(req.body.description || complaint.description, 1000);
+  }
+
+  if (Object.keys(updates).length === 0) {
+    const hydratedExisting = await Complaint.findByPk(complaint.id, {
+      include: complaintInclude(),
+    });
+    return mapComplaint(hydratedExisting || complaint);
+  }
+
+  updates.updated_at = new Date();
+  await complaint.update(updates);
+
+  await createAuditLog({
+    req,
+    action: 'complaint.update',
+    entityType: 'complaint',
+    entityId: complaint.id,
+    tenantId: complaint.tenant_id,
+    details: updates,
+  });
+
+  const hydrated = await Complaint.findByPk(complaint.id, {
+    include: complaintInclude(),
+  });
+  const mapped = await mapComplaint(hydrated || complaint);
+  const automation = await criticalComplaintService.handleComplaintCriticality({
+    complaintId: complaint.id,
+    req,
+  });
+  return { ...mapped, automation };
 };
 
 const assignComplaint = async (req) => {
@@ -1194,6 +1255,7 @@ module.exports = {
   createComplaint,
   getPublicFeedbackFormPage,
   createPublicComplaint,
+  updateComplaint,
   assignComplaint,
   resolveComplaint,
   dispatchComplaint,

@@ -17,13 +17,25 @@ router.use('/alerts', protect);
 router.use(
   '/alerts',
   requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
-  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireRouteKey(RouteKeys.OPS_ALERTS, RouteKeys.SUPERVISOR_ALERTS),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
 );
 
-router.get('/alerts', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlerts);
-router.get('/alerts/summary', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlertSummary);
-router.get('/alerts/:id', requireAnyPermissions('alerts.manage', 'dashboard.read'), alertController.getAlertById);
+router.get(
+  '/alerts',
+  requireAnyPermissions('alerts.manage', 'dashboard.read', 'supervisor.alerts.read'),
+  alertController.getAlerts,
+);
+router.get(
+  '/alerts/summary',
+  requireAnyPermissions('alerts.manage', 'dashboard.read', 'supervisor.alerts.read'),
+  alertController.getAlertSummary,
+);
+router.get(
+  '/alerts/:id',
+  requireAnyPermissions('alerts.manage', 'dashboard.read', 'supervisor.alerts.read'),
+  alertController.getAlertById,
+);
 router.patch(
   '/alerts/:id/acknowledge',
   requirePermissions('alerts.manage'),

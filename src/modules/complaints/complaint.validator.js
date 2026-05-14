@@ -55,9 +55,30 @@ const validateComplaintDispatch = (req) => {
   return errors;
 };
 
+const validateComplaintUpdate = (req) => {
+  const errors = [];
+  if (req.body.priority != null && !allowedPriorities.has(String(req.body.priority))) {
+    errors.push('priority must be one of low|medium|high|critical');
+  }
+  if (
+    req.body.status != null &&
+    !['open', 'assigned', 'resolved', 'rejected'].includes(String(req.body.status))
+  ) {
+    errors.push('status must be one of open|assigned|resolved|rejected');
+  }
+  if (req.body.complaintType != null && typeof req.body.complaintType !== 'string') {
+    errors.push('complaintType must be a string when provided');
+  }
+  if (req.body.description != null && typeof req.body.description !== 'string') {
+    errors.push('description must be a string when provided');
+  }
+  return errors;
+};
+
 module.exports = {
   validateComplaintListQuery,
   validateComplaintCreate,
   validateComplaintAssign,
   validateComplaintDispatch,
+  validateComplaintUpdate,
 };

@@ -20,6 +20,7 @@ const notificationRoutes = require('../../modules/notifications/notification.rou
 const liveRoutes = require('../../modules/live/live.routes');
 const auditRoutes = require('../../modules/audit/audit.routes');
 const appUpdateRoutes = require('../../modules/appUpdate/appUpdate.routes');
+const workerRoutes = require('../../modules/worker/worker.routes');
 const { protect } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 
@@ -46,5 +47,6 @@ router.use(reportRoutes);
 router.use(notificationRoutes);
 router.use(liveRoutes);
 router.use(auditRoutes);
+router.use(workerRoutes);
 
 module.exports = router;

@@ -58,6 +58,15 @@ const getLiveLocations = async (req, res, next) => {
   }
 };
 
+const getLiveMap = async (req, res, next) => {
+  try {
+    const data = await supervisorService.getLiveMap(req);
+    return sendSuccess(res, { message: 'Supervisor live map fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getCheckins = async (req, res, next) => {
   try {
     const payload = await supervisorService.getCheckins(req);
@@ -148,6 +157,7 @@ module.exports = {
   getCleanliness,
   getDailyReport,
   getDeviceHealth,
+  getLiveMap,
   getLiveLocations,
   getOverview,
   getWorkerDetail,

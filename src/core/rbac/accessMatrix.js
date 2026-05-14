@@ -533,6 +533,7 @@ const ROLE_ACCESS_MATRIX = {
       RouteKeys.SUPERVISOR_REPORTS,
     ],
     allowedActionKeys: [
+      'task.reassign',
       'supervisor.alerts.escalate',
       'cleanliness.verification.review',
     ],
