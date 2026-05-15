@@ -86,6 +86,21 @@ const validateUnitCreate = (req) => {
   return errors;
 };
 
+const validateUnitBulkCreate = (req) => {
+  const errors = validateUnitCreate(req);
+  const quantity = Number(req.body.quantity);
+  if (!Number.isInteger(quantity) || quantity < 2 || quantity > 200) {
+    errors.push('quantity must be an integer between 2 and 200');
+  }
+  if (!isBlank(req.body.code)) {
+    errors.push('code is not allowed for bulk create');
+  }
+  if (!isBlank(req.body.permanentQrCode) || !isBlank(req.body.qrCode)) {
+    errors.push('permanentQrCode/qrCode is not allowed for bulk create');
+  }
+  return errors;
+};
+
 const validateQrResolve = (req) => {
   const errors = [];
   const value = req.body?.rawQrValue;
@@ -119,5 +134,6 @@ module.exports = {
   validateFacilityCreate,
   validateBlockCreate,
   validateUnitCreate,
+  validateUnitBulkCreate,
   validateQrResolve,
 };

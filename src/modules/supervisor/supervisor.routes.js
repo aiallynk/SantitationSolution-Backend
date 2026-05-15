@@ -21,9 +21,9 @@ router.use('/supervisor', protect);
 router.use('/supervisor', supervisorApiRateLimit);
 router.use(
   '/supervisor',
-  requireRoles('supervisor'),
-  requireSurface(SurfaceTypes.OPS_WEB_AND_MOBILE),
-  requireScope({ scopeTypes: [ScopeTypes.FACILITY] }),
+  requireRoles('supervisor', 'auditor'),
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
 );
 
 router.get(

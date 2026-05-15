@@ -183,6 +183,19 @@ const postToiletUnit = async (req, res, next) => {
   }
 };
 
+const postToiletUnitsBulk = async (req, res, next) => {
+  try {
+    const data = await platformService.createUnitsBulk(req);
+    return sendSuccess(res, {
+      statusCode: 201,
+      message: `Bulk toilet creation completed (${data.quantityCreated})`,
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getToiletDetails = async (req, res, next) => {
   try {
     const data = await inspectionService.getToiletDetailsById(req);
@@ -256,6 +269,7 @@ module.exports = {
   getToiletUnitByQr,
   postToiletUnitByQr,
   postToiletUnit,
+  postToiletUnitsBulk,
   getToiletInspections,
   getToiletDetails,
   getToiletLatestInspection,

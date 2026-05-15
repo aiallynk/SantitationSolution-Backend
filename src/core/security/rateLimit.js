@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = rateLimit;
 const { runtimeConfig } = require('../../config/runtime');
 
 const isIngestionPath = (req) =>
@@ -37,7 +38,7 @@ const supervisorApiRateLimit = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => {
     const userId = req.user?.id || req.user?.userId || null;
-    return userId ? `supuid:${userId}` : `supip:${req.ip || 'anon'}`;
+    return userId ? `supuid:${userId}` : `supip:${ipKeyGenerator(req.ip || '')}`;
   },
   message: {
     success: false,

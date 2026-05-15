@@ -16,6 +16,7 @@ const {
   validateFacilityCreate,
   validateBlockCreate,
   validateUnitCreate,
+  validateUnitBulkCreate,
   validateQrResolve,
 } = require('./platform.validator');
 const {
@@ -217,6 +218,16 @@ router.post(
   requireAnyPermissions('dashboard.read', 'inspection.create'),
   validate(validateQrResolve),
   platformController.postToiletUnitByQr
+);
+router.post(
+  '/toilet-units/bulk',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  validate(validateUnitBulkCreate),
+  platformController.postToiletUnitsBulk
 );
 router.post(
   '/toilet-units',
