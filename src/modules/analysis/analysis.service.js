@@ -32,6 +32,10 @@ const {
 const { classifyAnalysisFailure } = require('./analysisFailureClassifier.service');
 const { IMAGE_PROCESSING_STATES } = require('../inspections/imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
+const {
+  applySingleImagePostProcessing,
+  buildSupervisorReviewFlags,
+} = require('./sanitationPostProcessing.helper');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -81,6 +85,73 @@ const toHighMediumLowSeverity = (value) => {
     return normalized;
   }
   return null;
+};
+
+const severityFromHygieneRisk = (risk) => {
+  const normalized = String(risk || '').trim().toLowerCase();
+  if (normalized === 'severe' || normalized === 'high') return 'high';
+  if (normalized === 'medium') return 'medium';
+  if (normalized === 'low') return 'low';
+  return null;
+};
+
+const hygieneRiskRank = (risk) => {
+  const normalized = String(risk || '').trim().toLowerCase();
+  if (normalized === 'severe') return 3;
+  if (normalized === 'high') return 2;
+  if (normalized === 'medium') return 1;
+  return 0;
+};
+
+const scoreToHygieneRisk = (score) => {
+  const value = clamp(Number(score) || 0, 0, 100);
+  if (value <= 25) return 'severe';
+  if (value <= 40) return 'high';
+  if (value <= 70) return 'medium';
+  return 'low';
+};
+
+const inferCriticalFindingsFromStrictJson = (strictJson = {}, normalizedIssues = []) => {
+  const issues = Array.isArray(normalizedIssues)
+    ? normalizedIssues.map((item) => String(item || '').toLowerCase())
+    : [];
+  const issueText = issues.join(' | ');
+  return {
+    visible_feces_or_potty:
+      strictJson?.critical_findings?.visible_feces_or_potty === true ||
+      Boolean(strictJson?.feces_or_extreme_bio_visible) ||
+      ['feces', 'faeces', 'potty', 'stool', 'human_waste', 'sewage', 'biohazard'].some((k) =>
+        issueText.includes(k)
+      ),
+    urine_pooling:
+      strictJson?.critical_findings?.urine_pooling === true ||
+      ['urine', 'urine_pooling', 'pee_pool'].some((k) => issueText.includes(k)),
+    dirty_commode_or_pan:
+      strictJson?.critical_findings?.dirty_commode_or_pan === true ||
+      Boolean(strictJson?.heavy_bowl_unsafe) ||
+      ['dirty_commode', 'dirty_pan', 'dirty_bowl', 'commode_stain', 'pan_stain'].some((k) =>
+        issueText.includes(k)
+      ),
+    heavy_stains:
+      strictJson?.critical_findings?.heavy_stains === true ||
+      Boolean(strictJson?.heavy_bowl_unsafe) ||
+      Number(strictJson?.stain_presence || 0) >= 60,
+    trash_or_waste:
+      strictJson?.critical_findings?.trash_or_waste === true ||
+      Boolean(strictJson?.garbage_presence) ||
+      ['trash', 'garbage', 'waste', 'overflowing_bin', 'sanitary_waste', 'wet_waste'].some((k) =>
+        issueText.includes(k)
+      ),
+    waterlogging:
+      strictJson?.critical_findings?.waterlogging === true ||
+      Number(strictJson?.water_stagnation || 0) >= 60 ||
+      ['waterlogging', 'water_logging', 'dirty_water', 'blocked_drain'].some((k) =>
+        issueText.includes(k)
+      ),
+    insects_or_biohazard:
+      strictJson?.critical_findings?.insects_or_biohazard === true ||
+      ['insect', 'maggot', 'biohazard', 'blood'].some((k) => issueText.includes(k)),
+  };
 };
 
 const buildStrictToiletJsonFromNormalizedResult = ({
@@ -599,10 +670,57 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
       ),
     ])
   );
+  const overviewScoreRounded = round2(overviewScore) || 0;
+  const riskCandidates = effective
+    .map((item) => String(item.strictJson?.hygiene_risk || '').trim().toLowerCase())
+    .filter((item) => ['low', 'medium', 'high', 'severe'].includes(item));
+  const aggregateRisk =
+    riskCandidates.length > 0
+      ? riskCandidates.reduce((max, item) =>
+          hygieneRiskRank(item) > hygieneRiskRank(max) ? item : max
+        )
+      : scoreToHygieneRisk(overviewScoreRounded);
+  const aggregateCriticalFindings = effective.reduce(
+    (acc, item) => {
+      const findings =
+        item?.strictJson?.critical_findings &&
+        typeof item.strictJson.critical_findings === 'object'
+          ? item.strictJson.critical_findings
+          : {};
+      const next = { ...acc };
+      for (const key of Object.keys(next)) {
+        if (findings[key] === true) next[key] = true;
+      }
+      return next;
+    },
+    {
+      visible_feces_or_potty: false,
+      urine_pooling: false,
+      dirty_commode_or_pan: false,
+      heavy_stains: false,
+      trash_or_waste: false,
+      waterlogging: false,
+      insects_or_biohazard: false,
+    }
+  );
+  const requiresRetakeAny = effective.some(
+    (item) => item?.strictJson?.requires_retake === true
+  );
+  const severityLevelFromRisk = severityFromHygieneRisk(aggregateRisk) || 'medium';
+  const supervisorFlags = Array.isArray(aggregate?.pipelineCounters?.ai_supervisor_flags)
+    ? aggregate.pipelineCounters.ai_supervisor_flags
+    : [];
+  const comparisonResult =
+    aggregate?.pipelineCounters &&
+    typeof aggregate.pipelineCounters === 'object' &&
+    aggregate.pipelineCounters.ai_comparison_result &&
+    typeof aggregate.pipelineCounters.ai_comparison_result === 'object'
+      ? aggregate.pipelineCounters.ai_comparison_result
+      : null;
 
   return {
     overallStatus: deriveStatus(overviewScore),
-    overallCleanlinessScore: round2(overviewScore) || 0,
+    overallCleanlinessScore: overviewScoreRounded,
     cleanlinessScore: round2(avgCleanliness ?? base?.cleanlinessScore ?? overviewScore) || 0,
     hygieneScore: round2(avgHygiene ?? base?.hygieneScore ?? overviewScore) || 0,
     odorRiskScore: round2(base?.odorRiskScore ?? 60) || 0,
@@ -613,7 +731,7 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
     issueTags,
     severityLabel:
       base?.severityLabel ||
-      (aggregate?.reviewRequired ? 'high' : 'medium'),
+      (aggregate?.reviewRequired ? 'high' : severityLevelFromRisk),
     reviewRequired: Boolean(aggregate?.reviewRequired || base?.reviewRequired),
     explanationText:
       base?.explanationText ||
@@ -646,11 +764,20 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
         confidence_score:
           avgConfidence !== null ? Number(Number(avgConfidence).toFixed(3)) : null,
         detected_issues: issueTags,
-        severity_level: aggregate?.reviewRequired ? 'high' : 'medium',
-        human_review_required: Boolean(aggregate?.reviewRequired || base?.reviewRequired),
+        severity_level: severityLevelFromRisk,
+        human_review_required:
+          Boolean(aggregate?.reviewRequired || base?.reviewRequired) || requiresRetakeAny,
+        score_0_100: overviewScoreRounded,
+        star_rating_0_5: Number((overviewScoreRounded / 20).toFixed(1)),
+        hygiene_risk: aggregateRisk,
+        cleanliness_level: null,
+        critical_findings: aggregateCriticalFindings,
+        requires_retake: requiresRetakeAny,
       },
       imageCount: effective.length,
       aggregate: aggregate || null,
+      supervisorFlags,
+      comparisonResult,
     },
   };
 };
@@ -770,6 +897,14 @@ const runInspectionAnalysis = async ({
       mediaRow.overall_score !== undefined &&
       !Boolean(mediaRow.scoring_rejected)
     ) {
+      const cachedScoring =
+        mediaRow.metadata &&
+        typeof mediaRow.metadata === 'object' &&
+        !Array.isArray(mediaRow.metadata) &&
+        mediaRow.metadata.ai_scoring &&
+        typeof mediaRow.metadata.ai_scoring === 'object'
+          ? mediaRow.metadata.ai_scoring
+          : null;
       imageResults.push({
         imageId: mediaRow.id,
         strictJson: {
@@ -787,6 +922,23 @@ const runInspectionAnalysis = async ({
           severity_level: mediaRow.severity || 'medium',
           human_review_required: Boolean(mediaRow.review_required),
           explanation_summary: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+          score_0_100:
+            cachedScoring?.score_0_100 !== undefined
+              ? Number(cachedScoring.score_0_100)
+              : Math.round(Number(mediaRow.overall_score || 0)),
+          star_rating_0_5:
+            cachedScoring?.star_rating_0_5 !== undefined
+              ? Number(cachedScoring.star_rating_0_5)
+              : Number((Number(mediaRow.overall_score || 0) / 20).toFixed(1)),
+          hygiene_risk: cachedScoring?.hygiene_risk || null,
+          cleanliness_level: cachedScoring?.cleanliness_level || null,
+          critical_findings:
+            cachedScoring?.critical_findings &&
+            typeof cachedScoring.critical_findings === 'object'
+              ? cachedScoring.critical_findings
+              : null,
+          requires_retake: Boolean(cachedScoring?.requires_retake),
+          retake_reason: cachedScoring?.retake_reason || '',
         },
         result: {
           overallCleanlinessScore: Number(mediaRow.overall_score || 0),
@@ -806,6 +958,9 @@ const runInspectionAnalysis = async ({
           modelVersion: mediaRow.model_version || 'openai-chat-completions-v4',
           provider: 'cached',
           explanationText: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+          rawResult: {
+            strictJson: cachedScoring || null,
+          },
         },
       });
       continue;
@@ -909,11 +1064,38 @@ const runInspectionAnalysis = async ({
         : Array.isArray(result.issueTags)
           ? normalizeIssueTags({ aiIssues: result.issueTags })
           : [];
-      const overallScore = calibrateOverallScore({
+      const calibratedOverallScore = calibrateOverallScore({
         strictJson,
         normalizedIssues: issues,
         confidence,
       });
+      const quality = qualityResult?.imageQualityStatus || 'ok';
+      const inferredCriticalFindings = inferCriticalFindingsFromStrictJson(strictJson, issues);
+      const singleImagePost = applySingleImagePostProcessing({
+        score_0_100: calibratedOverallScore,
+        star_rating_0_5: strictJson?.star_rating_0_5,
+        cleanliness_level: strictJson?.cleanliness_level || null,
+        hygiene_risk: strictJson?.hygiene_risk || null,
+        critical_findings: strictJson?.critical_findings || inferredCriticalFindings,
+        detected_issues: issues,
+        positive_observations: Array.isArray(strictJson?.positive_observations)
+          ? strictJson.positive_observations
+          : [],
+        score_reason:
+          strictJson?.score_reason ||
+          strictJson?.reasoning_summary ||
+          strictJson?.explanation_summary ||
+          result.explanationText ||
+          '',
+        confidence,
+        requires_retake: Boolean(strictJson?.requires_retake),
+        retake_reason: strictJson?.retake_reason || '',
+        toilet_detected: toiletDetected,
+        visibility_score: visibilityScore,
+        image_quality_status: quality,
+      });
+      const overallScore = Number(singleImagePost.score_0_100 || 0);
+      const finalConfidence = Number(singleImagePost.confidence || confidence || 0);
       const floorScore =
         strictJson && strictJson.floor_cleanliness !== undefined
           ? Number(strictJson.floor_cleanliness)
@@ -931,7 +1113,7 @@ const runInspectionAnalysis = async ({
           ? Number(strictJson.water_stagnation)
           : 100 - Number(result.wetnessScore || 0);
       const garbageScore = toGarbageScore(strictJson, result);
-      const reviewRequired =
+      let reviewRequired =
         (strictJson && strictJson.human_review_required !== undefined
           ? Boolean(strictJson.human_review_required)
           : Boolean(result.reviewRequired)) || confidenceEngine.reviewRequired;
@@ -941,13 +1123,18 @@ const runInspectionAnalysis = async ({
         perceptualHash,
         imageId: mediaRow.id,
       });
+      reviewRequired =
+        reviewRequired ||
+        singleImagePost.requires_retake ||
+        ['high', 'severe'].includes(String(singleImagePost.hygiene_risk || '').toLowerCase()) ||
+        Boolean(similarityResult?.suspicious);
       const severity =
+        severityFromHygieneRisk(singleImagePost.hygiene_risk) ||
         strictJson?.severity_level ||
         (String(result.severityLabel || '').toLowerCase() === 'critical'
           ? 'high'
           : String(result.severityLabel || '').toLowerCase() || null) ||
         'medium';
-      const quality = qualityResult?.imageQualityStatus || 'ok';
       const suspiciousFlags = [];
       if (similarityResult?.suspicious) {
         suspiciousFlags.push('possible_fake_cleaning_similar_images');
@@ -955,14 +1142,19 @@ const runInspectionAnalysis = async ({
       if (confidenceEngine.reviewRequired) {
         suspiciousFlags.push('low_confidence');
       }
+      if (singleImagePost.requires_retake) {
+        suspiciousFlags.push('retake_required');
+      }
       const qualityWarning = qualityValidationStatus !== 'VALID';
-      const resolvedValidationStatus = lowConfidenceReview
-        ? qualityWarning
-          ? 'LOW_CONFIDENCE_QUALITY_WARNING'
-          : 'LOW_CONFIDENCE_REVIEW'
-        : qualityWarning
-          ? 'QUALITY_WARNING'
-          : 'VALID';
+      const resolvedValidationStatus = singleImagePost.requires_retake
+        ? 'RETAKE_REQUIRED'
+        : lowConfidenceReview
+          ? qualityWarning
+            ? 'LOW_CONFIDENCE_QUALITY_WARNING'
+            : 'LOW_CONFIDENCE_REVIEW'
+          : qualityWarning
+            ? 'QUALITY_WARNING'
+            : 'VALID';
       const validationReasons = [];
       if (qualityWarning) {
         validationReasons.push(
@@ -972,28 +1164,71 @@ const runInspectionAnalysis = async ({
       if (lowConfidenceReview) {
         validationReasons.push('Confidence below review threshold');
       }
+      if (singleImagePost.requires_retake && singleImagePost.retake_reason) {
+        validationReasons.push(singleImagePost.retake_reason);
+      }
       const resolvedValidationReason =
         validationReasons.length > 0 ? validationReasons.join(' | ').slice(0, 500) : null;
+      const supervisorFlags = buildSupervisorReviewFlags({
+        singleImageResult: singleImagePost,
+        pairwiseComparison: null,
+        afterScore: overallScore,
+      });
+      const strictJsonFinal = {
+        ...strictJson,
+        ...singleImagePost,
+        overall_cleanliness_score: overallScore,
+        confidence_score: finalConfidence,
+        critical_findings: singleImagePost.critical_findings,
+        detected_issues: issues,
+        severity_level: severity,
+        human_review_required: reviewRequired,
+        explanation_summary:
+          singleImagePost.score_reason ||
+          strictJson?.explanation_summary ||
+          result.explanationText ||
+          null,
+      };
+      const existingMetadata =
+        mediaRow.metadata && typeof mediaRow.metadata === 'object' && !Array.isArray(mediaRow.metadata)
+          ? mediaRow.metadata
+          : {};
+      const scoringMetadata = {
+        ...singleImagePost,
+        applied_at: new Date().toISOString(),
+        prompt_version: result.promptVersion || PROMPT_VERSION,
+        scoring_version: result.scoringVersion || SCORING_VERSION,
+        supervisor_flags: supervisorFlags,
+      };
+      const metadata = {
+        ...existingMetadata,
+        ai_scoring: scoringMetadata,
+        ai_supervisor_flags: supervisorFlags,
+      };
 
       await mediaRow.update({
         ai_status: 'AI_COMPLETED',
         processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
         image_quality_status: quality,
         overall_score: round2(overallScore),
-        confidence_score: round2(confidence),
+        confidence_score: round2(finalConfidence),
         floor_score: round2(floorScore),
         commode_score: round2(commodeScore),
         stain_score: round2(stainScore),
         garbage_score: round2(garbageScore),
         water_score: round2(waterScore),
         issue_tags: issues,
-        issue_summary: issues.length > 0 ? issues.slice(0, 6).join(', ') : null,
+        issue_summary:
+          issues.length > 0
+            ? issues.slice(0, 6).join(', ')
+            : strictJsonFinal.explanation_summary || null,
         severity,
         review_required:
           reviewRequired ||
           quality !== 'ok' ||
           Boolean(similarityResult?.suspicious) ||
-          lowConfidenceReview,
+          lowConfidenceReview ||
+          singleImagePost.requires_retake,
         model_version: result.modelVersion || null,
         prompt_version: result.promptVersion || PROMPT_VERSION,
         scoring_version: result.scoringVersion || SCORING_VERSION,
@@ -1011,15 +1246,47 @@ const runInspectionAnalysis = async ({
         similarity_score: similarityResult?.maxSimilarity || null,
         scoring_rejected: false,
         explanation_summary:
-          strictJson?.explanation_summary ||
+          strictJsonFinal.explanation_summary ||
           result.explanationText ||
           (issues.length > 0 ? issues.join(', ') : null),
+        metadata,
         updated_at: new Date(),
       });
 
+      result.overallCleanlinessScore = round2(overallScore);
+      result.confidenceScore = round2(finalConfidence);
+      result.reviewRequired = Boolean(reviewRequired);
+      result.issueTags = issues;
+      result.severityLabel = severity;
+      result.explanationText =
+        strictJsonFinal.explanation_summary || result.explanationText || null;
+      if (!result.rawResult || typeof result.rawResult !== 'object') {
+        result.rawResult = {};
+      }
+      result.rawResult.strictJson = strictJsonFinal;
+
+      // eslint-disable-next-line no-console
+      console.info(
+        '[ai-scoring] image-final',
+        JSON.stringify({
+          inspectionId: inspection.id,
+          imageId: mediaRow.id,
+          captureStage: mediaRow.capture_stage,
+          rawScore: round2(calibratedOverallScore),
+          finalScore: round2(overallScore),
+          stars: singleImagePost.star_rating_0_5,
+          hygieneRisk: singleImagePost.hygiene_risk,
+          capsApplied: singleImagePost.caps_applied,
+          confidence: round2(finalConfidence),
+          requiresRetake: Boolean(singleImagePost.requires_retake),
+          suspiciousSimilarity: Boolean(similarityResult?.suspicious),
+          supervisorFlags,
+        })
+      );
+
       imageResults.push({
         imageId: mediaRow.id,
-        strictJson,
+        strictJson: strictJsonFinal,
         result,
         scoringRejected: false,
       });
@@ -1036,17 +1303,22 @@ const runInspectionAnalysis = async ({
           imageId: mediaRow.id,
           stage: mediaRow.capture_stage,
           score: round2(overallScore),
-          confidence: round2(confidence),
+          confidence: round2(finalConfidence),
           severity,
           reviewRequired:
             reviewRequired ||
             quality !== 'ok' ||
             Boolean(similarityResult?.suspicious) ||
-            lowConfidenceReview,
+            lowConfidenceReview ||
+            singleImagePost.requires_retake,
           suspiciousFlags,
           validationStatus: resolvedValidationStatus,
           scoringRejected: false,
           lowConfidenceReview,
+          requiresRetake: Boolean(singleImagePost.requires_retake),
+          retakeReason: singleImagePost.retake_reason || null,
+          hygieneRisk: singleImagePost.hygiene_risk,
+          starRating: singleImagePost.star_rating_0_5,
           similarityScore: similarityResult?.maxSimilarity || null,
           processingMs,
         },
@@ -1085,16 +1357,47 @@ const runInspectionAnalysis = async ({
         const fallbackConfidence = Number(
           fallbackConfidenceEngine.finalConfidence || fallbackStrictJson.confidence_score || 0
         );
-        const fallbackOverallScore = calibrateOverallScore({
+        const fallbackCalibratedScore = calibrateOverallScore({
           strictJson: fallbackStrictJson,
           normalizedIssues: fallbackIssues,
           confidence: fallbackConfidence,
         });
+        const fallbackSinglePost = applySingleImagePostProcessing({
+          score_0_100: fallbackCalibratedScore,
+          star_rating_0_5: fallbackStrictJson.star_rating_0_5,
+          cleanliness_level: fallbackStrictJson.cleanliness_level || null,
+          hygiene_risk: fallbackStrictJson.hygiene_risk || null,
+          critical_findings:
+            fallbackStrictJson.critical_findings ||
+            inferCriticalFindingsFromStrictJson(fallbackStrictJson, fallbackIssues),
+          detected_issues: fallbackIssues,
+          positive_observations: Array.isArray(fallbackStrictJson.positive_observations)
+            ? fallbackStrictJson.positive_observations
+            : [],
+          score_reason: fallbackStrictJson.explanation_summary || fallbackStrictJson.score_reason || '',
+          confidence: fallbackConfidence,
+          requires_retake: Boolean(fallbackStrictJson.requires_retake),
+          retake_reason: fallbackStrictJson.retake_reason || '',
+          toilet_detected: Boolean(toiletDetected),
+          visibility_score: visibilityScore,
+          image_quality_status: qualityResult?.imageQualityStatus || 'unknown',
+        });
+        const fallbackFinalScore = Number(fallbackSinglePost.score_0_100 || 0);
+        const fallbackFinalConfidence = Number(fallbackSinglePost.confidence || fallbackConfidence);
+        const fallbackSeverity =
+          severityFromHygieneRisk(fallbackSinglePost.hygiene_risk) ||
+          fallbackStrictJson.severity_level ||
+          'high';
         const fallbackStrictWithCalibrated = {
           ...fallbackStrictJson,
-          overall_cleanliness_score: Math.round(fallbackOverallScore),
-          confidence_score: Number(fallbackConfidence.toFixed(4)),
+          ...fallbackSinglePost,
+          overall_cleanliness_score: Math.round(fallbackFinalScore),
+          confidence_score: Number(fallbackFinalConfidence.toFixed(4)),
           detected_issues: fallbackIssues,
+          severity_level: fallbackSeverity,
+          human_review_required: true,
+          explanation_summary:
+            fallbackSinglePost.score_reason || fallbackStrictJson.explanation_summary || null,
         };
         const fallbackFloorScore = Number(
           fallbackStrictWithCalibrated.floor_cleanliness || 0
@@ -1111,8 +1414,6 @@ const runInspectionAnalysis = async ({
         const fallbackGarbageScore = fallbackStrictWithCalibrated.garbage_presence
           ? 100
           : 0;
-        const fallbackSeverity =
-          fallbackStrictWithCalibrated.severity_level || 'high';
         const fallbackOdorRiskScore = clamp(
           Math.round(
             fallbackStainScore * 0.45 +
@@ -1122,16 +1423,23 @@ const runInspectionAnalysis = async ({
           0,
           100
         );
+        const fallbackSupervisorFlags = buildSupervisorReviewFlags({
+          singleImageResult: fallbackSinglePost,
+          pairwiseComparison: null,
+          afterScore: fallbackFinalScore,
+        });
         const fallbackValidationReason = `Fallback scoring applied due to ${
           failure.errorCode || code || 'analysis_error'
-        }: ${failure.message || 'Unknown failure'}`.slice(0, 500);
+        }: ${failure.message || 'Unknown failure'}${
+          fallbackSinglePost.retake_reason ? ` | ${fallbackSinglePost.retake_reason}` : ''
+        }`.slice(0, 500);
 
         await mediaRow.update({
           ai_status: 'AI_COMPLETED',
           processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
           image_quality_status: qualityResult?.imageQualityStatus || 'unknown',
-          overall_score: round2(fallbackOverallScore),
-          confidence_score: round2(fallbackConfidence),
+          overall_score: round2(fallbackFinalScore),
+          confidence_score: round2(fallbackFinalConfidence),
           floor_score: round2(fallbackFloorScore),
           commode_score: round2(fallbackCommodeScore),
           stain_score: round2(fallbackStainScore),
@@ -1152,29 +1460,46 @@ const runInspectionAnalysis = async ({
           next_retry_at: null,
           image_quality_score: qualityResult?.imageQualityScore || null,
           toilet_detected: Boolean(toiletDetected),
-          validation_status: 'FALLBACK_SCORED',
+          validation_status: fallbackSinglePost.requires_retake
+            ? 'RETAKE_REQUIRED'
+            : 'FALLBACK_SCORED',
           validation_reason: fallbackValidationReason,
           visibility_score: visibilityScore,
           perceptual_hash: perceptualHash || null,
           similarity_score: similarityResult?.maxSimilarity || null,
           scoring_rejected: false,
-          explanation_summary: fallbackStrictWithCalibrated.explanation_summary,
+          explanation_summary:
+            fallbackStrictWithCalibrated.explanation_summary || fallbackValidationReason,
+          metadata: {
+            ...(mediaRow.metadata && typeof mediaRow.metadata === 'object' && !Array.isArray(mediaRow.metadata)
+              ? mediaRow.metadata
+              : {}),
+            ai_scoring: {
+              ...fallbackSinglePost,
+              applied_at: new Date().toISOString(),
+              prompt_version: PROMPT_VERSION,
+              scoring_version: SCORING_VERSION,
+              supervisor_flags: fallbackSupervisorFlags,
+            },
+            ai_supervisor_flags: fallbackSupervisorFlags,
+          },
           updated_at: new Date(),
         });
 
         const fallbackResult = {
-          overallCleanlinessScore: round2(fallbackOverallScore),
+          overallCleanlinessScore: round2(fallbackFinalScore),
           cleanlinessScore: round2(fallbackFloorScore),
           hygieneScore: round2(fallbackCommodeScore),
           odorRiskScore: round2(fallbackOdorRiskScore),
           wetnessScore: round2(clamp(100 - fallbackWaterScore, 0, 100)),
           stainScore: round2(clamp(100 - fallbackStainScore, 0, 100)),
           litterScore: fallbackGarbageScore > 50 ? 0 : 100,
-          confidenceScore: round2(fallbackConfidence),
+          confidenceScore: round2(fallbackFinalConfidence),
           issueTags: fallbackIssues,
           severityLabel: fallbackSeverity,
           reviewRequired: true,
-          explanationText: fallbackStrictWithCalibrated.explanation_summary,
+          explanationText:
+            fallbackStrictWithCalibrated.explanation_summary || fallbackValidationReason,
           modelName: runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
           modelVersion: 'fallback-v1',
           provider: 'fallback',
@@ -1198,6 +1523,25 @@ const runInspectionAnalysis = async ({
           scoringRejected: false,
         });
 
+        // eslint-disable-next-line no-console
+        console.info(
+          '[ai-scoring] image-fallback',
+          JSON.stringify({
+            inspectionId: inspection.id,
+            imageId: mediaRow.id,
+            captureStage: mediaRow.capture_stage,
+            rawScore: round2(fallbackCalibratedScore),
+            finalScore: round2(fallbackFinalScore),
+            stars: fallbackSinglePost.star_rating_0_5,
+            hygieneRisk: fallbackSinglePost.hygiene_risk,
+            capsApplied: fallbackSinglePost.caps_applied,
+            confidence: round2(fallbackFinalConfidence),
+            requiresRetake: Boolean(fallbackSinglePost.requires_retake),
+            supervisorFlags: fallbackSupervisorFlags,
+            errorCode: failure.errorCode || code || null,
+          })
+        );
+
         await InspectionEvent.create({
           tenant_id: inspection.tenant_id,
           inspection_id: inspection.id,
@@ -1209,13 +1553,20 @@ const runInspectionAnalysis = async ({
           payload: {
             imageId: mediaRow.id,
             stage: mediaRow.capture_stage,
-            score: round2(fallbackOverallScore),
-            confidence: round2(fallbackConfidence),
+            score: round2(fallbackFinalScore),
+            confidence: round2(fallbackFinalConfidence),
             severity: fallbackSeverity,
             reviewRequired: true,
-            validationStatus: 'FALLBACK_SCORED',
+            validationStatus: fallbackSinglePost.requires_retake
+              ? 'RETAKE_REQUIRED'
+              : 'FALLBACK_SCORED',
             scoringRejected: false,
             fallbackScored: true,
+            requiresRetake: Boolean(fallbackSinglePost.requires_retake),
+            retakeReason: fallbackSinglePost.retake_reason || null,
+            hygieneRisk: fallbackSinglePost.hygiene_risk,
+            starRating: fallbackSinglePost.star_rating_0_5,
+            supervisorFlags: fallbackSupervisorFlags,
             errorCode: failure.errorCode || code || null,
             processingMs: Date.now() - mediaStartedAt,
           },

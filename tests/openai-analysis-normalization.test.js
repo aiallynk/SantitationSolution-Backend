@@ -2,7 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  __testUtils: { normalizeScoringPayload, inferPercentScaleMultiplier, toConfidence },
+  __testUtils: {
+    normalizeScoringPayload,
+    inferPercentScaleMultiplier,
+    toConfidence,
+    isStrictSanitationPayload,
+  },
 } = require('../src/modules/analysis/openaiAnalysis.service');
 
 test('normalizeScoringPayload rescales 0-1 cleanliness outputs to 0-100', () => {
@@ -75,4 +80,25 @@ test('percent scale detection only activates for consistently normalized anchors
     }),
     1
   );
+});
+
+test('strict sanitation payload is detected and normalized', () => {
+  const strictPayload = {
+    score_0_100: 62,
+    hygiene_risk: 'high',
+    cleanliness_level: 'average',
+    critical_findings: {
+      dirty_commode_or_pan: true,
+    },
+    detected_issues: ['dirty commode'],
+    confidence: 0.71,
+    requires_retake: false,
+  };
+  assert.equal(isStrictSanitationPayload(strictPayload), true);
+  const normalized = normalizeScoringPayload(strictPayload);
+  assert.equal(normalized.scoring_rubric, 'sanitation_strict_v2');
+  assert.equal(normalized.overall_cleanliness_score, 62);
+  assert.equal(normalized.hygiene_risk, 'high');
+  assert.equal(normalized.critical_findings.dirty_commode_or_pan, true);
+  assert.equal(normalized.star_rating_0_5, 3.1);
 });

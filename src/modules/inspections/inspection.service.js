@@ -131,6 +131,29 @@ const parseOptionalNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const starFromScore = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const clamped = Math.min(Math.max(parsed, 0), 100);
+  return Number((clamped / 20).toFixed(1));
+};
+
+const inspectionAiStatusFromSignals = ({
+  score = null,
+  hygieneRisk = null,
+  requiresRetake = false,
+  suspiciousFlag = false,
+}) => {
+  if (requiresRetake) return 'Retake Required';
+  if (suspiciousFlag) return 'Suspicious Improvement';
+  const risk = String(hygieneRisk || '').trim().toLowerCase();
+  if (risk === 'severe') return 'Severe Hygiene Issue';
+  const parsedScore = parseOptionalNumber(score);
+  if (parsedScore === null) return 'Pending Analysis';
+  if (parsedScore < 40) return 'Needs Cleaning';
+  return 'Clean';
+};
+
 const parseOptionalObject = (value) => {
   if (!value) return null;
   if (typeof value === 'object' && !Array.isArray(value)) {
@@ -449,6 +472,131 @@ const loadLatestReviewByInspectionIds = async (inspectionIds) => {
   return map;
 };
 
+const mapInspectionMediaItem = (item) => {
+  const aiScoring =
+    item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
+      ? item.metadata.ai_scoring || null
+      : null;
+  const score =
+    item.overall_score !== null && item.overall_score !== undefined
+      ? Number(item.overall_score)
+      : aiScoring?.score_0_100 !== undefined
+        ? Number(aiScoring.score_0_100)
+        : null;
+  const starRating =
+    aiScoring?.star_rating_0_5 !== undefined
+      ? Number(aiScoring.star_rating_0_5)
+      : score !== null
+        ? Number((score / 20).toFixed(1))
+        : null;
+  return {
+    id: item.id,
+    clientImageId: item.client_image_id || null,
+    captureStage: item.capture_stage,
+    uploadStatus: item.upload_status || null,
+    processingState: item.processing_state || null,
+    fileUrl: normalizeMediaUrl(item.file_url),
+    thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
+    uploadedAt: item.uploaded_at,
+    confirmedAt: item.confirmed_at || null,
+    capturedAt: item.captured_at || null,
+    contentLength: Number(item.content_length || 0) || null,
+    etag: item.etag || null,
+    aiStatus: item.ai_status || null,
+    retryCount: Number(item.retry_count || 0),
+    aiAttemptCount: Number(item.ai_attempt_count || 0),
+    nextRetryAt: item.next_retry_at || null,
+    lastRetryAt: item.last_retry_at || null,
+    storageVerifiedAt: item.storage_verified_at || null,
+    lastErrorCode: item.last_error_code || null,
+    lastErrorMessage: item.last_error_message || null,
+    manualReviewRequiredAt: item.manual_review_required_at || null,
+    imageQualityStatus: item.image_quality_status || null,
+    imageQualityScore:
+      item.image_quality_score !== null && item.image_quality_score !== undefined
+        ? Number(item.image_quality_score)
+        : null,
+    validationStatus: item.validation_status || null,
+    validationReason: item.validation_reason || null,
+    toiletDetected:
+      item.toilet_detected !== null && item.toilet_detected !== undefined
+        ? Boolean(item.toilet_detected)
+        : null,
+    visibilityScore:
+      item.visibility_score !== null && item.visibility_score !== undefined
+        ? Number(item.visibility_score)
+        : null,
+    score,
+    score0To100: score,
+    starRating0To5: starRating,
+    confidenceScore:
+      item.confidence_score !== null && item.confidence_score !== undefined
+        ? Number(item.confidence_score)
+        : null,
+    aiConfidence:
+      aiScoring?.confidence !== undefined
+        ? Number(aiScoring.confidence)
+        : aiScoring?.confidence_score !== undefined
+          ? Number(aiScoring.confidence_score)
+          : item.confidence_score !== null && item.confidence_score !== undefined
+            ? Number(item.confidence_score)
+            : null,
+    floorScore:
+      item.floor_score !== null && item.floor_score !== undefined
+        ? Number(item.floor_score)
+        : null,
+    commodeScore:
+      item.commode_score !== null && item.commode_score !== undefined
+        ? Number(item.commode_score)
+        : null,
+    stainScore:
+      item.stain_score !== null && item.stain_score !== undefined
+        ? Number(item.stain_score)
+        : null,
+    garbageScore:
+      item.garbage_score !== null && item.garbage_score !== undefined
+        ? Number(item.garbage_score)
+        : null,
+    waterScore:
+      item.water_score !== null && item.water_score !== undefined
+        ? Number(item.water_score)
+        : null,
+    issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
+    issueSummary: item.issue_summary || null,
+    severity: item.severity || null,
+    reviewRequired: Boolean(item.review_required),
+    hygieneRisk: aiScoring?.hygiene_risk || null,
+    cleanlinessLevel: aiScoring?.cleanliness_level || null,
+    requiresRetake: Boolean(aiScoring?.requires_retake),
+    retakeReason: aiScoring?.retake_reason || null,
+    scoreReason: aiScoring?.score_reason || null,
+    criticalFindings:
+      aiScoring?.critical_findings && typeof aiScoring.critical_findings === 'object'
+        ? aiScoring.critical_findings
+        : null,
+    supervisorFlags: Array.isArray(aiScoring?.supervisor_flags)
+      ? aiScoring.supervisor_flags
+      : [],
+    modelVersion: item.model_version || null,
+    promptVersion: item.prompt_version || null,
+    scoringVersion: item.scoring_version || null,
+    aiProcessedAt: item.ai_processed_at || null,
+    aiError: item.ai_error || null,
+    scoringRejected: Boolean(item.scoring_rejected),
+    similarityScore:
+      item.similarity_score !== null && item.similarity_score !== undefined
+        ? Number(item.similarity_score)
+        : null,
+    explanationSummary: item.explanation_summary || null,
+    gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
+    gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
+    deviceId: item.device_id || null,
+    workerId: item.worker_id || null,
+    assignmentId: item.assignment_id || null,
+    metadata: item.metadata,
+  };
+};
+
 const mapInspection = (
   inspection,
   { withAnalysis = true, reviewByInspectionId = new Map() } = {}
@@ -488,6 +636,49 @@ const mapInspection = (
   const toiletUnitCode = inspection.ToiletUnit?.code || null;
   const inspectorName = inspection.inspector?.full_name || null;
   const shortId = String(inspection.id || '').slice(0, 8).toUpperCase();
+  const pipelineCounters =
+    inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+      ? inspection.pipeline_counters
+      : {};
+  const aiComparisonResult =
+    pipelineCounters.ai_comparison_result &&
+    typeof pipelineCounters.ai_comparison_result === 'object'
+      ? pipelineCounters.ai_comparison_result
+      : null;
+  const aiSupervisorFlags = Array.isArray(pipelineCounters.ai_supervisor_flags)
+    ? pipelineCounters.ai_supervisor_flags
+    : [];
+  const beforeScoreValue =
+    inspection.avg_before_score !== null && inspection.avg_before_score !== undefined
+      ? Number(inspection.avg_before_score)
+      : null;
+  const afterScoreValue =
+    inspection.avg_after_score !== null && inspection.avg_after_score !== undefined
+      ? Number(inspection.avg_after_score)
+      : null;
+  const afterStageAiScoring = afterMedia
+    .map((item) =>
+      item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
+        ? item.metadata.ai_scoring || null
+        : null
+    )
+    .filter((item) => item && typeof item === 'object');
+  const derivedHygieneRisk = afterStageAiScoring.reduce((risk, item) => {
+    const next = String(item?.hygiene_risk || '').trim().toLowerCase();
+    if (!next) return risk;
+    if (next === 'severe') return 'severe';
+    if (next === 'high' && risk !== 'severe') return 'high';
+    if (next === 'medium' && !['severe', 'high'].includes(risk)) return 'medium';
+    if (next === 'low' && !risk) return 'low';
+    return risk;
+  }, '');
+  const requiresRetake = afterStageAiScoring.some((item) => item?.requires_retake === true);
+  const aiStatus = inspectionAiStatusFromSignals({
+    score: afterScoreValue ?? beforeScoreValue,
+    hygieneRisk: derivedHygieneRisk || null,
+    requiresRetake,
+    suspiciousFlag: Boolean(inspection.suspicious_flag),
+  });
 
   return {
     id: inspection.id,
@@ -527,13 +718,14 @@ const mapInspection = (
         ? afterMedia.length
         : Number(inspection.after_image_count || 0),
     avgBeforeScore:
-      inspection.avg_before_score !== null && inspection.avg_before_score !== undefined
-        ? Number(inspection.avg_before_score)
-        : null,
+      beforeScoreValue,
     avgAfterScore:
-      inspection.avg_after_score !== null && inspection.avg_after_score !== undefined
-        ? Number(inspection.avg_after_score)
-        : null,
+      afterScoreValue,
+    avgBeforeStarRating0To5: starFromScore(beforeScoreValue),
+    avgAfterStarRating0To5: starFromScore(afterScoreValue),
+    aiHygieneRisk: derivedHygieneRisk || null,
+    aiStatus,
+    requiresRetake,
     improvementScore:
       inspection.improvement_score !== null && inspection.improvement_score !== undefined
         ? Number(inspection.improvement_score)
@@ -549,6 +741,8 @@ const mapInspection = (
     remainingIssues: Array.isArray(inspection.remaining_issues) ? inspection.remaining_issues : [],
     suspiciousFlag: Boolean(inspection.suspicious_flag),
     suspiciousReasons: Array.isArray(inspection.suspicious_reasons) ? inspection.suspicious_reasons : [],
+    aiSupervisorFlags,
+    aiComparisonResult,
     validationFailedCount: Number(inspection.validation_failed_count || 0),
     rejectedImageCount: Number(inspection.rejected_image_count || 0),
     evidence: {
@@ -593,270 +787,19 @@ const mapInspection = (
           employeeCode: inspection.inspector.employee_code,
         }
       : null,
-    beforeMedia: beforeMedia.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
-    afterMedia: afterMedia.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
-    media: media.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
+    beforeMedia: beforeMedia.map(mapInspectionMediaItem),
+    afterMedia: afterMedia.map(mapInspectionMediaItem),
+    media: media.map(mapInspectionMediaItem),
     timeline,
     analysisResult: result
       ? {
+          strictJson:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? result.raw_result.strictJson
+              : null,
           id: result.id,
           modelName: result.model_name,
           modelVersion: result.model_version,
@@ -876,6 +819,34 @@ const mapInspection = (
           subScores: result.sub_scores || null,
           issueTags: Array.isArray(result.issue_tags) ? result.issue_tags : [],
           severityLabel: result.severity_label || null,
+          score0To100:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(result.raw_result.strictJson.score_0_100 ?? result.cleanliness_score)
+              : Number(result.cleanliness_score),
+          starRating0To5:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(result.raw_result.strictJson.star_rating_0_5 ?? starFromScore(result.cleanliness_score))
+              : starFromScore(result.cleanliness_score),
+          hygieneRisk:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? result.raw_result.strictJson.hygiene_risk || null
+              : null,
+          requiresRetake:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Boolean(result.raw_result.strictJson.requires_retake)
+              : false,
           explanationText: result.explanation_text || null,
           processingMs: Number(result.processing_ms || 0) || null,
           anomalyFlags: result.anomaly_flags || {},

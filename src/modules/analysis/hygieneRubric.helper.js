@@ -1,11 +1,11 @@
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) => Number(Number(value).toFixed(2));
 
-const CAP_FECES_OR_EXTREME_BIO = 20;
-const CAP_HEAVY_BOWL_UNSAFE = 25;
-const CAP_FLOOR_WALLS_HEAVY = 30;
-const CAP_VERY_DIRTY_USABLE = 40;
-const CAP_MODERATE_MULTI_AREA = 60;
+const CAP_FECES_OR_EXTREME_BIO = 25;
+const CAP_HEAVY_BOWL_UNSAFE = 45;
+const CAP_FLOOR_WALLS_HEAVY = 40;
+const CAP_VERY_DIRTY_USABLE = 55;
+const CAP_MODERATE_MULTI_AREA = 70;
 const CAP_GENERALLY_CLEAN_MINOR = 85;
 
 /**
@@ -27,19 +27,20 @@ const applyCriticalPenaltyCaps = (score, flags = {}) => {
 
 const ratingLabelFromScore = (score) => {
   const s = clamp(Number(score) || 0, 0, 100);
-  if (s <= 10) return 'Unusable';
-  if (s <= 25) return 'Very Poor';
-  if (s <= 40) return 'Poor';
-  if (s <= 60) return 'Average';
-  if (s <= 75) return 'Good';
-  if (s <= 90) return 'Very Good';
+  if (s <= 10) return 'Extreme Dirty';
+  if (s <= 25) return 'Severe Dirty';
+  if (s <= 40) return 'Dirty';
+  if (s <= 55) return 'Poor';
+  if (s <= 70) return 'Average';
+  if (s <= 85) return 'Good';
+  if (s <= 95) return 'Very Good';
   return 'Excellent';
 };
 
 const hygieneInspectionResultFromScore = (score) => {
   const s = clamp(Number(score) || 0, 0, 100);
-  if (s <= 40) return 'Fail';
-  if (s <= 65) return 'Needs Cleaning';
+  if (s <= 25) return 'Severe Hygiene Issue';
+  if (s <= 55) return 'Needs Cleaning';
   if (s <= 85) return 'Pass';
   return 'Excellent';
 };
@@ -50,8 +51,9 @@ const starRatingFromScore = (score) => {
 };
 
 const severityFromRubricScore = (score, flags = {}) => {
-  if (flags.feces_or_extreme_bio_visible || Number(score) < 35) return 'high';
-  if (Number(score) < 65) return 'medium';
+  if (flags.feces_or_extreme_bio_visible || Number(score) <= 25) return 'high';
+  if (flags.heavy_bowl_unsafe || Number(score) <= 40) return 'high';
+  if (Number(score) <= 70) return 'medium';
   return 'low';
 };
 
