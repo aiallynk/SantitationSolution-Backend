@@ -24,7 +24,7 @@ const {
   normalizeMediaUrl,
   resolveMediaPairUrls,
 } = require('../media/mediaUrl.service');
-const { applyTenantScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const { applyTenantScope, isFacilityInScope, isFacilityAccessibleForInspection } = require('../../core/rbac/scopeWhere');
 const { IMAGE_PROCESSING_STATES } = require('./imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
 const {
@@ -496,7 +496,11 @@ const assertInspectionScope = async (inspectionId, req, options = {}) => {
   if (!inspection) {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
   }
-  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, inspection.facility_id || null, {
+      facilityTenantId: inspection.tenant_id,
+    })
+  ) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return inspection;
@@ -515,7 +519,11 @@ const assertToiletScope = async (toiletId, req) => {
   if (!req?.user?.isSuperAdmin && req?.user?.tenantId !== unit.Facility?.tenant_id) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (!isFacilityInScope(req, unit.facility_id || unit.Facility?.id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, unit.facility_id || unit.Facility?.id || null, {
+      facilityTenantId: unit.Facility?.tenant_id || null,
+    })
+  ) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return unit;

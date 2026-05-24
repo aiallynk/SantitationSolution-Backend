@@ -26,6 +26,8 @@ const {
   buildAccessContextFromUser,
   applyScopeToQuery,
   isFacilityInScope,
+  isFacilityAccessibleForInspection,
+  hasFieldInspectionRole,
 } = require('../../core/rbac/scopeWhere');
 const {
   resolveDateRange,
@@ -180,12 +182,33 @@ const scopedWhere = (req, where = {}) => {
   });
 };
 
+const assertWorkerInspectionOwnership = (req, inspection) => {
+  if (!inspection || req.user?.isSuperAdmin || !hasFieldInspectionRole(req)) {
+    return;
+  }
+  const inspectorId = String(inspection.inspector_user_id || '').trim();
+  const actorId = String(req.user?.id || '').trim();
+  if (inspectorId && actorId && inspectorId !== actorId) {
+    throw new AppError('This inspection belongs to another worker', 403, {
+      code: 'INSPECTOR_MISMATCH',
+      details: {
+        inspectionId: inspection.id,
+        inspectorUserId: inspectorId,
+      },
+    });
+  }
+};
+
 const assertInspectionScope = (req, inspection) => {
   if (!inspection) return;
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+  if (
+    !hasFieldInspectionRole(req) &&
+    req.user?.scopeLevel === 'facility' &&
+    uniqueIds(req.user?.scopeFacilityIds || []).length === 0
+  ) {
     throw new AppError('Worker scope is not loaded for facility-level access', 403, {
       code: 'SCOPE_NOT_LOADED',
       details: {
@@ -194,7 +217,11 @@ const assertInspectionScope = (req, inspection) => {
       },
     });
   }
-  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, inspection.facility_id || null, {
+      facilityTenantId: inspection.tenant_id,
+    })
+  ) {
     throw new AppError('Inspection out of scope', 403, {
       code: 'SCOPE_FORBIDDEN',
       details: {
@@ -203,6 +230,7 @@ const assertInspectionScope = (req, inspection) => {
       },
     });
   }
+  assertWorkerInspectionOwnership(req, inspection);
 };
 
 const createInspectionEvent = async ({
@@ -884,6 +912,56 @@ const buildAnalysisRequestContext = (req) => {
 
 const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
+const findResumableOngoingInspection = async ({
+  inspectorUserId,
+  facilityId,
+  toiletUnitId,
+}) => {
+  const where = {
+    inspector_user_id: inspectorUserId,
+    facility_id: facilityId,
+    submitted_at: null,
+  };
+  if (toiletUnitId) {
+    where.toilet_unit_id = toiletUnitId;
+  }
+
+  const candidates = await Inspection.findAll({
+    where,
+    order: [['captured_at', 'DESC']],
+    limit: 20,
+  });
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const candidateIds = candidates.map((row) => row.id);
+  const beforeRows = await InspectionMedia.findAll({
+    attributes: ['inspection_id'],
+    where: {
+      inspection_id: { [Op.in]: candidateIds },
+      capture_stage: 'before',
+      upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
+    },
+    group: ['inspection_id'],
+    raw: true,
+  });
+  const beforeIds = new Set(beforeRows.map((row) => row.inspection_id));
+  if (beforeIds.size === 0) {
+    return null;
+  }
+
+  const submittedRows = await InspectionSubmission.findAll({
+    attributes: ['inspection_id'],
+    where: { inspection_id: { [Op.in]: [...beforeIds] } },
+    group: ['inspection_id'],
+    raw: true,
+  });
+  const submittedIds = new Set(submittedRows.map((row) => row.inspection_id));
+
+  return candidates.find((row) => beforeIds.has(row.id) && !submittedIds.has(row.id)) || null;
+};
+
 const createInspection = async (req) => {
   const inspectionType = normalizeInspectionType(req.body.inspectionType);
   const facility = await Facility.findByPk(req.body.facilityId);
@@ -893,7 +971,11 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+  if (
+    !hasFieldInspectionRole(req) &&
+    req.user?.scopeLevel === 'facility' &&
+    uniqueIds(req.user?.scopeFacilityIds || []).length === 0
+  ) {
     throw new AppError('Worker scope is not loaded for facility-level access', 403, {
       code: 'SCOPE_NOT_LOADED',
       details: {
@@ -902,7 +984,11 @@ const createInspection = async (req) => {
       },
     });
   }
-  if (!isFacilityInScope(req, facility.id)) {
+  if (
+    !isFacilityAccessibleForInspection(req, facility.id, {
+      facilityTenantId: facility.tenant_id,
+    })
+  ) {
     throw new AppError('Facility out of scope', 403, {
       code: 'SCOPE_FORBIDDEN',
       details: {
@@ -926,6 +1012,15 @@ const createInspection = async (req) => {
 
   const fallbackLatitude = req.body.latitude ?? facility.latitude ?? null;
   const fallbackLongitude = req.body.longitude ?? facility.longitude ?? null;
+
+  const resumableInspection = await findResumableOngoingInspection({
+    inspectorUserId: req.user.id,
+    facilityId: facility.id,
+    toiletUnitId: req.body.toiletUnitId || null,
+  });
+  if (resumableInspection) {
+    return mapInspection(resumableInspection, { withAnalysis: false });
+  }
 
   const inspection = await Inspection.create({
     tenant_id: facility.tenant_id,
@@ -1452,23 +1547,137 @@ const reviewInspection = async (req) => {
   });
 };
 
+const DISPLAY_STATUS_PIPELINE = {
+  'queued for ai': 'queued_for_ai',
+  queued_for_ai: 'queued_for_ai',
+  queued: 'queued_for_ai',
+  processing: 'processing',
+  'low confidence': 'low_confidence',
+  low_confidence: 'low_confidence',
+};
+
+const findInspectionIdsByLatestReviewActions = async (actions = []) => {
+  const normalizedActions = (Array.isArray(actions) ? actions : [actions])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean);
+  if (normalizedActions.length === 0) {
+    return [];
+  }
+
+  const rows = await AuditLog.findAll({
+    attributes: ['entity_id', 'details', 'created_at'],
+    where: {
+      action: 'inspection.review',
+      entity_type: 'inspection',
+    },
+    order: [['created_at', 'DESC']],
+    raw: true,
+  });
+
+  const latestByInspection = new Map();
+  for (const row of rows) {
+    const id = String(row.entity_id || '').trim();
+    if (!id || latestByInspection.has(id)) {
+      continue;
+    }
+    let details = row.details || {};
+    if (typeof details === 'string') {
+      try {
+        details = JSON.parse(details);
+      } catch (_) {
+        details = {};
+      }
+    }
+    const action = String(details.reviewAction || details.action || 'reviewed').toLowerCase();
+    latestByInspection.set(id, action);
+  }
+
+  return Array.from(latestByInspection.entries())
+    .filter(([, action]) => normalizedActions.includes(action))
+    .map(([id]) => id);
+};
+
+const applyInspectionStatusFilters = async (where, query = {}) => {
+  const displayStatus = String(query.displayStatus || query.uiStatus || '')
+    .trim()
+    .toLowerCase();
+  if (displayStatus && displayStatus !== 'all') {
+    if (displayStatus === 'pending-review') {
+      const rejectedIds = await findInspectionIdsByLatestReviewActions([
+        'rejected',
+        'reinspection_required',
+      ]);
+      const pendingClauses = [
+        { pipeline_status: { [Op.in]: ['needs_review', 'low_confidence'] } },
+        { status: 'REVIEW_REQUIRED' },
+        { review_required: true },
+        { overall_status: { [Op.in]: ['critical', 'poor'] } },
+      ];
+      if (rejectedIds.length > 0) {
+        pendingClauses.push({ id: { [Op.in]: rejectedIds } });
+      }
+      return {
+        ...where,
+        [Op.or]: pendingClauses,
+      };
+    }
+
+    if (displayStatus === 'accepted') {
+      const ids = await findInspectionIdsByLatestReviewActions(['accepted']);
+      if (ids.length === 0) {
+        return { empty: true };
+      }
+      return { ...where, id: { [Op.in]: ids } };
+    }
+
+    if (displayStatus === 'rejected') {
+      const ids = await findInspectionIdsByLatestReviewActions(['rejected', 'reinspection_required']);
+      if (ids.length === 0) {
+        return { empty: true };
+      }
+      return { ...where, id: { [Op.in]: ids } };
+    }
+
+    const pipelineStatus = DISPLAY_STATUS_PIPELINE[displayStatus];
+    if (pipelineStatus) {
+      return { ...where, pipeline_status: pipelineStatus };
+    }
+  }
+
+  if (!query.status) {
+    return where;
+  }
+
+  const requestedStatus = String(query.status).trim().toLowerCase();
+  const requestedUpper = String(query.status).trim().toUpperCase();
+  if (PROCESSING_STATUSES.has(requestedStatus)) {
+    return { ...where, processing_status: requestedStatus };
+  }
+  if (INSPECTION_STATUSES.has(requestedUpper)) {
+    return { ...where, status: requestedUpper };
+  }
+  return { ...where, pipeline_status: requestedStatus };
+};
+
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
   let where = scopedWhere(req);
   const ongoingOnly = ['1', 'true', 'yes'].includes(
     String(req.query.ongoing || '').trim().toLowerCase()
   );
-  if (req.query.status) {
-    const requestedStatus = String(req.query.status).trim().toLowerCase();
-    const requestedUpper = String(req.query.status).trim().toUpperCase();
-    if (PROCESSING_STATUSES.has(requestedStatus)) {
-      where.processing_status = requestedStatus;
-    } else if (INSPECTION_STATUSES.has(requestedUpper)) {
-      where.status = requestedUpper;
-    } else {
-      where.pipeline_status = requestedStatus;
-    }
+  where = await applyInspectionStatusFilters(where, req.query);
+  if (where?.empty) {
+    return {
+      items: [],
+      meta: {
+        page,
+        limit,
+        total: 0,
+        totalPages: 1,
+      },
+    };
   }
+  delete where.empty;
   if (myOnly) {
     where.inspector_user_id = req.user.id;
   }

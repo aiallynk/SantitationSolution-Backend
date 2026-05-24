@@ -29,6 +29,24 @@ const patchTenant = async (req, res, next) => {
   }
 };
 
+const getOwnTenantProfile = async (req, res, next) => {
+  try {
+    const row = await platformService.getOwnTenantProfile(req);
+    return sendSuccess(res, { message: 'Tenant profile fetched successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const patchOwnTenantProfile = async (req, res, next) => {
+  try {
+    const row = await platformService.patchOwnTenantProfile(req);
+    return sendSuccess(res, { message: 'Tenant profile updated successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getGeographiesTree = async (req, res, next) => {
   try {
     const data = await platformService.listGeographyTree(req);
@@ -253,6 +271,8 @@ module.exports = {
   getTenants,
   postTenant,
   patchTenant,
+  getOwnTenantProfile,
+  patchOwnTenantProfile,
   getGeographiesTree,
   getGeographyOptions,
   postGeography,

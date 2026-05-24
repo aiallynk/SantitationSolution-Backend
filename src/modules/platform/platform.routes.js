@@ -56,6 +56,22 @@ const TOILETS_ROUTE_KEYS = [
 router.use(PLATFORM_ROUTE_PREFIXES, protect);
 
 router.get(
+  '/tenants/me',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_SETTINGS, RouteKeys.OPS_USERS),
+  requireScope(COMMON_SCOPE_RULE),
+  requireAnyPermissions('dashboard.read', 'users.manage'),
+  platformController.getOwnTenantProfile
+);
+router.patch(
+  '/tenants/me/profile',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_SETTINGS, RouteKeys.OPS_USERS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('users.manage'),
+  platformController.patchOwnTenantProfile
+);
+router.get(
   '/tenants',
   requireSurface(...OPS_WEB_SURFACES),
   requireRouteKey(RouteKeys.OPS_ADMINOPS),

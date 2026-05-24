@@ -2107,6 +2107,113 @@ const patchTenant = async (req) => {
   return mapTenantRow(tenant);
 };
 
+const mapTenantProfileForClient = (tenant) => {
+  const row = mapTenantRow(tenant);
+  const metadata = tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {};
+  return {
+    ...row,
+    addressLine2: metadata.addressLine2 || null,
+    pincode: metadata.pincode || null,
+    timezone: metadata.timezone || null,
+  };
+};
+
+const getOwnTenantProfile = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) {
+    throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  }
+  return mapTenantProfileForClient(tenant);
+};
+
+const patchOwnTenantProfile = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) {
+    throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  }
+
+  const nextMetadata = {
+    ...(tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {}),
+  };
+  if (req.body.addressLine2 !== undefined) {
+    nextMetadata.addressLine2 = sanitizeOptionalText(req.body.addressLine2, 300);
+  }
+  if (req.body.pincode !== undefined) {
+    const pincode = sanitizeOptionalText(req.body.pincode, 20);
+    if (pincode && !/^[A-Za-z0-9\- ]{3,20}$/.test(pincode)) {
+      throw new AppError('Invalid pincode format', 400, { code: 'VALIDATION_ERROR' });
+    }
+    nextMetadata.pincode = pincode;
+  }
+  if (req.body.timezone !== undefined) {
+    nextMetadata.timezone = sanitizeOptionalText(req.body.timezone, 64);
+  }
+
+  await tenant.update({
+    name: req.body.name ? sanitizeText(req.body.name, 200) : tenant.name,
+    country_code:
+      req.body.countryCode !== undefined
+        ? sanitizeOptionalText(req.body.countryCode, 10)
+        : tenant.country_code,
+    contact_name:
+      req.body.contactName !== undefined
+        ? sanitizeOptionalText(req.body.contactName, 180)
+        : tenant.contact_name,
+    contact_email:
+      req.body.contactEmail !== undefined
+        ? sanitizeOptionalText(req.body.contactEmail, 180)
+        : tenant.contact_email,
+    contact_mobile:
+      req.body.contactMobile !== undefined
+        ? sanitizeOptionalText(req.body.contactMobile, 32)
+        : tenant.contact_mobile,
+    country_name:
+      req.body.countryName !== undefined
+        ? sanitizeOptionalText(req.body.countryName, 120)
+        : tenant.country_name,
+    state_name:
+      req.body.stateName !== undefined
+        ? sanitizeOptionalText(req.body.stateName, 120)
+        : tenant.state_name,
+    district_name:
+      req.body.districtName !== undefined
+        ? sanitizeOptionalText(req.body.districtName, 120)
+        : tenant.district_name,
+    city_name:
+      req.body.cityName !== undefined
+        ? sanitizeOptionalText(req.body.cityName, 120)
+        : tenant.city_name,
+    zone_name:
+      req.body.zoneName !== undefined
+        ? sanitizeOptionalText(req.body.zoneName, 120)
+        : tenant.zone_name,
+    address_line:
+      req.body.addressLine !== undefined
+        ? sanitizeOptionalText(req.body.addressLine, 300)
+        : tenant.address_line,
+    metadata: nextMetadata,
+    updated_at: new Date(),
+  });
+
+  await createAuditLog({
+    req,
+    action: 'tenant.profile.update',
+    entityType: 'tenant',
+    entityId: tenant.id,
+    tenantId: tenant.id,
+  });
+
+  return mapTenantProfileForClient(tenant);
+};
+
 const buildGeographyTree = (rows) => {
   const map = new Map(rows.map((row) => [row.id, { ...row, children: [] }]));
   const roots = [];
@@ -3210,6 +3317,8 @@ module.exports = {
   listTenants,
   createTenant,
   patchTenant,
+  getOwnTenantProfile,
+  patchOwnTenantProfile,
   listGeographyTree,
   listGeographyOptions,
   createGeography,
