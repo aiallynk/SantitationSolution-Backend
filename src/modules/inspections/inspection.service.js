@@ -182,6 +182,14 @@ const scopedWhere = (req, where = {}) => {
   });
 };
 
+const scopedWhereForMyInspections = (req, where = {}) => {
+  const next = { ...where };
+  if (!req.user?.isSuperAdmin && req.user?.tenantId) {
+    next.tenant_id = req.user.tenantId;
+  }
+  return next;
+};
+
 const assertWorkerInspectionOwnership = (req, inspection) => {
   if (!inspection || req.user?.isSuperAdmin || !hasFieldInspectionRole(req)) {
     return;
@@ -1659,9 +1667,74 @@ const applyInspectionStatusFilters = async (where, query = {}) => {
   return { ...where, pipeline_status: requestedStatus };
 };
 
+const resolveOngoingInspectionFilter = async (where, { myOnly = false, userId = null } = {}) => {
+  const submittedQuery = {
+    attributes: ['inspection_id'],
+    raw: true,
+  };
+  if (myOnly && userId) {
+    submittedQuery.include = [
+      {
+        model: Inspection,
+        attributes: [],
+        where: {
+          inspector_user_id: userId,
+          ...(where.tenant_id ? { tenant_id: where.tenant_id } : {}),
+        },
+        required: true,
+      },
+    ];
+  }
+
+  const submittedRows = await InspectionSubmission.findAll(submittedQuery);
+  const submittedIds = uniqueIds(submittedRows.map((row) => row.inspection_id));
+
+  const candidateWhere = {
+    ...where,
+    submitted_at: null,
+  };
+  if (submittedIds.length > 0) {
+    candidateWhere.id = { [Op.notIn]: submittedIds };
+  }
+
+  const candidates = await Inspection.findAll({
+    attributes: ['id', 'processing_status'],
+    where: candidateWhere,
+    include: [
+      {
+        model: InspectionMedia,
+        attributes: ['id', 'capture_stage', 'upload_status'],
+        required: false,
+      },
+    ],
+  });
+
+  const ongoingIds = uniqueIds(
+    candidates
+      .filter((inspection) => {
+        const media = inspection.InspectionMedia || [];
+        const hasBefore = media.some((item) => item.capture_stage === 'before');
+        if (hasBefore) {
+          return true;
+        }
+        return String(inspection.processing_status || '').trim().toLowerCase() === 'draft';
+      })
+      .map((inspection) => inspection.id)
+  );
+
+  if (ongoingIds.length === 0) {
+    return { empty: true };
+  }
+
+  return { id: { [Op.in]: ongoingIds } };
+};
+
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  let where = scopedWhere(req);
+  let where =
+    myOnly && hasFieldInspectionRole(req)
+      ? scopedWhereForMyInspections(req)
+      : scopedWhere(req);
   const ongoingOnly = ['1', 'true', 'yes'].includes(
     String(req.query.ongoing || '').trim().toLowerCase()
   );
@@ -1682,42 +1755,32 @@ const listInspections = async (req, myOnly = false) => {
     where.inspector_user_id = req.user.id;
   }
   if (req.query.facilityId) {
-    if (!isFacilityInScope(req, req.query.facilityId)) {
+    const facilityFilterAllowed = myOnly && hasFieldInspectionRole(req)
+      ? true
+      : isFacilityInScope(req, req.query.facilityId);
+    if (!facilityFilterAllowed) {
       throw new AppError('facilityId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
     where.facility_id = req.query.facilityId;
   }
   if (ongoingOnly) {
-    const beforeRows = await InspectionMedia.findAll({
-      attributes: ['inspection_id'],
-      where: {
-        capture_stage: 'before',
-        upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
-        inspection_id: { [Op.ne]: null },
-      },
-      group: ['inspection_id'],
-      raw: true,
+    const ongoingFilter = await resolveOngoingInspectionFilter(where, {
+      myOnly,
+      userId: req.user?.id || null,
     });
-    const beforeInspectionIds = uniqueIds(
-      beforeRows.map((row) => row.inspection_id)
-    );
-    const submittedRows = beforeInspectionIds.length > 0
-      ? await InspectionSubmission.findAll({
-          attributes: ['inspection_id'],
-          where: { inspection_id: { [Op.in]: beforeInspectionIds } },
-          group: ['inspection_id'],
-          raw: true,
-        })
-      : [];
-    const submittedInspectionIds = uniqueIds(
-      submittedRows.map((row) => row.inspection_id)
-    );
-    where.id = {
-      [Op.in]: beforeInspectionIds,
-      ...(submittedInspectionIds.length > 0
-        ? { [Op.notIn]: submittedInspectionIds }
-        : {}),
-    };
+    if (ongoingFilter.empty) {
+      return {
+        items: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 1,
+        },
+      };
+    }
+    delete ongoingFilter.empty;
+    where = { ...where, ...ongoingFilter };
   }
   where = applyDateRangeToWhere(
     where,
