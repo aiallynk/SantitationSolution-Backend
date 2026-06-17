@@ -24,9 +24,13 @@ const {
   normalizeMediaUrl,
   resolveMediaPairUrls,
 } = require('../media/mediaUrl.service');
-const { applyTenantScope, isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const { applyTenantScope, isFacilityInScope, isFacilityAccessibleForInspection } = require('../../core/rbac/scopeWhere');
 const { IMAGE_PROCESSING_STATES } = require('./imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
+const {
+  evaluatePairwiseComparison,
+  starRatingFromScore,
+} = require('../analysis/sanitationPostProcessing.helper');
 
 const REVIEW_CONFIDENCE_THRESHOLD = runtimeConfig.analysis.confidenceThreshold;
 const IMPROVEMENT_THRESHOLD = runtimeConfig.analysis.improvementThreshold;
@@ -153,6 +157,33 @@ const unionIssueTags = (rows = []) => {
 };
 
 const stageOf = (row) => String(row.capture_stage || 'evidence').toLowerCase();
+
+const getAiScoringMetadata = (row) => {
+  if (!row || typeof row !== 'object') return null;
+  const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : null;
+  if (!metadata || Array.isArray(metadata)) return null;
+  const scoring = metadata.ai_scoring;
+  if (!scoring || typeof scoring !== 'object' || Array.isArray(scoring)) return null;
+  return scoring;
+};
+
+const getScoreFromRow = (row) => {
+  const scored = toNumber(row?.overall_score, null);
+  if (scored !== null) return scored;
+  const aiScoring = getAiScoringMetadata(row);
+  if (!aiScoring) return null;
+  return toNumber(aiScoring.score_0_100, null);
+};
+
+const scoreStatusFromSignals = ({ score, hygieneRisk, requiresRetake, suspicious }) => {
+  if (requiresRetake) return 'Retake Required';
+  if (suspicious) return 'Suspicious Improvement';
+  if (String(hygieneRisk || '').toLowerCase() === 'severe') return 'Severe Hygiene Issue';
+  const value = toNumber(score, null);
+  if (value === null) return 'Pending Analysis';
+  if (value < 40) return 'Needs Cleaning';
+  return 'Clean';
+};
 
 const hasScored = (row) =>
   String(row.ai_status || '').toUpperCase() === 'AI_COMPLETED' &&
@@ -313,13 +344,30 @@ const dedupeInspectionMediaRows = (rows = []) => {
 const mapMediaEvidence = async (row, options = {}) => {
   const mediaUrlCache = options.mediaUrlCache || null;
   const includeAdminDiagnostics = Boolean(options.includeAdminDiagnostics);
-  const overallScore = toNumber(row.overall_score, null);
+  const aiScoring = getAiScoringMetadata(row);
+  const overallScore =
+    toNumber(row.overall_score, null) ?? toNumber(aiScoring?.score_0_100, null);
   const confidence = toNumber(row.confidence_score, null);
   const garbageScore = toNumber(row.garbage_score, null);
   const waterScore = toNumber(row.water_score, null);
   const stainScore = toNumber(row.stain_score, null);
   const issueTags = Array.isArray(row.issue_tags) ? row.issue_tags : [];
   const similarityScore = toNumber(row.similarity_score, null);
+  const starRating =
+    toNumber(aiScoring?.star_rating_0_5, null) ??
+    (overallScore !== null ? starRatingFromScore(overallScore) : null);
+  const hygieneRisk = String(aiScoring?.hygiene_risk || '').trim().toLowerCase() || null;
+  const cleanlinessLevel =
+    String(aiScoring?.cleanliness_level || '').trim().toLowerCase() || null;
+  const requiresRetake = Boolean(aiScoring?.requires_retake);
+  const retakeReason = String(aiScoring?.retake_reason || '').trim() || null;
+  const scoreReason = String(aiScoring?.score_reason || '').trim() || null;
+  const criticalFindings =
+    aiScoring?.critical_findings && typeof aiScoring.critical_findings === 'object'
+      ? aiScoring.critical_findings
+      : null;
+  const supervisorFlags =
+    Array.isArray(aiScoring?.supervisor_flags) ? aiScoring.supervisor_flags : [];
   const validationStatus = row.validation_status || null;
   const validationReason = row.validation_reason || null;
   const suspiciousFlags = [];
@@ -378,8 +426,28 @@ const mapMediaEvidence = async (row, options = {}) => {
         : null,
     visibilityScore: toNumber(row.visibility_score, null),
     score: overallScore,
+    score0To100: overallScore,
+    starRating0To5: starRating,
+    hygieneRisk,
+    cleanlinessLevel,
+    aiStatusLabel: scoreStatusFromSignals({
+      score: overallScore,
+      hygieneRisk,
+      requiresRetake,
+      suspicious: suspiciousFlags.length > 0,
+    }),
     scoreLabel: scoreLabel(overallScore),
     confidence,
+    aiConfidence:
+      toNumber(aiScoring?.confidence, null) ??
+      toNumber(aiScoring?.confidence_score, null) ??
+      confidence,
+    requiresRetake,
+    retakeReason,
+    scoreReason,
+    criticalFindings,
+    supervisorFlags,
+    aiCapsApplied: Array.isArray(aiScoring?.caps_applied) ? aiScoring.caps_applied : [],
     subscores: {
       floor: toNumber(row.floor_score, null),
       commodeUrinal: toNumber(row.commode_score, null),
@@ -428,7 +496,11 @@ const assertInspectionScope = async (inspectionId, req, options = {}) => {
   if (!inspection) {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
   }
-  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, inspection.facility_id || null, {
+      facilityTenantId: inspection.tenant_id,
+    })
+  ) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return inspection;
@@ -447,7 +519,11 @@ const assertToiletScope = async (toiletId, req) => {
   if (!req?.user?.isSuperAdmin && req?.user?.tenantId !== unit.Facility?.tenant_id) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (!isFacilityInScope(req, unit.facility_id || unit.Facility?.id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, unit.facility_id || unit.Facility?.id || null, {
+      facilityTenantId: unit.Facility?.tenant_id || null,
+    })
+  ) {
     throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   return unit;
@@ -1017,6 +1093,95 @@ const recomputeInspectionAggregates = async (
   const resolvedIssues = beforeIssueTags.filter((tag) => !afterIssueTags.includes(tag));
   const remainingIssues = afterIssueTags;
 
+  const beforeByOrdinal = new Map();
+  for (const row of beforeRows) {
+    const ordinal = toNumber(row.ordinal, null);
+    if (ordinal === null || !hasScored(row)) continue;
+    beforeByOrdinal.set(Number(ordinal), row);
+  }
+  const pairwiseComparisons = [];
+  for (const after of afterRows) {
+    const ordinal = toNumber(after.ordinal, null);
+    if (ordinal === null || !beforeByOrdinal.has(Number(ordinal)) || !hasScored(after)) {
+      continue;
+    }
+    const before = beforeByOrdinal.get(Number(ordinal));
+    const beforeScore = getScoreFromRow(before);
+    const afterScore = getScoreFromRow(after);
+    if (beforeScore === null || afterScore === null) continue;
+    const beforeAi = getAiScoringMetadata(before);
+    const afterAi = getAiScoringMetadata(after);
+    const duplicateDetected =
+      String(before.sha256 || '').trim().toLowerCase() &&
+      String(before.sha256 || '').trim().toLowerCase() ===
+        String(after.sha256 || '').trim().toLowerCase();
+    const similarityValue = toNumber(after.similarity_score, null);
+    const comparison = evaluatePairwiseComparison({
+      before_score_0_100: beforeScore,
+      after_score_0_100: afterScore,
+      before_critical_findings: beforeAi?.critical_findings || null,
+      after_critical_findings: afterAi?.critical_findings || null,
+      similarities: similarityValue !== null ? [similarityValue] : [],
+      duplicate_detected: duplicateDetected,
+      same_toilet_likely: null,
+    });
+    pairwiseComparisons.push({
+      ordinal: Number(ordinal),
+      before_image_id: before.id,
+      after_image_id: after.id,
+      ...comparison,
+    });
+  }
+  const pairDeltaAvg =
+    pairwiseComparisons.length > 0
+      ? round2(mean(pairwiseComparisons.map((item) => toNumber(item.score_delta, 0))))
+      : null;
+  const pairBeforeAvg =
+    pairwiseComparisons.length > 0
+      ? round2(mean(pairwiseComparisons.map((item) => toNumber(item.before_score_0_100, 0))))
+      : null;
+  const pairAfterAvg =
+    pairwiseComparisons.length > 0
+      ? round2(mean(pairwiseComparisons.map((item) => toNumber(item.after_score_0_100, 0))))
+      : null;
+  const pairNoMeaningfulImprovement =
+    pairwiseComparisons.length > 0 &&
+    pairwiseComparisons.every((item) => item.improvement_level === 'none');
+  const pairSameToiletFalse = pairwiseComparisons.some(
+    (item) => item.same_toilet_likely === false
+  );
+  const pairSuspiciousChange = pairwiseComparisons.some(
+    (item) => item.suspicious_change_detected === true
+  );
+  const pairAcceptImprovement =
+    pairwiseComparisons.length > 0 &&
+    pairwiseComparisons.some((item) => item.should_accept_improvement === true);
+  const comparisonResult = {
+    pair_count: pairwiseComparisons.length,
+    same_toilet_likely: pairSameToiletFalse ? false : true,
+    before_score_0_100_avg: pairBeforeAvg ?? avgBeforeScore,
+    after_score_0_100_avg: pairAfterAvg ?? avgAfterScore,
+    score_delta: pairDeltaAvg ?? improvementScore,
+    cleanliness_difference_detected: !pairNoMeaningfulImprovement,
+    improvement_level: pairNoMeaningfulImprovement
+      ? 'none'
+      : pairDeltaAvg !== null && pairDeltaAvg > 30
+        ? 'major'
+        : pairDeltaAvg !== null && pairDeltaAvg > 15
+          ? 'moderate'
+          : pairDeltaAvg !== null && pairDeltaAvg > 5
+            ? 'minor'
+            : 'none',
+    should_accept_improvement: pairAcceptImprovement,
+    suspicious_change_detected: pairSuspiciousChange || pairSameToiletFalse,
+    suspicious_reason: pairSameToiletFalse
+      ? 'Before/after images are unlikely to be of same toilet.'
+      : pairSuspiciousChange
+        ? 'Suspicious before/after similarity detected.'
+        : '',
+    pairwise: pairwiseComparisons,
+  };
+
   const lowConfidence = scoredRows.some((row) => {
     const confidence = toNumber(row.confidence_score, null);
     return confidence !== null && confidence < REVIEW_CONFIDENCE_THRESHOLD;
@@ -1056,21 +1221,57 @@ const recomputeInspectionAggregates = async (
   const hasBefore = beforeRows.length > 0;
   const hasAfter = afterRows.length > 0;
   const noMeaningfulImprovement =
-    improvementScore !== null && improvementScore < IMPROVEMENT_THRESHOLD;
+    pairwiseComparisons.length > 0
+      ? pairNoMeaningfulImprovement
+      : improvementScore !== null && improvementScore < IMPROVEMENT_THRESHOLD;
   const noImprovementDetected =
-    improvementScore !== null &&
-    avgBeforeScore !== null &&
-    avgAfterScore !== null &&
-    avgAfterScore <= avgBeforeScore;
+    pairwiseComparisons.length > 0
+      ? pairNoMeaningfulImprovement
+      : improvementScore !== null &&
+        avgBeforeScore !== null &&
+        avgAfterScore !== null &&
+        avgAfterScore <= avgBeforeScore;
+  const visibleFecesDetected = evidenceRows.some((row) => {
+    const scoring = getAiScoringMetadata(row);
+    return scoring?.critical_findings?.visible_feces_or_potty === true;
+  });
+  const severeRiskDetected = evidenceRows.some((row) => {
+    const scoring = getAiScoringMetadata(row);
+    return String(scoring?.hygiene_risk || '').trim().toLowerCase() === 'severe';
+  });
+  const retakeRequiredDetected = evidenceRows.some((row) => {
+    const scoring = getAiScoringMetadata(row);
+    return scoring?.requires_retake === true;
+  });
+  const afterBelow40 = afterScored.some((row) => {
+    const score = getScoreFromRow(row);
+    return score !== null && score < 40;
+  });
+  const supervisorFlags = new Set();
+  if (visibleFecesDetected) supervisorFlags.add('SEVERE_HYGIENE_ISSUE');
+  if (severeRiskDetected) supervisorFlags.add('SEVERE_HYGIENE_ISSUE');
+  if (afterBelow40) supervisorFlags.add('AI_REVIEW_REQUIRED');
+  if (suspiciousReuseBySha || suspiciousReuseByPerceptualHash) supervisorFlags.add('SUSPICIOUS_IMPROVEMENT');
+  if (pairNoMeaningfulImprovement || noImprovementDetected) supervisorFlags.add('AI_REVIEW_REQUIRED');
+  if (pairSameToiletFalse) supervisorFlags.add('SUSPICIOUS_IMPROVEMENT');
+  if (retakeRequiredDetected || lowConfidence) supervisorFlags.add('RETAKE_REQUIRED');
 
   const suspiciousReasons = [];
   if (suspiciousReuseBySha || suspiciousReuseByPerceptualHash) {
     suspiciousReasons.push('possible_fake_cleaning_similar_images');
+    suspiciousReasons.push('duplicate_before_after_image');
   }
-  if (noImprovementDetected) {
+  if (noImprovementDetected || pairNoMeaningfulImprovement) {
     suspiciousReasons.push('no_improvement_detected');
+    suspiciousReasons.push('no_meaningful_improvement');
   }
-  const suspiciousFlag = suspiciousReasons.length > 0;
+  if (pairSameToiletFalse) suspiciousReasons.push('same_toilet_unlikely');
+  if (pairSuspiciousChange) suspiciousReasons.push('suspicious_pairwise_change');
+  if (visibleFecesDetected) suspiciousReasons.push('visible_feces_detected');
+  if (retakeRequiredDetected) suspiciousReasons.push('retake_required');
+  if (severeRiskDetected) suspiciousReasons.push('severe_hygiene_risk');
+  const suspiciousReasonsUnique = Array.from(new Set(suspiciousReasons));
+  const suspiciousFlag = suspiciousReasonsUnique.length > 0;
 
   const reviewRequired =
     evidenceRows.some((row) => Boolean(row.review_required)) ||
@@ -1082,7 +1283,12 @@ const recomputeInspectionAggregates = async (
     rejectedImageCount > 0 ||
     !hasBefore ||
     !hasAfter ||
-    noMeaningfulImprovement;
+    noMeaningfulImprovement ||
+    visibleFecesDetected ||
+    severeRiskDetected ||
+    retakeRequiredDetected ||
+    afterBelow40 ||
+    pairSameToiletFalse;
 
   const completedImages = evidenceRows.filter(
     (row) =>
@@ -1170,6 +1376,8 @@ const recomputeInspectionAggregates = async (
       fail_any_below_40: hygieneFailAnyBelow40,
       scored_image_count: scoredRows.length,
     },
+    ai_comparison_result: comparisonResult,
+    ai_supervisor_flags: Array.from(supervisorFlags.values()),
   };
 
   await inspection.update(
@@ -1188,7 +1396,7 @@ const recomputeInspectionAggregates = async (
       inspection_result: inspectionResult,
       review_required: reviewRequired,
       suspicious_flag: suspiciousFlag,
-      suspicious_reasons: suspiciousReasons,
+      suspicious_reasons: suspiciousReasonsUnique,
       validation_failed_count: validationFailedCount,
       rejected_image_count: rejectedImageCount,
       pipeline_counters: mergedPipelineCounters,
@@ -1222,10 +1430,16 @@ const recomputeInspectionAggregates = async (
     resolvedIssues,
     remainingIssues,
     suspiciousFlag,
-    suspiciousReasons,
+    suspiciousReasons: suspiciousReasonsUnique,
     validationFailedCount,
     rejectedImageCount,
-    pipelineCounters: lifecycleCounters,
+    comparisonResult,
+    supervisorFlags: Array.from(supervisorFlags.values()),
+    pipelineCounters: {
+      ...lifecycleCounters,
+      ai_comparison_result: comparisonResult,
+      ai_supervisor_flags: Array.from(supervisorFlags.values()),
+    },
   };
 };
 
@@ -1552,6 +1766,16 @@ const getInspectionComparison = async (inspectionId, req) => {
   ]);
 
   const beforeByOrdinal = new Map();
+  const beforeRawByOrdinal = new Map();
+  const afterRawByOrdinal = new Map();
+  for (const row of beforeRows) {
+    const ordinal = toNumber(row.ordinal, null);
+    if (ordinal !== null) beforeRawByOrdinal.set(Number(ordinal), row);
+  }
+  for (const row of afterRows) {
+    const ordinal = toNumber(row.ordinal, null);
+    if (ordinal !== null) afterRawByOrdinal.set(Number(ordinal), row);
+  }
   for (const image of beforeImages) {
     if (image.ordinal !== null && image.ordinal !== undefined) {
       beforeByOrdinal.set(Number(image.ordinal), image);
@@ -1560,19 +1784,63 @@ const getInspectionComparison = async (inspectionId, req) => {
 
   const pairs = [];
   for (const image of afterImages) {
-    const ordinal = image.ordinal !== null && image.ordinal !== undefined ? Number(image.ordinal) : null;
-    if (ordinal !== null && beforeByOrdinal.has(ordinal)) {
-      const before = beforeByOrdinal.get(ordinal);
-      pairs.push({
-        ordinal,
-        before,
-        after: image,
-        delta:
-          toNumber(image?.score, null) !== null && toNumber(before?.score, null) !== null
-            ? round2(toNumber(image.score, 0) - toNumber(before.score, 0))
-            : null,
-      });
+    const ordinal =
+      image.ordinal !== null && image.ordinal !== undefined ? Number(image.ordinal) : null;
+    if (ordinal === null || !beforeByOrdinal.has(ordinal)) {
+      continue;
     }
+    const before = beforeByOrdinal.get(ordinal);
+    const beforeRaw = beforeRawByOrdinal.get(ordinal) || null;
+    const afterRaw = afterRawByOrdinal.get(ordinal) || null;
+    const beforeScore = toNumber(before?.score, null);
+    const afterScore = toNumber(image?.score, null);
+    const delta =
+      beforeScore !== null && afterScore !== null ? round2(afterScore - beforeScore) : null;
+    const beforeAi = getAiScoringMetadata(beforeRaw);
+    const afterAi = getAiScoringMetadata(afterRaw);
+    const duplicateDetected =
+      String(beforeRaw?.sha256 || '').trim().toLowerCase() &&
+      String(beforeRaw?.sha256 || '').trim().toLowerCase() ===
+        String(afterRaw?.sha256 || '').trim().toLowerCase();
+    const pairEval =
+      beforeScore !== null && afterScore !== null
+        ? evaluatePairwiseComparison({
+            before_score_0_100: beforeScore,
+            after_score_0_100: afterScore,
+            before_critical_findings: beforeAi?.critical_findings || before?.criticalFindings || null,
+            after_critical_findings: afterAi?.critical_findings || image?.criticalFindings || null,
+            similarities:
+              toNumber(image?.similarityScore, null) !== null
+                ? [toNumber(image.similarityScore, 0)]
+                : [],
+            duplicate_detected: Boolean(duplicateDetected),
+            same_toilet_likely: null,
+          })
+        : null;
+    pairs.push({
+      ordinal,
+      before,
+      after: image,
+      delta,
+      beforeScore,
+      afterScore,
+      ...(pairEval
+        ? {
+            imageAngleSimilarity: pairEval.image_angle_similarity,
+            cleanlinessDifferenceDetected: pairEval.cleanliness_difference_detected,
+            improvementLevel: pairEval.improvement_level,
+            shouldAcceptImprovement: pairEval.should_accept_improvement,
+            sameToiletLikely: pairEval.same_toilet_likely,
+            suspiciousChangeDetected: pairEval.suspicious_change_detected,
+            suspiciousReason: pairEval.suspicious_reason || null,
+            comparisonReason: pairEval.comparison_reason || null,
+            remainingCriticalIssuesAfter: pairEval.remaining_critical_issues_after,
+            beforeStarRating0To5: pairEval.before_star_rating_0_5,
+            afterStarRating0To5: pairEval.after_star_rating_0_5,
+            scoreDelta: pairEval.score_delta,
+          }
+        : {}),
+    });
   }
 
   const beforeAvg =
@@ -1584,6 +1852,35 @@ const getInspectionComparison = async (inspectionId, req) => {
   const improvement =
     toNumber(inspection.improvement_score, null) ??
     (beforeAvg !== null && afterAvg !== null ? round2(afterAvg - beforeAvg) : null);
+  const pipelineCounters =
+    inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+      ? inspection.pipeline_counters
+      : {};
+  const comparisonResult =
+    pipelineCounters.ai_comparison_result &&
+    typeof pipelineCounters.ai_comparison_result === 'object'
+      ? pipelineCounters.ai_comparison_result
+      : null;
+  const supervisorFlags = Array.isArray(pipelineCounters.ai_supervisor_flags)
+    ? pipelineCounters.ai_supervisor_flags
+    : [];
+  const derivedHygieneRisk = afterImages.reduce((risk, image) => {
+    const nextRisk = String(image?.hygieneRisk || '').trim().toLowerCase();
+    if (!nextRisk) return risk;
+    if (nextRisk === 'severe') return 'severe';
+    if (nextRisk === 'high' && risk !== 'severe') return 'high';
+    if (nextRisk === 'medium' && !['severe', 'high'].includes(risk)) return 'medium';
+    if (nextRisk === 'low' && !risk) return 'low';
+    return risk;
+  }, '');
+  const summaryStarRating =
+    afterAvg !== null ? starRatingFromScore(afterAvg) : beforeAvg !== null ? starRatingFromScore(beforeAvg) : null;
+  const summaryStatus = scoreStatusFromSignals({
+    score: afterAvg ?? beforeAvg,
+    hygieneRisk: derivedHygieneRisk || null,
+    requiresRetake: afterImages.some((image) => Boolean(image?.requiresRetake)),
+    suspicious: Boolean(inspection.suspicious_flag) || supervisorFlags.includes('SUSPICIOUS_IMPROVEMENT'),
+  });
 
   return {
     inspectionId: inspection.id,
@@ -1591,6 +1888,10 @@ const getInspectionComparison = async (inspectionId, req) => {
       avgBeforeScore: beforeAvg,
       avgAfterScore: afterAvg,
       improvementScore: improvement,
+      beforeStarRating0To5: beforeAvg !== null ? starRatingFromScore(beforeAvg) : null,
+      afterStarRating0To5: summaryStarRating,
+      hygieneRisk: derivedHygieneRisk || null,
+      status: summaryStatus,
       scoreLabelBefore: scoreLabel(beforeAvg),
       scoreLabelAfter: scoreLabel(afterAvg),
       inspectionResult: inspection.inspection_result || null,
@@ -1602,6 +1903,8 @@ const getInspectionComparison = async (inspectionId, req) => {
         : [],
       validationFailedCount: Number(inspection.validation_failed_count || 0),
       rejectedImageCount: Number(inspection.rejected_image_count || 0),
+      comparisonResult,
+      supervisorFlags,
     },
     grouped: {
       beforeImages,

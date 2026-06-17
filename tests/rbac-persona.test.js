@@ -40,13 +40,16 @@ test('role bundles keep geography admins aligned and enforce facility/supervisor
 
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('audit.read'), true);
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('inspection.create'), true);
+  assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('supervisor.workers.read'), true);
+  assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('worker.task_progress.read'), true);
   assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('task.manage'), false);
+  assert.equal(ROLE_PERMISSION_BUNDLES.auditor.includes('supervisor.alerts.escalate'), false);
 });
 
 test('scope rules enforce scoped role requirements', () => {
   assert.equal(getRequiredScopeType('city_admin'), 'geography');
   assert.equal(getRequiredScopeType('facility_manager'), 'facility');
-  assert.equal(getRequiredScopeType('supervisor'), 'facility');
+  assert.equal(getRequiredScopeType('supervisor'), 'geography');
   assert.equal(getRequiredScopeType('field_worker'), 'facility');
 
   const missingCityScope = collectRoleScopeValidationErrors({
@@ -96,18 +99,12 @@ test('role access profile resolves strict route, widget, and action keys for sup
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_USERS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_ADMINOPS), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_SETTINGS), false);
-<<<<<<< HEAD
-  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), true);
-  assert.equal(profile.routeKeys.includes(RouteKeys.OPS_MONITORING), true);
-  assert.equal(profile.actionKeys.includes('task.assign'), true);
-=======
   assert.equal(profile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), false);
   assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_OVERVIEW), true);
   assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_WORKERS), true);
   assert.equal(profile.routeKeys.includes(RouteKeys.SUPERVISOR_LIVE_LOCATION), true);
   assert.equal(profile.actionKeys.includes('task.assign'), false);
   assert.equal(profile.actionKeys.includes('supervisor.alerts.escalate'), true);
->>>>>>> 2ff9ef24d8ebb2ede97d37640848db6173ebd690
   assert.equal(profile.actionKeys.includes('user.manage'), false);
   assert.equal(profile.widgetKeys.includes('W_WORKER_PRODUCTIVITY'), true);
   assert.equal(profile.permissionCodes.includes('supervisor.workers.read'), true);
@@ -115,7 +112,7 @@ test('role access profile resolves strict route, widget, and action keys for sup
   assert.equal(profile.permissionCodes.includes('task.manage'), false);
 });
 
-test('monitoring route key remains supervisor-only', () => {
+test('shared monitoring route key remains excluded from persona-specific views', () => {
   const tenantAdminProfile = resolveRoleAccessProfile({ roleCodes: ['tenant_admin'] });
   const viewerProfile = resolveRoleAccessProfile({ roleCodes: ['viewer'] });
   const auditorProfile = resolveRoleAccessProfile({ roleCodes: ['auditor'] });
@@ -127,7 +124,7 @@ test('monitoring route key remains supervisor-only', () => {
   assert.equal(fieldWorkerProfile.routeKeys.includes(RouteKeys.OPS_MONITORING), false);
 });
 
-test('auditor gets dedicated auditor route keys only', () => {
+test('auditor gets dedicated auditor routes plus read-only supervisor review routes', () => {
   const auditorProfile = resolveRoleAccessProfile({ roleCodes: ['auditor'] });
   const supervisorProfile = resolveRoleAccessProfile({ roleCodes: ['supervisor'] });
   const tenantAdminProfile = resolveRoleAccessProfile({ roleCodes: ['tenant_admin'] });
@@ -140,6 +137,13 @@ test('auditor gets dedicated auditor route keys only', () => {
   assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_ALERTS), true);
   assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_EVIDENCE), true);
   assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_REPORTS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.SUPERVISOR_WORKERS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.SUPERVISOR_WORK_PROGRESS), true);
+  assert.equal(auditorProfile.routeKeys.includes(RouteKeys.SUPERVISOR_CLEANLINESS), true);
+  assert.equal(auditorProfile.permissionCodes.includes('supervisor.workers.read'), true);
+  assert.equal(auditorProfile.permissionCodes.includes('worker.task_progress.read'), true);
+  assert.equal(auditorProfile.actionKeys.includes('supervisor.alerts.escalate'), false);
+  assert.equal(auditorProfile.actionKeys.includes('task.reassign'), false);
   assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_OVERVIEW), false);
   assert.equal(auditorProfile.routeKeys.includes(RouteKeys.OPS_USERS), false);
   assert.equal(supervisorProfile.routeKeys.includes(RouteKeys.OPS_AUDITOR_DASHBOARD), false);

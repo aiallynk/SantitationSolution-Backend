@@ -314,6 +314,32 @@ const SUPERVISOR_PERMISSION_CODES = [
 
 ];
 
+const SUPERVISOR_READ_ROUTE_KEYS = [
+  RouteKeys.SUPERVISOR_OVERVIEW,
+  RouteKeys.SUPERVISOR_WORKERS,
+  RouteKeys.SUPERVISOR_ATTENDANCE,
+  RouteKeys.SUPERVISOR_LIVE_LOCATION,
+  RouteKeys.SUPERVISOR_CHECKIN_CHECKOUT,
+  RouteKeys.SUPERVISOR_DEVICE_HEALTH,
+  RouteKeys.SUPERVISOR_WORK_PROGRESS,
+  RouteKeys.SUPERVISOR_CLEANLINESS,
+  RouteKeys.SUPERVISOR_ALERTS,
+  RouteKeys.SUPERVISOR_REPORTS,
+];
+
+const AUDITOR_SUPERVISOR_PERMISSION_CODES = [
+  'supervisor.overview.read',
+  'supervisor.workers.read',
+  'worker.attendance.read',
+  'worker.location.read',
+  'worker.checkin.read',
+  'worker.device_health.read',
+  'worker.task_progress.read',
+  'cleanliness.verification.read',
+  'supervisor.alerts.read',
+  'supervisor.reports.read',
+];
+
 const VIEWER_PERMISSION_CODES = ['auth.read', 'dashboard.read', 'reports.read'];
 
 const AUDITOR_PERMISSION_CODES = [
@@ -629,10 +655,11 @@ const ROLE_ACCESS_MATRIX = {
       RouteKeys.OPS_AUDITOR_ALERTS,
       RouteKeys.OPS_AUDITOR_EVIDENCE,
       RouteKeys.OPS_AUDITOR_REPORTS,
+      ...SUPERVISOR_READ_ROUTE_KEYS,
       RouteKeys.OPS_PROFILE,
     ],
     allowedActionKeys: [],
-    allowedWidgetKeys: [...READ_ONLY_WIDGET_KEYS, ...AUDITOR_WIDGET_KEYS],
+    allowedWidgetKeys: [...READ_ONLY_WIDGET_KEYS, ...AUDITOR_WIDGET_KEYS, ...SUPERVISOR_WIDGET_KEYS],
     allowedDataDomains: [
       'read.dashboard',
       'read.reports',
@@ -641,8 +668,17 @@ const ROLE_ACCESS_MATRIX = {
       'audit.inspection_trail',
       'audit.evidence',
       'audit.attendance',
+      'supervisor.workers',
+      'supervisor.attendance',
+      'supervisor.locations',
+      'supervisor.checkins',
+      'supervisor.device_health',
+      'supervisor.work_progress',
+      'supervisor.cleanliness',
+      'supervisor.alerts',
+      'supervisor.reports',
     ],
-    permissionCodes: [...AUDITOR_PERMISSION_CODES],
+    permissionCodes: [...AUDITOR_PERMISSION_CODES, ...AUDITOR_SUPERVISOR_PERMISSION_CODES],
     readOnly: true,
     canAccessWeb: true,
     canAccessMobile: false,

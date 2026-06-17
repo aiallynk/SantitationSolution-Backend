@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Op } = require('sequelize');
 
-const { requireRouteKey } = require('../src/core/middleware/auth');
+const { requireAnyPermissions, requireRouteKey } = require('../src/core/middleware/auth');
 const { RouteKeys } = require('../src/core/rbac/accessMatrix');
 const { buildAccessContextFromUser, applyScopeToQuery } = require('../src/core/rbac/accessContext');
 
@@ -86,6 +86,55 @@ test('supervisor route keys are limited to dedicated supervisor routes', async (
   assert.equal(adminError.code, 'ROUTE_FORBIDDEN');
   assert.equal(supervisorError, null);
   assert.equal(workerRosterError, null);
+});
+
+test('auditor route bundle can enter read-only supervisor review routes', async () => {
+  const workerRosterGuard = requireRouteKey(RouteKeys.SUPERVISOR_WORKERS);
+  const workProgressGuard = requireRouteKey(RouteKeys.SUPERVISOR_WORK_PROGRESS);
+  const adminGuard = requireRouteKey(RouteKeys.OPS_USERS);
+  const req = {
+    user: {
+      routeKeys: [
+        RouteKeys.OPS_AUDITOR_DASHBOARD,
+        RouteKeys.SUPERVISOR_WORKERS,
+        RouteKeys.SUPERVISOR_WORK_PROGRESS,
+      ],
+    },
+  };
+
+  const workerRosterError = await runMiddleware(workerRosterGuard, req);
+  const workProgressError = await runMiddleware(workProgressGuard, req);
+  const adminError = await runMiddleware(adminGuard, req);
+
+  assert.equal(workerRosterError, null);
+  assert.equal(workProgressError, null);
+  assert.ok(adminError);
+  assert.equal(adminError.code, 'ROUTE_FORBIDDEN');
+});
+
+test('auditor alert review route key can read generic alerts endpoint', async () => {
+  const routeGuard = requireRouteKey(
+    RouteKeys.OPS_ALERTS,
+    RouteKeys.OPS_AUDITOR_ALERTS,
+    RouteKeys.SUPERVISOR_ALERTS
+  );
+  const permissionGuard = requireAnyPermissions(
+    'alerts.manage',
+    'dashboard.read',
+    'supervisor.alerts.read'
+  );
+  const req = {
+    user: {
+      routeKeys: [RouteKeys.OPS_AUDITOR_ALERTS],
+      permissionCodes: ['dashboard.read'],
+    },
+  };
+
+  const routeError = await runMiddleware(routeGuard, req);
+  const permissionError = await runMiddleware(permissionGuard, req);
+
+  assert.equal(routeError, null);
+  assert.equal(permissionError, null);
 });
 
 test('tenant admin cannot cross tenant boundary in scoped query', () => {

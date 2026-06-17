@@ -18,7 +18,7 @@ const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { recomputeInspectionAggregates } = require('./inspectionEvidence.service');
-const { isFacilityInScope } = require('../../core/rbac/scopeWhere');
+const { isFacilityInScope, isFacilityAccessibleForInspection, hasFieldInspectionRole } = require('../../core/rbac/scopeWhere');
 const { logger } = require('../../core/logging/logger');
 const {
   IMAGE_PROCESSING_STATES,
@@ -166,8 +166,21 @@ const assertInspectionScope = async (req) => {
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, inspection.facility_id || null, {
+      facilityTenantId: inspection.tenant_id,
+    })
+  ) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (hasFieldInspectionRole(req)) {
+    const inspectorId = String(inspection.inspector_user_id || '').trim();
+    const actorId = String(req.user?.id || '').trim();
+    if (inspectorId && actorId && inspectorId !== actorId) {
+      throw new AppError('This inspection belongs to another worker', 403, {
+        code: 'INSPECTOR_MISMATCH',
+      });
+    }
   }
   return inspection;
 };

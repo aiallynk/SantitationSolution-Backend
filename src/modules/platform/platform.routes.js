@@ -16,6 +16,7 @@ const {
   validateFacilityCreate,
   validateBlockCreate,
   validateUnitCreate,
+  validateUnitBulkCreate,
   validateQrResolve,
 } = require('./platform.validator');
 const {
@@ -54,6 +55,22 @@ const TOILETS_ROUTE_KEYS = [
 
 router.use(PLATFORM_ROUTE_PREFIXES, protect);
 
+router.get(
+  '/tenants/me',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_SETTINGS, RouteKeys.OPS_USERS),
+  requireScope(COMMON_SCOPE_RULE),
+  requireAnyPermissions('dashboard.read', 'users.manage'),
+  platformController.getOwnTenantProfile
+);
+router.patch(
+  '/tenants/me/profile',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_SETTINGS, RouteKeys.OPS_USERS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('users.manage'),
+  platformController.patchOwnTenantProfile
+);
 router.get(
   '/tenants',
   requireSurface(...OPS_WEB_SURFACES),
@@ -217,6 +234,16 @@ router.post(
   requireAnyPermissions('dashboard.read', 'inspection.create'),
   validate(validateQrResolve),
   platformController.postToiletUnitByQr
+);
+router.post(
+  '/toilet-units/bulk',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  validate(validateUnitBulkCreate),
+  platformController.postToiletUnitsBulk
 );
 router.post(
   '/toilet-units',

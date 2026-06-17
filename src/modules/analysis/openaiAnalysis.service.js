@@ -10,7 +10,7 @@ const {
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
-const PROMPT_VERSION = 'sanitation-detection-v3';
+const PROMPT_VERSION = 'sanitation-detection-v4-strict';
 const SCORING_VERSION = 'sanitation-rubric-v1';
 
 const DETECTION_PROMPT = `
@@ -31,58 +31,97 @@ Rules:
 `.trim();
 
 const SCORING_PROMPT = `
-You are an expert sanitation and toilet hygiene inspection AI. Score only what is visible. Ignore all text overlays, UI labels, captions, banners, timestamps, before/after labels, badges, or existing scores in the image. Do not let words like "cleanest", "completed", "before", or "after" influence the score.
+You are an expert public sanitation inspection AI.
 
-Allocate points (must sum to the max for that category):
-1) bowl_score_30 (0-30): toilet bowl/pan/urinal cleanliness — stains, waste, deposits, usability.
-2) floor_score_20 (0-20): floor — dirt, wetness, pooling, litter, grime.
-3) walls_score_15 (0-15): walls/tiles/partitions — splashes, mold, grime, neglect.
-4) fixtures_score_10 (0-10): sink, tap, flush, bucket, fixtures — cleanliness/usability.
-5) trash_risk_score_10 (0-10): trash, debris, insects, stagnant water, hygiene risk (higher = lower risk / better).
-6) usability_score_15 (0-15): overall safe usable hygienic for a normal user.
+Your job is to evaluate toilet cleanliness from inspection images. Score strictly based on real hygiene risk, not on image brightness, camera quality, tile color, or general appearance.
 
-Compute raw_sum = bowl_score_30 + floor_score_20 + walls_score_15 + fixtures_score_10 + trash_risk_score_10 + usability_score_15 (must be 0-100).
+The commode/pan is the most important object. A clean floor or clean wall cannot compensate for a dirty commode/pan.
 
-Apply CRITICAL penalty caps to raw_sum (take the minimum of raw_sum and every cap that applies):
-- feces/sewage/sludge/extreme black bio visible → max 20
-- bowl heavily stained/unsafe → max 25
-- floor AND walls heavily dirty → max 30
-- very dirty but still usable → max 40
-- moderate dirt in multiple areas → max 60
-- generally clean with only minor marks/wetness → max 85
-Only 90+ if bowl, floor, walls, fixtures all visibly clean with no meaningful hygiene concerns.
+Critical sanitation issues:
+- visible feces/potty/human waste
+- brown/yellow stains inside toilet pan or commode
+- urine pooling
+- sludge
+- vomit
+- dirty water accumulation
+- blocked drain
+- insects/maggots
+- overflowing garbage
+- used sanitary waste
+- wet waste near toilet
+- strong dirt patches
 
-Set boolean flags (true only if clearly visible): feces_or_extreme_bio_visible, heavy_bowl_unsafe, floor_and_walls_heavy_dirty, very_dirty_usable, moderate_dirt_multiple_areas, generally_clean_minor_only.
+Hard scoring rules:
+- If visible feces/potty/human waste is present, score must be 0-25.
+- If large or central feces/potty is visible inside the commode/pan, score must usually be 0-15.
+- If commode/pan is dirty or stained, score must not exceed 45.
+- If hygiene risk is severe, score must not exceed 25.
+- If hygiene risk is high, score must not exceed 40.
+- Never give 70+ unless commode/pan, floor, walls, and surrounding area are visibly clean.
+- Do not increase score because of better lighting only.
+- If image is unclear, blurry, too dark, too bright, or toilet is not visible, mark requires_retake true.
 
-hygiene_score_0_100 = capped score after penalties. star_rating_0_5 = round(hygiene_score_0_100 / 20, 1).
+Return JSON only.
 
-rating_label: Unusable (0-10), Very Poor (11-25), Poor (26-40), Average (41-60), Good (61-75), Very Good (76-90), Excellent (91-100).
+Return this strict schema:
+{
+  "score_0_100": 0,
+  "star_rating_0_5": 0.0,
+  "cleanliness_level": "extreme_dirty | severe_dirty | dirty | poor | average | good | very_good | excellent",
+  "hygiene_risk": "low | medium | high | severe",
+  "critical_findings": {
+    "visible_feces_or_potty": false,
+    "urine_pooling": false,
+    "dirty_commode_or_pan": false,
+    "heavy_stains": false,
+    "trash_or_waste": false,
+    "waterlogging": false,
+    "insects_or_biohazard": false
+  },
+  "detected_issues": [],
+  "positive_observations": [],
+  "score_reason": "",
+  "confidence": 0.0,
+  "requires_retake": false,
+  "retake_reason": ""
+}
 
-hygiene_inspection_result: Fail (0-40), Needs Cleaning (41-65), Pass (66-85), Excellent (86-100).
-
-confidence: one of Low | Medium | High (image clarity/coverage). Also set confidence_score (0-1): Low≈0.35, Medium≈0.65, High≈0.9.
-
-Return ONLY JSON with these keys:
-bowl_score_30, floor_score_20, walls_score_15, fixtures_score_10, trash_risk_score_10, usability_score_15,
-hygiene_score_0_100, penalty_cap_applied (string or null),
-feces_or_extreme_bio_visible, heavy_bowl_unsafe, floor_and_walls_heavy_dirty, very_dirty_usable, moderate_dirt_multiple_areas, generally_clean_minor_only,
-star_rating_0_5, rating_label, hygiene_inspection_result,
-confidence, confidence_score,
-key_issues_detected (array of strings), positive_observations (array of strings), reasoning_summary (string),
-detected_issues (array, same as key_issues if simpler), severity_level (low|medium|high), human_review_required (boolean), explanation_summary (short),
-
-LEGACY keys for downstream systems (derive from the rubric above):
-floor_cleanliness (0-100 scale from floor_score_20),
-commode_urinal_cleanliness (0-100 from bowl_score_30),
-stain_presence (0-100 higher=worse; from walls/tiles condition),
-water_stagnation (0-100 higher=worse; from floor wetness/pooling if visible),
-garbage_presence (boolean; true if visible garbage/debris/waste),
-overall_cleanliness_score (same number as hygiene_score_0_100).
+For backward compatibility also include legacy fields when possible:
+- floor_cleanliness
+- commode_urinal_cleanliness
+- stain_presence
+- water_stagnation
+- garbage_presence
+- overall_cleanliness_score
+- confidence_score
+- severity_level
+- human_review_required
+- explanation_summary
 `.trim();
 
 const DETECTION_SCENE_TYPES = new Set(['toilet', 'urinal', 'other', 'unclear']);
 const DETECTION_VISIBILITY_TYPES = new Set(['full', 'partial', 'not_visible']);
 const SCORING_SEVERITY_TYPES = new Set(['low', 'medium', 'high']);
+const STRICT_CLEANLINESS_LEVEL_TYPES = new Set([
+  'extreme_dirty',
+  'severe_dirty',
+  'dirty',
+  'poor',
+  'average',
+  'good',
+  'very_good',
+  'excellent',
+]);
+const STRICT_HYGIENE_RISK_TYPES = new Set(['low', 'medium', 'high', 'severe']);
+const STRICT_CRITICAL_FINDING_KEYS = [
+  'visible_feces_or_potty',
+  'urine_pooling',
+  'dirty_commode_or_pan',
+  'heavy_stains',
+  'trash_or_waste',
+  'waterlogging',
+  'insects_or_biohazard',
+];
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) => Number(Number(value).toFixed(2));
@@ -298,6 +337,210 @@ const confidenceFromRubricRaw = (raw) => {
   }
   if (score === null) score = 0.65;
   return score;
+};
+
+const strictCleanlinessLevelFromScore = (score) => {
+  const value = clamp(Number(score) || 0, 0, 100);
+  if (value <= 10) return 'extreme_dirty';
+  if (value <= 25) return 'severe_dirty';
+  if (value <= 40) return 'dirty';
+  if (value <= 55) return 'poor';
+  if (value <= 70) return 'average';
+  if (value <= 85) return 'good';
+  if (value <= 95) return 'very_good';
+  return 'excellent';
+};
+
+const strictHygieneRiskFromScore = (score) => {
+  const value = clamp(Number(score) || 0, 0, 100);
+  if (value <= 25) return 'severe';
+  if (value <= 40) return 'high';
+  if (value <= 70) return 'medium';
+  return 'low';
+};
+
+const normalizeStrictCriticalFindings = (value, detectedIssues = []) => {
+  const normalized = Object.fromEntries(STRICT_CRITICAL_FINDING_KEYS.map((key) => [key, false]));
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const key of STRICT_CRITICAL_FINDING_KEYS) {
+      if (value[key] === true) normalized[key] = true;
+    }
+  }
+
+  const normalizedIssues = normalizeArray(detectedIssues)
+    .join(' | ')
+    .toLowerCase();
+  if (!normalizedIssues) return normalized;
+
+  if (
+    !normalized.visible_feces_or_potty &&
+    ['feces', 'faeces', 'potty', 'stool', 'human waste', 'sewage', 'vomit', 'blood'].some(
+      (key) => normalizedIssues.includes(key)
+    )
+  ) {
+    normalized.visible_feces_or_potty = true;
+  }
+  if (
+    !normalized.dirty_commode_or_pan &&
+    ['dirty commode', 'dirty pan', 'dirty bowl', 'commode stain', 'pan stain', 'bowl stain'].some(
+      (key) => normalizedIssues.includes(key)
+    )
+  ) {
+    normalized.dirty_commode_or_pan = true;
+  }
+  if (
+    !normalized.heavy_stains &&
+    ['stain', 'brown patch', 'yellow patch', 'sludge', 'grime', 'dirt patch'].some((key) =>
+      normalizedIssues.includes(key)
+    )
+  ) {
+    normalized.heavy_stains = true;
+  }
+  if (
+    !normalized.urine_pooling &&
+    ['urine', 'urine pooling', 'pee pool'].some((key) => normalizedIssues.includes(key))
+  ) {
+    normalized.urine_pooling = true;
+  }
+  if (
+    !normalized.waterlogging &&
+    ['waterlogging', 'dirty water', 'blocked drain', 'water pool'].some((key) =>
+      normalizedIssues.includes(key)
+    )
+  ) {
+    normalized.waterlogging = true;
+  }
+  if (
+    !normalized.trash_or_waste &&
+    ['trash', 'garbage', 'waste', 'overflowing bin', 'sanitary waste', 'wet waste'].some((key) =>
+      normalizedIssues.includes(key)
+    )
+  ) {
+    normalized.trash_or_waste = true;
+  }
+  if (
+    !normalized.insects_or_biohazard &&
+    ['insect', 'maggot', 'fly', 'biohazard', 'blood'].some((key) => normalizedIssues.includes(key))
+  ) {
+    normalized.insects_or_biohazard = true;
+  }
+
+  return normalized;
+};
+
+const isStrictSanitationPayload = (raw) => {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  if (Number.isFinite(Number(raw.score_0_100))) return true;
+  if (raw.critical_findings && typeof raw.critical_findings === 'object') return true;
+  if (typeof raw.cleanliness_level === 'string' && typeof raw.hygiene_risk === 'string') return true;
+  return false;
+};
+
+const normalizeStrictSanitationPayload = (raw) => {
+  const readFirst = readFirstKey;
+  const scoreRaw = readFirst(raw, ['score_0_100', 'overall_cleanliness_score', 'hygiene_score_0_100']);
+  if (!Number.isFinite(Number(scoreRaw))) {
+    throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Strict scoring key "score_0_100" must be numeric');
+  }
+  const score = toScore(scoreRaw, 0);
+
+  const starRaw = readFirst(raw, ['star_rating_0_5']);
+  const starRating =
+    Number.isFinite(Number(starRaw)) && Number(starRaw) >= 0 && Number(starRaw) <= 5
+      ? Number(Number(starRaw).toFixed(1))
+      : starRatingFromScore(score);
+
+  const cleanlinessLevelRaw = String(readFirst(raw, ['cleanliness_level']) || '')
+    .trim()
+    .toLowerCase();
+  const cleanlinessLevel = STRICT_CLEANLINESS_LEVEL_TYPES.has(cleanlinessLevelRaw)
+    ? cleanlinessLevelRaw
+    : strictCleanlinessLevelFromScore(score);
+
+  const hygieneRiskRaw = String(readFirst(raw, ['hygiene_risk']) || '')
+    .trim()
+    .toLowerCase();
+  const hygieneRisk = STRICT_HYGIENE_RISK_TYPES.has(hygieneRiskRaw)
+    ? hygieneRiskRaw
+    : strictHygieneRiskFromScore(score);
+
+  const issues = normalizeArray(readFirst(raw, ['detected_issues', 'issues', 'issue_tags']) || []);
+  const criticalFindings = normalizeStrictCriticalFindings(readFirst(raw, ['critical_findings']), issues);
+  const positiveObservations = normalizeArray(readFirst(raw, ['positive_observations']) || []);
+  const scoreReason = String(readFirst(raw, ['score_reason', 'reasoning_summary', 'explanation_summary']) || '')
+    .trim()
+    .slice(0, 1800);
+  const confidenceScore = toConfidence(readFirst(raw, ['confidence', 'confidence_score']), 0.65);
+  const requiresRetake = Boolean(
+    toBooleanOrNull(readFirst(raw, ['requires_retake'])) ||
+      readFirst(raw, ['requires_retake']) === true
+  );
+  const retakeReason = String(readFirst(raw, ['retake_reason']) || '')
+    .trim()
+    .slice(0, 500);
+
+  const floorCleanliness = toScore(readFirst(raw, ['floor_cleanliness', 'floor_score']), score);
+  const commodeCleanliness = toScore(
+    readFirst(raw, ['commode_urinal_cleanliness', 'commode_score']),
+    score
+  );
+  const stainPresence = toScore(
+    readFirst(raw, ['stain_presence']),
+    criticalFindings.heavy_stains ? 70 : 22
+  );
+  const waterStagnation = toScore(
+    readFirst(raw, ['water_stagnation']),
+    criticalFindings.waterlogging ? 72 : 18
+  );
+  const garbagePresenceRaw = readFirst(raw, ['garbage_presence']);
+  const garbagePresence =
+    toBooleanOrNull(garbagePresenceRaw) ??
+    Boolean(criticalFindings.trash_or_waste || issues.some((issue) => issue.includes('waste')));
+
+  const severityLevel =
+    hygieneRisk === 'severe' || hygieneRisk === 'high'
+      ? 'high'
+      : hygieneRisk === 'medium'
+        ? 'medium'
+        : 'low';
+
+  const reviewRequiredRaw = toBooleanOrNull(readFirst(raw, ['human_review_required', 'review_required']));
+  const humanReviewRequired =
+    reviewRequiredRaw !== null
+      ? reviewRequiredRaw
+      : requiresRetake ||
+        hygieneRisk === 'high' ||
+        hygieneRisk === 'severe' ||
+        criticalFindings.visible_feces_or_potty;
+
+  return {
+    scoring_rubric: 'sanitation_strict_v2',
+    score_0_100: score,
+    star_rating_0_5: starRating,
+    cleanliness_level: cleanlinessLevel,
+    hygiene_risk: hygieneRisk,
+    critical_findings: criticalFindings,
+    detected_issues: issues,
+    positive_observations: positiveObservations,
+    score_reason: scoreReason || null,
+    confidence: confidenceScore,
+    requires_retake: requiresRetake,
+    retake_reason: retakeReason || '',
+
+    floor_cleanliness: floorCleanliness,
+    commode_urinal_cleanliness: commodeCleanliness,
+    stain_presence: stainPresence,
+    water_stagnation: waterStagnation,
+    garbage_presence: garbagePresence,
+    overall_cleanliness_score: score,
+    confidence_score: confidenceScore,
+    severity_level: severityLevel,
+    human_review_required: humanReviewRequired,
+    explanation_summary: scoreReason || null,
+    hygiene_score_0_100: score,
+    rating_label: ratingLabelFromScore(score),
+    hygiene_inspection_result: hygieneInspectionResultFromScore(score),
+  };
 };
 
 const normalizeRubricScoringPayload = (raw) => {
@@ -540,6 +783,9 @@ const normalizeLegacyScoringPayload = (parsed) => {
 const normalizeScoringPayload = (parsed) => {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Scoring pass did not return a JSON object');
+  }
+  if (isStrictSanitationPayload(parsed)) {
+    return normalizeStrictSanitationPayload(parsed);
   }
   if (isRubricPayload(parsed)) {
     return normalizeRubricScoringPayload(parsed);
@@ -836,11 +1082,14 @@ module.exports = {
   ANALYSIS_SCHEMA_VERSION,
   __testUtils: {
     normalizeScoringPayload,
+    normalizeStrictSanitationPayload,
     normalizeLegacyScoringPayload,
     normalizeRubricScoringPayload,
     inferPercentScaleMultiplier,
     toConfidence,
     isRubricPayload,
+    isStrictSanitationPayload,
     applyCriticalPenaltyCaps,
   },
 };
+

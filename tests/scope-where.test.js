@@ -6,6 +6,7 @@ const {
   applyTenantScope,
   applyFacilityScope,
   isFacilityInScope,
+  isFacilityAccessibleForInspection,
   buildAccessContextFromUser,
   applyScopeToQuery,
 } = require('../src/core/rbac/scopeWhere');
@@ -42,6 +43,42 @@ test('applyScopeToQuery enforces facility scope for supervisor access context', 
   const scoped = applyScopeToQuery({}, accessContext, 'dashboard');
   assert.equal(scoped.tenant_id, 'tenant-1');
   assert.deepEqual(scoped.facility_id, { [Op.in]: ['fac-1'] });
+});
+
+test('isFacilityAccessibleForInspection allows field workers within tenant', () => {
+  const req = {
+    user: {
+      isSuperAdmin: false,
+      tenantId: 'tenant-1',
+      roleCodes: ['field_worker'],
+      scopeFacilityIds: ['fac-1'],
+      scopeLevel: 'facility',
+    },
+  };
+  assert.equal(
+    isFacilityAccessibleForInspection(req, 'fac-2', { facilityTenantId: 'tenant-1' }),
+    true
+  );
+  assert.equal(
+    isFacilityAccessibleForInspection(req, 'fac-2', { facilityTenantId: 'tenant-2' }),
+    false
+  );
+});
+
+test('isFacilityAccessibleForInspection keeps strict scope for non-field roles', () => {
+  const req = {
+    user: {
+      isSuperAdmin: false,
+      tenantId: 'tenant-1',
+      roleCodes: ['supervisor'],
+      scopeFacilityIds: ['fac-1'],
+      scopeLevel: 'facility',
+    },
+  };
+  assert.equal(
+    isFacilityAccessibleForInspection(req, 'fac-2', { facilityTenantId: 'tenant-1' }),
+    false
+  );
 });
 
 test('applyScopeToQuery blocks facility-scoped actors without facility assignments', () => {

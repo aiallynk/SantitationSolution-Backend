@@ -9,8 +9,14 @@ const {
 } = require('../src/modules/analysis/openaiAnalysis.service').__testUtils;
 
 test('applyCriticalPenaltyCaps applies strictest applicable cap', () => {
-  assert.equal(applyCriticalPenaltyCaps(95, { feces_or_extreme_bio_visible: true }), 20);
-  assert.equal(applyCriticalPenaltyCaps(95, { heavy_bowl_unsafe: true, feces_or_extreme_bio_visible: false }), 25);
+  assert.equal(applyCriticalPenaltyCaps(95, { feces_or_extreme_bio_visible: true }), 25);
+  assert.equal(
+    applyCriticalPenaltyCaps(95, {
+      heavy_bowl_unsafe: true,
+      feces_or_extreme_bio_visible: false,
+    }),
+    45
+  );
   assert.equal(applyCriticalPenaltyCaps(50, { moderate_dirt_multiple_areas: true }), 50);
 });
 
@@ -33,10 +39,10 @@ test('rubric payload caps hygiene score when feces flag set', () => {
     severity_level: 'high',
   });
   assert.equal(out.scoring_rubric, 'hygiene_v1');
-  assert.equal(out.overall_cleanliness_score, 20);
-  assert.equal(out.star_rating_0_5, 1);
-  assert.equal(out.hygiene_inspection_result, 'Fail');
-  assert.equal(out.rating_label, 'Very Poor');
+  assert.equal(out.overall_cleanliness_score, 25);
+  assert.equal(out.star_rating_0_5, 1.3);
+  assert.equal(out.hygiene_inspection_result, 'Severe Hygiene Issue');
+  assert.equal(out.rating_label, 'Severe Dirty');
 });
 
 test('rubric payload derives legacy dimensions and merge issues', () => {

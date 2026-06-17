@@ -1,4 +1,5 @@
-const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = rateLimit;
 const { runtimeConfig } = require('../../config/runtime');
 
 const isIngestionPath = (req) =>

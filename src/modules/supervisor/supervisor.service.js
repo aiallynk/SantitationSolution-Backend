@@ -36,6 +36,7 @@ const {
 const userService = require('../users/user.service');
 
 const ROLE_CODES = {
+  AUDITOR: 'auditor',
   FIELD_WORKER: 'field_worker',
   SUPERVISOR: 'supervisor',
 };
@@ -58,12 +59,13 @@ const uniqueIds = (values = []) =>
     ),
   ];
 
-const isBlank = (value) => value === undefined || value === null || String(value).trim() === '';
+const hasRoleCode = (req, roleCode) =>
+  (Array.isArray(req?.user?.roleCodes) ? req.user.roleCodes : [])
+    .map((code) => String(code || '').trim().toLowerCase())
+    .includes(String(roleCode || '').trim().toLowerCase());
 
-const firstScopedId = (values = []) =>
-  (Array.isArray(values) ? values : [])
-    .map((value) => String(value || '').trim())
-    .find(Boolean) || null;
+const isAuditorActor = (req) =>
+  hasRoleCode(req, ROLE_CODES.AUDITOR) || String(req?.user?.roleType || '').trim().toLowerCase() === ROLE_CODES.AUDITOR;
 
 const toNumber = (value, fallback = null) => {
   const parsed = Number(value);
@@ -250,6 +252,7 @@ const resolveSupervisorScope = async (req) => {
 
   const userFacilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
   const userGeographyIds = uniqueIds(req.user?.scopeGeographyIds || []);
+  const auditorActor = isAuditorActor(req);
 
   const directFacilities = await Facility.findAll({
     where: tenantWhere(req, { supervisor_user_id: req.user.id }),
@@ -271,7 +274,7 @@ const resolveSupervisorScope = async (req) => {
   ]);
 
   const assignmentOr = [];
-  if (!req.user?.isSuperAdmin) {
+  if (!req.user?.isSuperAdmin && !auditorActor) {
     assignmentOr.push({ supervisor_user_id: req.user.id });
   }
   if (facilityIds.length > 0) {
@@ -281,26 +284,18 @@ const resolveSupervisorScope = async (req) => {
     assignmentOr.push({ geography_id: { [Op.in]: geographyIds } });
   }
 
-  if (assignmentOr.length === 0) {
-    return {
-      tenantId,
-      workerIds: [],
-      facilityIds,
-      geographyIds,
-      assignments: [],
-      directFacilities,
-    };
+  const assignmentWhere = tenantWhere(req, { status: 'active' });
+  if (assignmentOr.length > 0) {
+    assignmentWhere[Op.or] = assignmentOr;
   }
 
   const assignments = await WorkerAssignment.findAll({
-    where: {
-      ...tenantWhere(req, { status: 'active' }),
-      [Op.or]: assignmentOr,
-    },
+    where: assignmentWhere,
     include: [
       { model: Facility, as: 'facility', attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude', 'geography_id', 'zone_geography_id', 'ward_geography_id'], required: false },
       { model: Geography, as: 'geography', attributes: ['id', 'name', 'code', 'level'], required: false },
       { model: ToiletUnit, as: 'toiletUnit', attributes: ['id', 'code', 'location_label', 'facility_id', 'latitude', 'longitude'], required: false },
+      { model: PlatformUser, as: 'supervisor', attributes: ['id', 'full_name', 'employee_code'], required: false },
     ],
   });
 
@@ -369,6 +364,7 @@ const buildWorkerBase = (worker, assignmentRows = []) => {
   const facility = primaryAssignment?.facility || null;
   const geography = primaryAssignment?.geography || null;
   const toiletUnit = primaryAssignment?.toiletUnit || null;
+  const supervisor = primaryAssignment?.supervisor || null;
   const metadata = worker.metadata || {};
 
   return {
@@ -377,6 +373,8 @@ const buildWorkerBase = (worker, assignmentRows = []) => {
     employeeCode: worker.employee_code || null,
     role: ROLE_CODES.FIELD_WORKER,
     assignedSupervisorId: primaryAssignment?.supervisor_user_id || null,
+    assignedSupervisorName: supervisor?.full_name || null,
+    assignedSupervisorEmployeeCode: supervisor?.employee_code || null,
     assignmentLevel: primaryAssignment?.assignment_level || null,
     assignmentRole: primaryAssignment?.assignment_role || null,
     assignedFacilityId: facility?.id || primaryAssignment?.facility_id || toiletUnit?.facility_id || null,
@@ -732,6 +730,8 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
       taskId: task.id,
       workerId: worker.workerId,
       workerName: worker.workerName,
+      assignedSupervisorId: worker.assignedSupervisorId,
+      assignedSupervisorName: worker.assignedSupervisorName,
       facilityId: task.facility_id || null,
       facilityName: task.Facility?.name || null,
       toiletUnitId: task.toilet_unit_id || null,
@@ -858,6 +858,10 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
     worker.inspections.push({
       inspectionId: inspection.id,
       taskId: inspection.task_id || null,
+      workerId: worker.workerId,
+      workerName: worker.workerName,
+      assignedSupervisorId: worker.assignedSupervisorId,
+      assignedSupervisorName: worker.assignedSupervisorName,
       facilityId: inspection.facility_id || null,
       facilityName: inspection.Facility?.name || null,
       toiletUnitId: inspection.toilet_unit_id || null,
@@ -876,6 +880,8 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
       taskId: inspection.task_id || null,
       workerId: worker.workerId,
       workerName: worker.workerName,
+      assignedSupervisorId: worker.assignedSupervisorId,
+      assignedSupervisorName: worker.assignedSupervisorName,
       facilityId: inspection.facility_id || null,
       facilityName: inspection.Facility?.name || null,
       locationLabel,
@@ -1584,6 +1590,8 @@ const getAttendance = async (req) => {
     employeeCode: worker.employeeCode,
     assignedFacility: worker.assignedFacilityName,
     assignedGeography: worker.assignedGeographyName,
+    assignedSupervisorId: worker.assignedSupervisorId,
+    assignedSupervisorName: worker.assignedSupervisorName,
     shift: worker.shift,
     attendanceStatus: worker.attendance.status,
     checkInAt: worker.attendance.checkInAt,
@@ -1620,6 +1628,8 @@ const getLiveLocations = async (req) => {
     workerName: worker.workerName,
     employeeCode: worker.employeeCode,
     currentStatus: worker.liveStatus,
+    assignedSupervisorId: worker.assignedSupervisorId,
+    assignedSupervisorName: worker.assignedSupervisorName,
     lastUpdatedAt: worker.latestLocation?.at || worker.lastSeenAt,
     gpsLat: worker.latestLocation?.gpsLat ?? null,
     gpsLng: worker.latestLocation?.gpsLng ?? null,
@@ -2152,6 +2162,8 @@ const getCheckins = async (req) => {
     workerId: worker.workerId,
     workerName: worker.workerName,
     employeeCode: worker.employeeCode,
+    assignedSupervisorId: worker.assignedSupervisorId,
+    assignedSupervisorName: worker.assignedSupervisorName,
     checkInAt: worker.attendance.checkInAt,
     checkInLocation: worker.attendance.checkInLocation,
     checkInEvidenceUrl: null,
@@ -2175,6 +2187,8 @@ const getDeviceHealth = async (req) => {
     workerId: worker.workerId,
     workerName: worker.workerName,
     employeeCode: worker.employeeCode,
+    assignedSupervisorId: worker.assignedSupervisorId,
+    assignedSupervisorName: worker.assignedSupervisorName,
     mobileBatteryPct: worker.phoneBatteryPct,
     sensorBatteryPct: worker.device.sensorBatteryPct,
     deviceId: worker.device.mobileDeviceId,
@@ -2274,6 +2288,8 @@ const getDailyReport = async (req) => {
     workers: snapshot.workers.map((worker) => ({
       workerId: worker.workerId,
       workerName: worker.workerName,
+      assignedSupervisorId: worker.assignedSupervisorId,
+      assignedSupervisorName: worker.assignedSupervisorName,
       attendanceStatus: worker.attendance.status,
       tasksAssigned: worker.productivity.tasksAssigned,
       tasksCompleted: worker.productivity.tasksCompleted,

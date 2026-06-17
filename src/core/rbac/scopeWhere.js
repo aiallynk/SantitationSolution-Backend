@@ -47,6 +47,15 @@ const applyFacilityScope = (where = {}, req, facilityKey = 'facility_id') => {
   return next;
 };
 
+const FIELD_INSPECTION_ROLE_CODES = new Set(['field_worker']);
+
+const hasFieldInspectionRole = (req) => {
+  const roleCodes = Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : [];
+  return roleCodes.some((roleCode) =>
+    FIELD_INSPECTION_ROLE_CODES.has(String(roleCode || '').trim().toLowerCase())
+  );
+};
+
 const isFacilityInScope = (req, facilityId) => {
   if (req.user?.isSuperAdmin) return true;
   const scopedFacilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
@@ -54,6 +63,22 @@ const isFacilityInScope = (req, facilityId) => {
     return req.user?.scopeLevel !== 'facility';
   }
   return scopedFacilityIds.includes(String(facilityId || ''));
+};
+
+// Matches mobile QR resolve policy: field workers may inspect any toilet in their tenant.
+const isFacilityAccessibleForInspection = (
+  req,
+  facilityId,
+  { facilityTenantId = null } = {}
+) => {
+  if (req.user?.isSuperAdmin) return true;
+  if (isFacilityInScope(req, facilityId)) return true;
+  if (!hasFieldInspectionRole(req)) return false;
+
+  const userTenantId = String(req.user?.tenantId || '').trim();
+  const resolvedFacilityTenantId = String(facilityTenantId || '').trim();
+  if (!userTenantId || !resolvedFacilityTenantId) return false;
+  return userTenantId === resolvedFacilityTenantId;
 };
 
 const isGeographyInScope = (req, geographyId) => {
@@ -72,6 +97,8 @@ module.exports = {
   applyGeographyScope,
   applyFacilityScope,
   isFacilityInScope,
+  isFacilityAccessibleForInspection,
+  hasFieldInspectionRole,
   isGeographyInScope,
   buildAccessContextFromUser,
   resolveAllowedGeographyIds,

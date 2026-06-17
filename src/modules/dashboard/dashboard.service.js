@@ -53,6 +53,13 @@ const scopedFacilityEntityWhere = (req, where = {}) => {
   });
 };
 
+const buildTimestampFilter = ({ start = null, end = null } = {}) => {
+  const filter = {};
+  if (start) filter[Op.gte] = start;
+  if (end) filter[Op.lte] = end;
+  return filter;
+};
+
 const toNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -467,9 +474,40 @@ const getWorkforce = async (req) => {
   if (!requestedRange.start) {
     activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
   }
-  const scopedTaskWhere = requestedRange.provided
-    ? applyDateRangeToWhere(scopedFacilityWhere(req), 'scheduled_at', requestedRange)
-    : scopedFacilityWhere(req);
+  const activeThresholdMinutes = toBoundedNumber(req.query.activeThresholdMinutes, {
+    fallback: 20,
+    min: 5,
+    max: 240,
+  });
+  const idleThresholdMinutes = toBoundedNumber(req.query.idleThresholdMinutes, {
+    fallback: 120,
+    min: activeThresholdMinutes + 1,
+    max: 720,
+  });
+  const shiftStartHour = toBoundedNumber(req.query.shiftStartHour, {
+    fallback: 8,
+    min: 0,
+    max: 23,
+  });
+  const minShiftHoursForEarlyExit = toBoundedNumber(req.query.minShiftHoursForEarlyExit, {
+    fallback: 6,
+    min: 1,
+    max: 24,
+  });
+  const activityEnd = requestedRange.end || new Date();
+  const taskActivityFilter = buildTimestampFilter({
+    start: activityStart,
+    end: activityEnd,
+  });
+  const scopedTaskWhere = {
+    ...scopedFacilityWhere(req),
+    [Op.or]: [
+      { scheduled_at: taskActivityFilter },
+      { started_at: taskActivityFilter },
+      { completed_at: taskActivityFilter },
+      { created_at: taskActivityFilter },
+    ],
+  };
 
   const scopedTaskRows = await InspectionTask.findAll({
     where: scopedTaskWhere,
@@ -498,7 +536,7 @@ const getWorkforce = async (req) => {
   );
   const scopedAssignmentRows = await WorkerAssignment.findAll({
     where: assignmentScopeWhere,
-    attributes: ['user_id', 'geography_id', 'facility_id', 'toilet_unit_id'],
+    attributes: ['user_id', 'supervisor_user_id', 'geography_id', 'facility_id', 'toilet_unit_id'],
     raw: true,
   });
 
@@ -557,6 +595,20 @@ const getWorkforce = async (req) => {
   const assignmentToiletUnitById = new Map(
     assignmentToiletUnitRows.map((row) => [String(row.id), row])
   );
+  const assignmentSupervisorIds = uniqueIds(
+    assignmentRows.map((row) => row.supervisor_user_id)
+  );
+  const assignmentSupervisorRows =
+    assignmentSupervisorIds.length > 0
+      ? await PlatformUser.findAll({
+          where: { id: { [Op.in]: assignmentSupervisorIds } },
+          attributes: ['id', 'full_name', 'employee_code'],
+          raw: true,
+        })
+      : [];
+  const assignmentSupervisorById = new Map(
+    assignmentSupervisorRows.map((row) => [String(row.id), row])
+  );
 
   const isSupervisorActor = (Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : []).includes(
     ROLE_CODES.SUPERVISOR
@@ -588,6 +640,8 @@ const getWorkforce = async (req) => {
       firstInspectionTodayAt: null,
       assignedToSupervisor: Boolean(isSupervisorActor),
       supervisorId: isSupervisorActor ? req.user.id : null,
+      supervisorIds: new Set(),
+      supervisorNames: new Set(),
     });
   }
 
@@ -595,6 +649,16 @@ const getWorkforce = async (req) => {
     const workerId = String(assignment.user_id || '');
     const row = workforceByWorkerId.get(workerId);
     if (!row) continue;
+    if (assignment.supervisor_user_id) {
+      const supervisorId = String(assignment.supervisor_user_id);
+      const supervisor = assignmentSupervisorById.get(supervisorId);
+      row.supervisorIds.add(supervisorId);
+      if (supervisor?.full_name || supervisor?.employee_code) {
+        row.supervisorNames.add(
+          supervisor.full_name || supervisor.employee_code
+        );
+      }
+    }
     if (assignment.facility_id) {
       row.facilityIds.add(String(assignment.facility_id));
     } else if (assignment.toilet_unit_id) {
@@ -917,7 +981,11 @@ const getWorkforce = async (req) => {
       earlyExit,
       assignedWard,
       assignedToSupervisor: row.assignedToSupervisor,
-      supervisorId: row.supervisorId,
+      supervisorId: row.supervisorId || [...row.supervisorIds.values()][0] || null,
+      assignedSupervisorIds: [...row.supervisorIds.values()],
+      assignedSupervisorName:
+        [...row.supervisorNames.values()].join(', ') ||
+        (row.supervisorId === req.user?.id ? req.user?.fullName || null : null),
       facilityIds: workerFacilityIds,
       facilityCount: workerFacilityIds.length,
       currentLocation: row.latestLocationPoint || null,

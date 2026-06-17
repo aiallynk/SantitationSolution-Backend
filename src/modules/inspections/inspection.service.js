@@ -40,6 +40,8 @@ const {
   buildAccessContextFromUser,
   applyScopeToQuery,
   isFacilityInScope,
+  isFacilityAccessibleForInspection,
+  hasFieldInspectionRole,
 } = require('../../core/rbac/scopeWhere');
 const {
   resolveDateRange,
@@ -212,6 +214,29 @@ const parseOptionalNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const starFromScore = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const clamped = Math.min(Math.max(parsed, 0), 100);
+  return Number((clamped / 20).toFixed(1));
+};
+
+const inspectionAiStatusFromSignals = ({
+  score = null,
+  hygieneRisk = null,
+  requiresRetake = false,
+  suspiciousFlag = false,
+}) => {
+  if (requiresRetake) return 'Retake Required';
+  if (suspiciousFlag) return 'Suspicious Improvement';
+  const risk = String(hygieneRisk || '').trim().toLowerCase();
+  if (risk === 'severe') return 'Severe Hygiene Issue';
+  const parsedScore = parseOptionalNumber(score);
+  if (parsedScore === null) return 'Pending Analysis';
+  if (parsedScore < 40) return 'Needs Cleaning';
+  return 'Clean';
+};
+
 const parseOptionalObject = (value) => {
   if (!value) return null;
   if (typeof value === 'object' && !Array.isArray(value)) {
@@ -238,12 +263,41 @@ const scopedWhere = (req, where = {}) => {
   });
 };
 
+const scopedWhereForMyInspections = (req, where = {}) => {
+  const next = { ...where };
+  if (!req.user?.isSuperAdmin && req.user?.tenantId) {
+    next.tenant_id = req.user.tenantId;
+  }
+  return next;
+};
+
+const assertWorkerInspectionOwnership = (req, inspection) => {
+  if (!inspection || req.user?.isSuperAdmin || !hasFieldInspectionRole(req)) {
+    return;
+  }
+  const inspectorId = String(inspection.inspector_user_id || '').trim();
+  const actorId = String(req.user?.id || '').trim();
+  if (inspectorId && actorId && inspectorId !== actorId) {
+    throw new AppError('This inspection belongs to another worker', 403, {
+      code: 'INSPECTOR_MISMATCH',
+      details: {
+        inspectionId: inspection.id,
+        inspectorUserId: inspectorId,
+      },
+    });
+  }
+};
+
 const assertInspectionScope = (req, inspection) => {
   if (!inspection) return;
   if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+  if (
+    !hasFieldInspectionRole(req) &&
+    req.user?.scopeLevel === 'facility' &&
+    uniqueIds(req.user?.scopeFacilityIds || []).length === 0
+  ) {
     throw new AppError('Worker scope is not loaded for facility-level access', 403, {
       code: 'SCOPE_NOT_LOADED',
       details: {
@@ -252,7 +306,11 @@ const assertInspectionScope = (req, inspection) => {
       },
     });
   }
-  if (!isFacilityInScope(req, inspection.facility_id || null)) {
+  if (
+    !isFacilityAccessibleForInspection(req, inspection.facility_id || null, {
+      facilityTenantId: inspection.tenant_id,
+    })
+  ) {
     throw new AppError('Inspection out of scope', 403, {
       code: 'SCOPE_FORBIDDEN',
       details: {
@@ -261,6 +319,7 @@ const assertInspectionScope = (req, inspection) => {
       },
     });
   }
+  assertWorkerInspectionOwnership(req, inspection);
 };
 
 const createInspectionEvent = async ({
@@ -538,6 +597,131 @@ const loadLatestReviewByInspectionIds = async (inspectionIds) => {
   return map;
 };
 
+const mapInspectionMediaItem = (item) => {
+  const aiScoring =
+    item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
+      ? item.metadata.ai_scoring || null
+      : null;
+  const score =
+    item.overall_score !== null && item.overall_score !== undefined
+      ? Number(item.overall_score)
+      : aiScoring?.score_0_100 !== undefined
+        ? Number(aiScoring.score_0_100)
+        : null;
+  const starRating =
+    aiScoring?.star_rating_0_5 !== undefined
+      ? Number(aiScoring.star_rating_0_5)
+      : score !== null
+        ? Number((score / 20).toFixed(1))
+        : null;
+  return {
+    id: item.id,
+    clientImageId: item.client_image_id || null,
+    captureStage: item.capture_stage,
+    uploadStatus: item.upload_status || null,
+    processingState: item.processing_state || null,
+    fileUrl: normalizeMediaUrl(item.file_url),
+    thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
+    uploadedAt: item.uploaded_at,
+    confirmedAt: item.confirmed_at || null,
+    capturedAt: item.captured_at || null,
+    contentLength: Number(item.content_length || 0) || null,
+    etag: item.etag || null,
+    aiStatus: item.ai_status || null,
+    retryCount: Number(item.retry_count || 0),
+    aiAttemptCount: Number(item.ai_attempt_count || 0),
+    nextRetryAt: item.next_retry_at || null,
+    lastRetryAt: item.last_retry_at || null,
+    storageVerifiedAt: item.storage_verified_at || null,
+    lastErrorCode: item.last_error_code || null,
+    lastErrorMessage: item.last_error_message || null,
+    manualReviewRequiredAt: item.manual_review_required_at || null,
+    imageQualityStatus: item.image_quality_status || null,
+    imageQualityScore:
+      item.image_quality_score !== null && item.image_quality_score !== undefined
+        ? Number(item.image_quality_score)
+        : null,
+    validationStatus: item.validation_status || null,
+    validationReason: item.validation_reason || null,
+    toiletDetected:
+      item.toilet_detected !== null && item.toilet_detected !== undefined
+        ? Boolean(item.toilet_detected)
+        : null,
+    visibilityScore:
+      item.visibility_score !== null && item.visibility_score !== undefined
+        ? Number(item.visibility_score)
+        : null,
+    score,
+    score0To100: score,
+    starRating0To5: starRating,
+    confidenceScore:
+      item.confidence_score !== null && item.confidence_score !== undefined
+        ? Number(item.confidence_score)
+        : null,
+    aiConfidence:
+      aiScoring?.confidence !== undefined
+        ? Number(aiScoring.confidence)
+        : aiScoring?.confidence_score !== undefined
+          ? Number(aiScoring.confidence_score)
+          : item.confidence_score !== null && item.confidence_score !== undefined
+            ? Number(item.confidence_score)
+            : null,
+    floorScore:
+      item.floor_score !== null && item.floor_score !== undefined
+        ? Number(item.floor_score)
+        : null,
+    commodeScore:
+      item.commode_score !== null && item.commode_score !== undefined
+        ? Number(item.commode_score)
+        : null,
+    stainScore:
+      item.stain_score !== null && item.stain_score !== undefined
+        ? Number(item.stain_score)
+        : null,
+    garbageScore:
+      item.garbage_score !== null && item.garbage_score !== undefined
+        ? Number(item.garbage_score)
+        : null,
+    waterScore:
+      item.water_score !== null && item.water_score !== undefined
+        ? Number(item.water_score)
+        : null,
+    issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
+    issueSummary: item.issue_summary || null,
+    severity: item.severity || null,
+    reviewRequired: Boolean(item.review_required),
+    hygieneRisk: aiScoring?.hygiene_risk || null,
+    cleanlinessLevel: aiScoring?.cleanliness_level || null,
+    requiresRetake: Boolean(aiScoring?.requires_retake),
+    retakeReason: aiScoring?.retake_reason || null,
+    scoreReason: aiScoring?.score_reason || null,
+    criticalFindings:
+      aiScoring?.critical_findings && typeof aiScoring.critical_findings === 'object'
+        ? aiScoring.critical_findings
+        : null,
+    supervisorFlags: Array.isArray(aiScoring?.supervisor_flags)
+      ? aiScoring.supervisor_flags
+      : [],
+    modelVersion: item.model_version || null,
+    promptVersion: item.prompt_version || null,
+    scoringVersion: item.scoring_version || null,
+    aiProcessedAt: item.ai_processed_at || null,
+    aiError: item.ai_error || null,
+    scoringRejected: Boolean(item.scoring_rejected),
+    similarityScore:
+      item.similarity_score !== null && item.similarity_score !== undefined
+        ? Number(item.similarity_score)
+        : null,
+    explanationSummary: item.explanation_summary || null,
+    gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
+    gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
+    deviceId: item.device_id || null,
+    workerId: item.worker_id || null,
+    assignmentId: item.assignment_id || null,
+    metadata: item.metadata,
+  };
+};
+
 const mapInspection = (
   inspection,
   { withAnalysis = true, reviewByInspectionId = new Map() } = {}
@@ -598,6 +782,49 @@ const mapInspection = (
   const toiletUnitCode = inspection.ToiletUnit?.code || null;
   const inspectorName = inspection.inspector?.full_name || null;
   const shortId = String(inspection.id || '').slice(0, 8).toUpperCase();
+  const pipelineCounters =
+    inspection.pipeline_counters && typeof inspection.pipeline_counters === 'object'
+      ? inspection.pipeline_counters
+      : {};
+  const aiComparisonResult =
+    pipelineCounters.ai_comparison_result &&
+    typeof pipelineCounters.ai_comparison_result === 'object'
+      ? pipelineCounters.ai_comparison_result
+      : null;
+  const aiSupervisorFlags = Array.isArray(pipelineCounters.ai_supervisor_flags)
+    ? pipelineCounters.ai_supervisor_flags
+    : [];
+  const beforeScoreValue =
+    inspection.avg_before_score !== null && inspection.avg_before_score !== undefined
+      ? Number(inspection.avg_before_score)
+      : null;
+  const afterScoreValue =
+    inspection.avg_after_score !== null && inspection.avg_after_score !== undefined
+      ? Number(inspection.avg_after_score)
+      : null;
+  const afterStageAiScoring = afterMedia
+    .map((item) =>
+      item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
+        ? item.metadata.ai_scoring || null
+        : null
+    )
+    .filter((item) => item && typeof item === 'object');
+  const derivedHygieneRisk = afterStageAiScoring.reduce((risk, item) => {
+    const next = String(item?.hygiene_risk || '').trim().toLowerCase();
+    if (!next) return risk;
+    if (next === 'severe') return 'severe';
+    if (next === 'high' && risk !== 'severe') return 'high';
+    if (next === 'medium' && !['severe', 'high'].includes(risk)) return 'medium';
+    if (next === 'low' && !risk) return 'low';
+    return risk;
+  }, '');
+  const requiresRetake = afterStageAiScoring.some((item) => item?.requires_retake === true);
+  const aiStatus = inspectionAiStatusFromSignals({
+    score: afterScoreValue ?? beforeScoreValue,
+    hygieneRisk: derivedHygieneRisk || null,
+    requiresRetake,
+    suspiciousFlag: Boolean(inspection.suspicious_flag),
+  });
 
   return {
     id: inspection.id,
@@ -637,13 +864,14 @@ const mapInspection = (
         ? afterMedia.length
         : Number(inspection.after_image_count || 0),
     avgBeforeScore:
-      inspection.avg_before_score !== null && inspection.avg_before_score !== undefined
-        ? Number(inspection.avg_before_score)
-        : null,
+      beforeScoreValue,
     avgAfterScore:
-      inspection.avg_after_score !== null && inspection.avg_after_score !== undefined
-        ? Number(inspection.avg_after_score)
-        : null,
+      afterScoreValue,
+    avgBeforeStarRating0To5: starFromScore(beforeScoreValue),
+    avgAfterStarRating0To5: starFromScore(afterScoreValue),
+    aiHygieneRisk: derivedHygieneRisk || null,
+    aiStatus,
+    requiresRetake,
     improvementScore:
       inspection.improvement_score !== null && inspection.improvement_score !== undefined
         ? Number(inspection.improvement_score)
@@ -659,6 +887,8 @@ const mapInspection = (
     remainingIssues: Array.isArray(inspection.remaining_issues) ? inspection.remaining_issues : [],
     suspiciousFlag: Boolean(inspection.suspicious_flag),
     suspiciousReasons: Array.isArray(inspection.suspicious_reasons) ? inspection.suspicious_reasons : [],
+    aiSupervisorFlags,
+    aiComparisonResult,
     validationFailedCount: Number(inspection.validation_failed_count || 0),
     rejectedImageCount: Number(inspection.rejected_image_count || 0),
     evidence: {
@@ -717,297 +947,19 @@ const mapInspection = (
           employeeCode: inspection.inspector.employee_code,
         }
       : null,
-    beforeMedia: beforeMedia.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      mediaType: item.media_type || 'image',
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      mimeType:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.mimeType || null
-          : null,
-      originalFileName:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.originalFileName || null
-          : null,
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
-    afterMedia: afterMedia.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      mediaType: item.media_type || 'image',
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      mimeType:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.mimeType || null
-          : null,
-      originalFileName:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.originalFileName || null
-          : null,
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
-    media: media.map((item) => ({
-      id: item.id,
-      clientImageId: item.client_image_id || null,
-      captureStage: item.capture_stage,
-      mediaType: item.media_type || 'image',
-      uploadStatus: item.upload_status || null,
-      processingState: item.processing_state || null,
-      fileUrl: normalizeMediaUrl(item.file_url),
-      thumbnailUrl: normalizeMediaUrl(item.thumbnail_url || item.file_url),
-      mimeType:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.mimeType || null
-          : null,
-      originalFileName:
-        item.metadata && typeof item.metadata === 'object'
-          ? item.metadata.originalFileName || null
-          : null,
-      uploadedAt: item.uploaded_at,
-      confirmedAt: item.confirmed_at || null,
-      capturedAt: item.captured_at || null,
-      contentLength: Number(item.content_length || 0) || null,
-      etag: item.etag || null,
-      aiStatus: item.ai_status || null,
-      retryCount: Number(item.retry_count || 0),
-      aiAttemptCount: Number(item.ai_attempt_count || 0),
-      nextRetryAt: item.next_retry_at || null,
-      lastRetryAt: item.last_retry_at || null,
-      storageVerifiedAt: item.storage_verified_at || null,
-      lastErrorCode: item.last_error_code || null,
-      lastErrorMessage: item.last_error_message || null,
-      manualReviewRequiredAt: item.manual_review_required_at || null,
-      imageQualityStatus: item.image_quality_status || null,
-      imageQualityScore:
-        item.image_quality_score !== null && item.image_quality_score !== undefined
-          ? Number(item.image_quality_score)
-          : null,
-      validationStatus: item.validation_status || null,
-      validationReason: item.validation_reason || null,
-      toiletDetected:
-        item.toilet_detected !== null && item.toilet_detected !== undefined
-          ? Boolean(item.toilet_detected)
-          : null,
-      visibilityScore:
-        item.visibility_score !== null && item.visibility_score !== undefined
-          ? Number(item.visibility_score)
-          : null,
-      score:
-        item.overall_score !== null && item.overall_score !== undefined
-          ? Number(item.overall_score)
-          : null,
-      confidenceScore:
-        item.confidence_score !== null && item.confidence_score !== undefined
-          ? Number(item.confidence_score)
-          : null,
-      floorScore:
-        item.floor_score !== null && item.floor_score !== undefined
-          ? Number(item.floor_score)
-          : null,
-      commodeScore:
-        item.commode_score !== null && item.commode_score !== undefined
-          ? Number(item.commode_score)
-          : null,
-      stainScore:
-        item.stain_score !== null && item.stain_score !== undefined
-          ? Number(item.stain_score)
-          : null,
-      garbageScore:
-        item.garbage_score !== null && item.garbage_score !== undefined
-          ? Number(item.garbage_score)
-          : null,
-      waterScore:
-        item.water_score !== null && item.water_score !== undefined
-          ? Number(item.water_score)
-          : null,
-      issueTags: Array.isArray(item.issue_tags) ? item.issue_tags : [],
-      issueSummary: item.issue_summary || null,
-      severity: item.severity || null,
-      reviewRequired: Boolean(item.review_required),
-      modelVersion: item.model_version || null,
-      promptVersion: item.prompt_version || null,
-      scoringVersion: item.scoring_version || null,
-      aiProcessedAt: item.ai_processed_at || null,
-      aiError: item.ai_error || null,
-      scoringRejected: Boolean(item.scoring_rejected),
-      similarityScore:
-        item.similarity_score !== null && item.similarity_score !== undefined
-          ? Number(item.similarity_score)
-          : null,
-      explanationSummary: item.explanation_summary || null,
-      gpsLat: item.gps_lat !== null && item.gps_lat !== undefined ? Number(item.gps_lat) : null,
-      gpsLng: item.gps_lng !== null && item.gps_lng !== undefined ? Number(item.gps_lng) : null,
-      deviceId: item.device_id || null,
-      workerId: item.worker_id || null,
-      assignmentId: item.assignment_id || null,
-      metadata: item.metadata,
-    })),
+    beforeMedia: beforeMedia.map(mapInspectionMediaItem),
+    afterMedia: afterMedia.map(mapInspectionMediaItem),
+    media: media.map(mapInspectionMediaItem),
     timeline,
     analysisResult: result
       ? {
+          strictJson:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? result.raw_result.strictJson
+              : null,
           id: result.id,
           modelName: result.model_name,
           modelVersion: result.model_version,
@@ -1027,6 +979,34 @@ const mapInspection = (
           subScores: result.sub_scores || null,
           issueTags: Array.isArray(result.issue_tags) ? result.issue_tags : [],
           severityLabel: result.severity_label || null,
+          score0To100:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(result.raw_result.strictJson.score_0_100 ?? result.cleanliness_score)
+              : Number(result.cleanliness_score),
+          starRating0To5:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(result.raw_result.strictJson.star_rating_0_5 ?? starFromScore(result.cleanliness_score))
+              : starFromScore(result.cleanliness_score),
+          hygieneRisk:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? result.raw_result.strictJson.hygiene_risk || null
+              : null,
+          requiresRetake:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Boolean(result.raw_result.strictJson.requires_retake)
+              : false,
           explanationText: result.explanation_text || null,
           processingMs: Number(result.processing_ms || 0) || null,
           anomalyFlags: result.anomaly_flags || {},
@@ -1064,504 +1044,54 @@ const buildAnalysisRequestContext = (req) => {
 
 const isAutoAnalysisOnUploadEnabled = () => runtimeConfig.analysis.triggerOnUpload;
 
-const resolveFacilityGeographyLevels = async (facility) => {
-  const byLevel = new Map();
-  const seeds = uniqueIds([
-    facility?.ward_geography_id,
-    facility?.zone_geography_id,
-    facility?.geography_id,
-  ]);
-
-  for (const seedId of seeds) {
-    let cursor = seedId;
-    let guard = 0;
-    while (cursor && guard < 16) {
-      // eslint-disable-next-line no-await-in-loop
-      const geography = await Geography.findByPk(cursor, {
-        attributes: ['id', 'parent_id', 'level', 'name'],
-      });
-      if (!geography) break;
-
-      const levelKey = String(geography.level || '').trim().toLowerCase();
-      if (levelKey && !byLevel.has(levelKey)) {
-        byLevel.set(levelKey, {
-          id: geography.id,
-          name: geography.name || null,
-        });
-      }
-
-      cursor = geography.parent_id || null;
-      guard += 1;
-    }
+const findResumableOngoingInspection = async ({
+  inspectorUserId,
+  facilityId,
+  toiletUnitId,
+}) => {
+  const where = {
+    inspector_user_id: inspectorUserId,
+    facility_id: facilityId,
+    submitted_at: null,
+  };
+  if (toiletUnitId) {
+    where.toilet_unit_id = toiletUnitId;
   }
 
-  return byLevel;
-};
-
-const parseOptionalArray = (value) => {
-  if (!value) return [];
-  if (Array.isArray(value)) return value;
-  if (typeof value !== 'string') return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
-};
-
-const hydrateInspectionSubmissionAttachmentsForDisplay = async (
-  inspection,
-  { mediaUrlCache = null } = {}
-) => {
-  const submissions = Array.isArray(inspection?.inspectionSubmissions)
-    ? inspection.inspectionSubmissions
-    : [];
-  for (const submission of submissions) {
-    const metadata =
-      submission?.metadata && typeof submission.metadata === 'object'
-        ? submission.metadata
-        : null;
-    if (!metadata) continue;
-
-    const [beforeCsvRaw, afterCsvRaw] = [
-      normalizeCsvAttachmentCollection(metadata.beforeCsvFiles, { captureStage: 'before' }),
-      normalizeCsvAttachmentCollection(metadata.afterCsvFiles, { captureStage: 'after' }),
-    ];
-
-    const [beforeCsvFiles, afterCsvFiles] = await Promise.all([
-      Promise.all(
-        beforeCsvRaw.map(async (item) => {
-          const resolvedUrl = await resolveMediaUrl(
-            {
-              fileUrl: item.fileUrl,
-              storageKey: item.storageKey || null,
-            },
-            { cache: mediaUrlCache }
-          );
-          return {
-            ...item,
-            fileUrl: resolvedUrl || item.fileUrl || null,
-            downloadUrl: resolvedUrl || item.fileUrl || null,
-          };
-        })
-      ),
-      Promise.all(
-        afterCsvRaw.map(async (item) => {
-          const resolvedUrl = await resolveMediaUrl(
-            {
-              fileUrl: item.fileUrl,
-              storageKey: item.storageKey || null,
-            },
-            { cache: mediaUrlCache }
-          );
-          return {
-            ...item,
-            fileUrl: resolvedUrl || item.fileUrl || null,
-            downloadUrl: resolvedUrl || item.fileUrl || null,
-          };
-        })
-      ),
-    ]);
-
-    submission.metadata = {
-      ...metadata,
-      beforeCsvFiles,
-      afterCsvFiles,
-    };
-  }
-};
-
-const isImageMimeType = (value) =>
-  String(value || '')
-    .trim()
-    .toLowerCase()
-    .startsWith('image/');
-
-const isVideoMimeType = (value) =>
-  String(value || '')
-    .trim()
-    .toLowerCase()
-    .startsWith('video/');
-
-const isCsvMimeType = (value) => {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (!normalized) return false;
-  return ALLOWED_CSV_CONTENT_TYPES.has(normalized);
-};
-
-const resolveMediaTypeFromUpload = (file = {}, hintedKind = null) => {
-  const normalizedKind = String(hintedKind || '').trim().toLowerCase();
-  if (normalizedKind === 'csv') return 'csv';
-  if (normalizedKind === 'video') return 'video';
-  if (normalizedKind === 'image') return 'image';
-
-  if (isCsvMimeType(file?.mimetype)) return 'csv';
-  if (isVideoMimeType(file?.mimetype)) return 'video';
-  return 'image';
-};
-
-const isMediaEvidenceType = (value) => {
-  const normalized = String(value || '').trim().toLowerCase();
-  return normalized === 'image' || normalized === 'video';
-};
-
-const isMediaEvidenceRow = (row) =>
-  isMediaEvidenceType(row?.media_type || row?.mediaType || 'image');
-
-const normalizeCsvAttachmentRecord = (entry, { captureStage = null } = {}) => {
-  const row = entry && typeof entry === 'object' ? entry : null;
-  if (!row) return null;
-
-  const fileUrl = String(
-    row.downloadUrl || row.fileUrl || row.url || row.file_url || ''
-  ).trim();
-  const storageKey = String(row.storageKey || row.storage_key || '').trim() || null;
-  if (!fileUrl && !storageKey) {
+  const candidates = await Inspection.findAll({
+    where,
+    order: [['captured_at', 'DESC']],
+    limit: 20,
+  });
+  if (candidates.length === 0) {
     return null;
   }
 
-  const mimeType = String(
-    row.mimeType || row.contentType || row.mime_type || row.content_type || ''
-  )
-    .trim()
-    .toLowerCase();
-  if (mimeType && !isCsvMimeType(mimeType)) {
+  const candidateIds = candidates.map((row) => row.id);
+  const beforeRows = await InspectionMedia.findAll({
+    attributes: ['inspection_id'],
+    where: {
+      inspection_id: { [Op.in]: candidateIds },
+      capture_stage: 'before',
+      upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
+    },
+    group: ['inspection_id'],
+    raw: true,
+  });
+  const beforeIds = new Set(beforeRows.map((row) => row.inspection_id));
+  if (beforeIds.size === 0) {
     return null;
   }
 
-  const contentLength = Number(
-    row.contentLength || row.content_length || row.sizeBytes || row.bytes || 0
-  );
-  const uploadedAt = parseOptionalDate(
-    row.uploadedAt || row.uploaded_at || row.createdAt || row.created_at
-  );
-  const normalizedStage = normalizeCaptureStage(
-    captureStage || row.captureStage || row.capture_stage || 'evidence'
-  );
-
-  return {
-    id: String(row.id || '').trim() || null,
-    captureStage: normalizedStage,
-    fileName:
-      String(
-        row.fileName || row.originalFileName || row.original_name || row.name || ''
-      ).trim() || null,
-    mimeType: mimeType || 'text/csv',
-    contentLength:
-      Number.isFinite(contentLength) && contentLength > 0 ? Number(contentLength) : null,
-    fileUrl: fileUrl || null,
-    storageKey,
-    uploadedAt: uploadedAt ? uploadedAt.toISOString() : null,
-    metadata:
-      row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
-        ? row.metadata
-        : null,
-  };
-};
-
-const normalizeCsvAttachmentCollection = (value, { captureStage }) =>
-  parseOptionalArray(value)
-    .map((entry) => normalizeCsvAttachmentRecord(entry, { captureStage }))
-    .filter(Boolean);
-
-const normalizeSubmittedMediaRecord = (entry, { captureStage = null } = {}) => {
-  const row = entry && typeof entry === 'object' ? entry : null;
-  if (!row) return null;
-  const mediaType = String(row.mediaType || row.media_type || 'image')
-    .trim()
-    .toLowerCase();
-  if (!isMediaEvidenceType(mediaType)) return null;
-
-  const normalizedStage = normalizeCaptureStage(
-    captureStage || row.captureStage || row.capture_stage || 'evidence'
-  );
-  const fileUrl = String(row.fileUrl || row.url || row.file_url || '').trim() || null;
-  const storageKey = String(row.storageKey || row.storage_key || '').trim() || null;
-  if (!fileUrl && !storageKey) return null;
-
-  const contentLength = Number(
-    row.contentLength || row.content_length || row.sizeBytes || row.bytes || 0
-  );
-
-  return {
-    id: String(row.id || '').trim() || null,
-    captureStage: normalizedStage,
-    mediaType,
-    fileUrl,
-    thumbnailUrl: String(
-      row.thumbnailUrl || row.thumbnail_url || row.fileUrl || row.file_url || row.url || ''
-    ).trim() || fileUrl,
-    storageKey,
-    mimeType: String(row.mimeType || row.contentType || row.mime_type || '').trim() || null,
-    contentLength:
-      Number.isFinite(contentLength) && contentLength > 0 ? Number(contentLength) : null,
-    uploadedAt: parseOptionalDate(
-      row.uploadedAt || row.uploaded_at || row.createdAt || row.created_at
-    )?.toISOString() || null,
-  };
-};
-
-const normalizeSubmittedMediaCollection = (value, { captureStage }) =>
-  parseOptionalArray(value)
-    .map((entry) => normalizeSubmittedMediaRecord(entry, { captureStage }))
-    .filter(Boolean);
-
-const resolveRequiredAttachmentSections = (inspectionType) => {
-  const normalizedType = String(inspectionType || '').trim().toLowerCase();
-  if (normalizedType === 'before_cleaning') {
-    return { requireBefore: true, requireAfter: false };
-  }
-  if (normalizedType === 'after_cleaning') {
-    return { requireBefore: false, requireAfter: true };
-  }
-  return { requireBefore: true, requireAfter: true };
-};
-
-const serializeSubmissionMediaRow = (row) => {
-  if (!row || !isMediaEvidenceRow(row)) return null;
-  return {
-    id: row.id,
-    captureStage: normalizeCaptureStage(row.capture_stage || row.captureStage || 'evidence'),
-    mediaType: String(row.media_type || row.mediaType || 'image').toLowerCase(),
-    fileUrl: normalizeMediaUrl(row.file_url || row.fileUrl || null),
-    thumbnailUrl: normalizeMediaUrl(row.thumbnail_url || row.thumbnailUrl || row.file_url || row.fileUrl || null),
-    storageKey: row.storage_key || row.storageKey || null,
-    mimeType:
-      row.metadata && typeof row.metadata === 'object'
-        ? row.metadata.mimeType || null
-        : null,
-    contentLength:
-      row.content_length !== null && row.content_length !== undefined
-        ? Number(row.content_length)
-        : null,
-    uploadedAt: row.uploaded_at || row.uploadedAt || null,
-  };
-};
-
-const resolveAttachmentValidationError = ({
-  inspectionType,
-  beforeMediaCount = 0,
-  afterMediaCount = 0,
-  beforeCsvCount = 0,
-  afterCsvCount = 0,
-}) => {
-  const requirement = resolveRequiredAttachmentSections(inspectionType);
-  const hasBefore = Number(beforeMediaCount) + Number(beforeCsvCount) > 0;
-  const hasAfter = Number(afterMediaCount) + Number(afterCsvCount) > 0;
-
-  if (requirement.requireBefore && !hasBefore) {
-    return {
-      message: 'At least one before-cleaning attachment is required',
-      details: {
-        reason: 'before_attachment_missing',
-        inspectionType,
-        beforeMediaCount,
-        beforeCsvCount,
-        afterMediaCount,
-        afterCsvCount,
-      },
-    };
-  }
-  if (requirement.requireAfter && !hasAfter) {
-    return {
-      message: 'At least one after-cleaning attachment is required',
-      details: {
-        reason: 'after_attachment_missing',
-        inspectionType,
-        beforeMediaCount,
-        beforeCsvCount,
-        afterMediaCount,
-        afterCsvCount,
-      },
-    };
-  }
-  return null;
-};
-
-const resolveEscalationRecipients = async ({ target, inspection, facility, geographyByLevel }) => {
-  if (target.key === SUBMISSION_TARGETS.supervisor.key) {
-    const preferredGeographyId =
-      geographyByLevel.get('ward')?.id ||
-      geographyByLevel.get('zone')?.id ||
-      geographyByLevel.get('city')?.id ||
-      facility?.ward_geography_id ||
-      facility?.zone_geography_id ||
-      facility?.geography_id ||
-      null;
-    const supervisorIds = await resolveSupervisorIds({
-      tenantId: inspection.tenant_id,
-      geographyId: preferredGeographyId,
-      facilityId: facility?.id || null,
-    });
-    return {
-      recipientIds: uniqueIds(supervisorIds),
-      geographyId: preferredGeographyId || null,
-    };
-  }
-
-  const requestedScopeKey = target.submittedToScope;
-  const requestedGeographyId = geographyByLevel.get(requestedScopeKey)?.id || null;
-  let recipientIds = await resolveUsersByRoleAndScope({
-    roleCodes: [target.submittedToRole],
-    tenantId: inspection.tenant_id,
-    ...(requestedGeographyId ? { geographyId: requestedGeographyId } : {}),
-    facilityId: facility?.id || null,
+  const submittedRows = await InspectionSubmission.findAll({
+    attributes: ['inspection_id'],
+    where: { inspection_id: { [Op.in]: [...beforeIds] } },
+    group: ['inspection_id'],
+    raw: true,
   });
+  const submittedIds = new Set(submittedRows.map((row) => row.inspection_id));
 
-  return {
-    recipientIds: uniqueIds(recipientIds),
-    geographyId: requestedGeographyId,
-  };
-};
-
-const buildEscalationMessage = ({
-  inspectionCode,
-  inspectionTypeLabel,
-  facilityName,
-  toiletLabel,
-  submittedBy,
-  wardName,
-  sectorCode,
-  locationLabel,
-  targetLabel,
-}) => {
-  const parts = [
-    `${inspectionCode} submitted to ${targetLabel}`,
-    `Type: ${inspectionTypeLabel}`,
-    facilityName ? `Facility: ${facilityName}` : null,
-    toiletLabel ? `Toilet: ${toiletLabel}` : null,
-    wardName ? `Ward: ${wardName}` : null,
-    sectorCode ? `Sector: ${sectorCode}` : null,
-    locationLabel ? `Location: ${locationLabel}` : null,
-    submittedBy ? `Submitted by: ${submittedBy}` : null,
-  ].filter(Boolean);
-  return parts.join(' | ');
-};
-
-const createSubmissionEscalationAlert = async ({
-  req,
-  inspection,
-  submission,
-  target,
-  severity,
-  facility,
-  toiletUnit,
-  inspector,
-  geographyByLevel,
-  recipientIds,
-  recipientGeographyId,
-}) => {
-  const inspectionCode = `INS-${String(inspection.id || '').replace(/-/g, '').slice(0, 8).toUpperCase()}`;
-  const inspectionTypeLabel = prettyLabel(inspection.inspection_type);
-  const facilityName = facility?.name || facility?.code || null;
-  const toiletLabel = toiletUnit?.code || toiletUnit?.location_label || null;
-  const submittedBy = inspector?.full_name || inspector?.email || req?.user?.email || 'Unknown user';
-  const wardName = geographyByLevel.get('ward')?.name || null;
-  const sectorCode = toiletUnit?.sector_code || null;
-  const locationLabel = toiletUnit?.location_label || facility?.address_line || null;
-  const message = buildEscalationMessage({
-    inspectionCode,
-    inspectionTypeLabel,
-    facilityName,
-    toiletLabel,
-    submittedBy,
-    wardName,
-    sectorCode,
-    locationLabel,
-    targetLabel: target.label,
-  });
-
-  const createdAt = new Date();
-  const alert = await Alert.create({
-    tenant_id: inspection.tenant_id,
-    alert_type: 'inspection_submission_escalation',
-    severity,
-    source_type: 'manual',
-    source_id: inspection.id,
-    facility_id: inspection.facility_id || null,
-    message,
-    status: 'open',
-    assigned_to_user_id: recipientIds[0] || null,
-    created_at: createdAt,
-    updated_at: createdAt,
-  });
-
-  eventBus.emit(EVENTS.ALERT_CREATED, {
-    id: alert.id,
-    tenantId: alert.tenant_id,
-    status: alert.status,
-    severity: alert.severity,
-    sourceType: alert.source_type,
-    sourceId: alert.source_id,
-    facilityId: alert.facility_id,
-    alertType: alert.alert_type,
-  });
-
-  if (recipientIds.length > 0) {
-    const priority =
-      severity === 'critical'
-        ? NotificationPriorities.CRITICAL
-        : severity === 'high'
-          ? NotificationPriorities.HIGH
-          : NotificationPriorities.MEDIUM;
-    const route = target.key === SUBMISSION_TARGETS.supervisor.key ? '/ops/supervisor/alerts' : '/ops/alerts';
-    const submittedAtIso = submission?.submitted_at
-      ? new Date(submission.submitted_at).toISOString()
-      : new Date().toISOString();
-    const notificationTitle = `Inspection Escalation: ${inspectionTypeLabel}`;
-    const notificationBody = `${inspectionCode} at ${facilityName || 'facility'} requires attention (${target.label}).`;
-
-    await notificationService.publishNotification({
-      recipients: recipientIds,
-      eventType: 'inspection.submission.escalated',
-      notificationType: NotificationTypes.ALERT,
-      priority,
-      title: notificationTitle,
-      body: notificationBody,
-      shortBody: notificationBody,
-      entityType: 'alert',
-      entityId: alert.id,
-      route,
-      iconKey: 'alert',
-      severity,
-      tenantId: inspection.tenant_id,
-      geographyId: recipientGeographyId || null,
-      facilityId: inspection.facility_id || null,
-      audienceKind: NotificationAudienceKinds.TARGETED_LIST,
-      createdByUserId: req?.user?.id || null,
-      dedupeKey: `inspection-escalation:${submission.id}:${target.submittedToRole}:${target.submittedToScope}`,
-      metadata: {
-        inspectionId: inspection.id,
-        submissionId: submission.id,
-        submittedToRole: target.submittedToRole,
-        submittedToScope: target.submittedToScope,
-        facilityName,
-        toiletLabel,
-        ward: wardName,
-        sector: sectorCode,
-        location: locationLabel,
-      },
-      payload: {
-        alertId: alert.id,
-        inspectionId: inspection.id,
-        inspectionCode,
-        inspectionTitle: `${inspectionCode} - ${inspectionTypeLabel}`,
-        inspectionType: inspection.inspection_type,
-        facilityName,
-        toiletName: toiletLabel,
-        severity,
-        submittedBy,
-        submittedAt: submittedAtIso,
-        ward: wardName,
-        sector: sectorCode,
-        location: locationLabel,
-        status: 'new',
-      },
-    });
-  }
-
-  return alert;
+  return candidates.find((row) => beforeIds.has(row.id) && !submittedIds.has(row.id)) || null;
 };
 
 const createInspection = async (req) => {
@@ -1573,7 +1103,11 @@ const createInspection = async (req) => {
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
     throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (req.user?.scopeLevel === 'facility' && uniqueIds(req.user?.scopeFacilityIds || []).length === 0) {
+  if (
+    !hasFieldInspectionRole(req) &&
+    req.user?.scopeLevel === 'facility' &&
+    uniqueIds(req.user?.scopeFacilityIds || []).length === 0
+  ) {
     throw new AppError('Worker scope is not loaded for facility-level access', 403, {
       code: 'SCOPE_NOT_LOADED',
       details: {
@@ -1582,7 +1116,11 @@ const createInspection = async (req) => {
       },
     });
   }
-  if (!isFacilityInScope(req, facility.id)) {
+  if (
+    !isFacilityAccessibleForInspection(req, facility.id, {
+      facilityTenantId: facility.tenant_id,
+    })
+  ) {
     throw new AppError('Facility out of scope', 403, {
       code: 'SCOPE_FORBIDDEN',
       details: {
@@ -1606,6 +1144,15 @@ const createInspection = async (req) => {
 
   const fallbackLatitude = req.body.latitude ?? facility.latitude ?? null;
   const fallbackLongitude = req.body.longitude ?? facility.longitude ?? null;
+
+  const resumableInspection = await findResumableOngoingInspection({
+    inspectorUserId: req.user.id,
+    facilityId: facility.id,
+    toiletUnitId: req.body.toiletUnitId || null,
+  });
+  if (resumableInspection) {
+    return mapInspection(resumableInspection, { withAnalysis: false });
+  }
 
   const inspection = await Inspection.create({
     tenant_id: facility.tenant_id,
@@ -2327,63 +1874,232 @@ const reviewInspection = async (req) => {
   });
 };
 
+const DISPLAY_STATUS_PIPELINE = {
+  'queued for ai': 'queued_for_ai',
+  queued_for_ai: 'queued_for_ai',
+  queued: 'queued_for_ai',
+  processing: 'processing',
+  'low confidence': 'low_confidence',
+  low_confidence: 'low_confidence',
+};
+
+const findInspectionIdsByLatestReviewActions = async (actions = []) => {
+  const normalizedActions = (Array.isArray(actions) ? actions : [actions])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean);
+  if (normalizedActions.length === 0) {
+    return [];
+  }
+
+  const rows = await AuditLog.findAll({
+    attributes: ['entity_id', 'details', 'created_at'],
+    where: {
+      action: 'inspection.review',
+      entity_type: 'inspection',
+    },
+    order: [['created_at', 'DESC']],
+    raw: true,
+  });
+
+  const latestByInspection = new Map();
+  for (const row of rows) {
+    const id = String(row.entity_id || '').trim();
+    if (!id || latestByInspection.has(id)) {
+      continue;
+    }
+    let details = row.details || {};
+    if (typeof details === 'string') {
+      try {
+        details = JSON.parse(details);
+      } catch (_) {
+        details = {};
+      }
+    }
+    const action = String(details.reviewAction || details.action || 'reviewed').toLowerCase();
+    latestByInspection.set(id, action);
+  }
+
+  return Array.from(latestByInspection.entries())
+    .filter(([, action]) => normalizedActions.includes(action))
+    .map(([id]) => id);
+};
+
+const applyInspectionStatusFilters = async (where, query = {}) => {
+  const displayStatus = String(query.displayStatus || query.uiStatus || '')
+    .trim()
+    .toLowerCase();
+  if (displayStatus && displayStatus !== 'all') {
+    if (displayStatus === 'pending-review') {
+      const rejectedIds = await findInspectionIdsByLatestReviewActions([
+        'rejected',
+        'reinspection_required',
+      ]);
+      const pendingClauses = [
+        { pipeline_status: { [Op.in]: ['needs_review', 'low_confidence'] } },
+        { status: 'REVIEW_REQUIRED' },
+        { review_required: true },
+        { overall_status: { [Op.in]: ['critical', 'poor'] } },
+      ];
+      if (rejectedIds.length > 0) {
+        pendingClauses.push({ id: { [Op.in]: rejectedIds } });
+      }
+      return {
+        ...where,
+        [Op.or]: pendingClauses,
+      };
+    }
+
+    if (displayStatus === 'accepted') {
+      const ids = await findInspectionIdsByLatestReviewActions(['accepted']);
+      if (ids.length === 0) {
+        return { empty: true };
+      }
+      return { ...where, id: { [Op.in]: ids } };
+    }
+
+    if (displayStatus === 'rejected') {
+      const ids = await findInspectionIdsByLatestReviewActions(['rejected', 'reinspection_required']);
+      if (ids.length === 0) {
+        return { empty: true };
+      }
+      return { ...where, id: { [Op.in]: ids } };
+    }
+
+    const pipelineStatus = DISPLAY_STATUS_PIPELINE[displayStatus];
+    if (pipelineStatus) {
+      return { ...where, pipeline_status: pipelineStatus };
+    }
+  }
+
+  if (!query.status) {
+    return where;
+  }
+
+  const requestedStatus = String(query.status).trim().toLowerCase();
+  const requestedUpper = String(query.status).trim().toUpperCase();
+  if (PROCESSING_STATUSES.has(requestedStatus)) {
+    return { ...where, processing_status: requestedStatus };
+  }
+  if (INSPECTION_STATUSES.has(requestedUpper)) {
+    return { ...where, status: requestedUpper };
+  }
+  return { ...where, pipeline_status: requestedStatus };
+};
+
+const resolveOngoingInspectionFilter = async (where, { myOnly = false, userId = null } = {}) => {
+  const submittedQuery = {
+    attributes: ['inspection_id'],
+    raw: true,
+  };
+  if (myOnly && userId) {
+    submittedQuery.include = [
+      {
+        model: Inspection,
+        attributes: [],
+        where: {
+          inspector_user_id: userId,
+          ...(where.tenant_id ? { tenant_id: where.tenant_id } : {}),
+        },
+        required: true,
+      },
+    ];
+  }
+
+  const submittedRows = await InspectionSubmission.findAll(submittedQuery);
+  const submittedIds = uniqueIds(submittedRows.map((row) => row.inspection_id));
+
+  const candidateWhere = {
+    ...where,
+    submitted_at: null,
+  };
+  if (submittedIds.length > 0) {
+    candidateWhere.id = { [Op.notIn]: submittedIds };
+  }
+
+  const candidates = await Inspection.findAll({
+    attributes: ['id', 'processing_status'],
+    where: candidateWhere,
+    include: [
+      {
+        model: InspectionMedia,
+        attributes: ['id', 'capture_stage', 'upload_status'],
+        required: false,
+      },
+    ],
+  });
+
+  const ongoingIds = uniqueIds(
+    candidates
+      .filter((inspection) => {
+        const media = inspection.InspectionMedia || [];
+        const hasBefore = media.some((item) => item.capture_stage === 'before');
+        if (hasBefore) {
+          return true;
+        }
+        return String(inspection.processing_status || '').trim().toLowerCase() === 'draft';
+      })
+      .map((inspection) => inspection.id)
+  );
+
+  if (ongoingIds.length === 0) {
+    return { empty: true };
+  }
+
+  return { id: { [Op.in]: ongoingIds } };
+};
+
 const listInspections = async (req, myOnly = false) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  let where = scopedWhere(req);
+  let where =
+    myOnly && hasFieldInspectionRole(req)
+      ? scopedWhereForMyInspections(req)
+      : scopedWhere(req);
   const ongoingOnly = ['1', 'true', 'yes'].includes(
     String(req.query.ongoing || '').trim().toLowerCase()
   );
-  if (req.query.status) {
-    const requestedStatus = String(req.query.status).trim().toLowerCase();
-    const requestedUpper = String(req.query.status).trim().toUpperCase();
-    if (PROCESSING_STATUSES.has(requestedStatus)) {
-      where.processing_status = requestedStatus;
-    } else if (INSPECTION_STATUSES.has(requestedUpper)) {
-      where.status = requestedUpper;
-    } else {
-      where.pipeline_status = requestedStatus;
-    }
+  where = await applyInspectionStatusFilters(where, req.query);
+  if (where?.empty) {
+    return {
+      items: [],
+      meta: {
+        page,
+        limit,
+        total: 0,
+        totalPages: 1,
+      },
+    };
   }
+  delete where.empty;
   if (myOnly) {
     where.inspector_user_id = req.user.id;
   }
   if (req.query.facilityId) {
-    if (!isFacilityInScope(req, req.query.facilityId)) {
+    const facilityFilterAllowed = myOnly && hasFieldInspectionRole(req)
+      ? true
+      : isFacilityInScope(req, req.query.facilityId);
+    if (!facilityFilterAllowed) {
       throw new AppError('facilityId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
     where.facility_id = req.query.facilityId;
   }
   if (ongoingOnly) {
-    const beforeRows = await InspectionMedia.findAll({
-      attributes: ['inspection_id'],
-      where: {
-        capture_stage: 'before',
-        upload_status: { [Op.in]: ['confirmed', 'uploaded'] },
-        inspection_id: { [Op.ne]: null },
-      },
-      group: ['inspection_id'],
-      raw: true,
+    const ongoingFilter = await resolveOngoingInspectionFilter(where, {
+      myOnly,
+      userId: req.user?.id || null,
     });
-    const beforeInspectionIds = uniqueIds(
-      beforeRows.map((row) => row.inspection_id)
-    );
-    const submittedRows = beforeInspectionIds.length > 0
-      ? await InspectionSubmission.findAll({
-          attributes: ['inspection_id'],
-          where: { inspection_id: { [Op.in]: beforeInspectionIds } },
-          group: ['inspection_id'],
-          raw: true,
-        })
-      : [];
-    const submittedInspectionIds = uniqueIds(
-      submittedRows.map((row) => row.inspection_id)
-    );
-    where.id = {
-      [Op.in]: beforeInspectionIds,
-      ...(submittedInspectionIds.length > 0
-        ? { [Op.notIn]: submittedInspectionIds }
-        : {}),
-    };
+    if (ongoingFilter.empty) {
+      return {
+        items: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 1,
+        },
+      };
+    }
+    delete ongoingFilter.empty;
+    where = { ...where, ...ongoingFilter };
   }
   where = applyDateRangeToWhere(
     where,

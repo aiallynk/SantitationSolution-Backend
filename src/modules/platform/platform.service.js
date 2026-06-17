@@ -707,7 +707,7 @@ const normalizeIdentifierPart = (value, fallback) => {
   return normalized || fallback;
 };
 
-/** Shorter segments for auto toilet codes (tenant + facility + block + suffix must fit DB limit). */
+/** Shorter segments for auto toilet codes (toilet name + block + suffix must fit DB limit). */
 const normalizeAutoToiletCodePart = (value, fallback, maxLen = 32) => {
   const text = sanitizeText(value, maxLen);
   const normalized = text
@@ -754,27 +754,23 @@ const findToiletUnitCodeConflict = async ({ facilityId, code, transaction = null
   return rows[0] || null;
 };
 
-const buildAutoToiletId = async ({ facility, toiletBlock, tenant = null, transaction = null }) => {
-  const tenantPart = tenant
-    ? normalizeAutoToiletCodePart(tenant.code || tenant.name, 'TEN', 24)
-    : null;
-  const facilityPart = normalizeAutoToiletCodePart(
-    facility.code || facility.name,
-    'FAC',
-    32
-  );
+const buildAutoToiletId = async ({
+  facility,
+  toiletBlock,
+  toiletName = null,
+  transaction = null,
+}) => {
+  const toiletPart = normalizeAutoToiletCodePart(toiletName, 'TOILET', 48);
   const blockPart = normalizeAutoToiletCodePart(
-    toiletBlock.code || toiletBlock.name,
+    toiletBlock.name || toiletBlock.code,
     'BLK',
-    32
+    36
   );
-  const prefix = tenantPart
-    ? `${tenantPart}-${facilityPart}-${blockPart}-T`
-    : `${facilityPart}-${blockPart}-T`;
+  const prefix = `${toiletPart}-${blockPart}`;
 
   let sequence = 1;
   while (sequence <= 9999) {
-    const candidate = `${prefix}${String(sequence).padStart(3, '0')}`;
+    const candidate = `${prefix}-${String(sequence).padStart(3, '0')}`;
     const conflict = await findToiletUnitCodeConflict({
       facilityId: facility.id,
       code: candidate,
@@ -2111,6 +2107,113 @@ const patchTenant = async (req) => {
   return mapTenantRow(tenant);
 };
 
+const mapTenantProfileForClient = (tenant) => {
+  const row = mapTenantRow(tenant);
+  const metadata = tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {};
+  return {
+    ...row,
+    addressLine2: metadata.addressLine2 || null,
+    pincode: metadata.pincode || null,
+    timezone: metadata.timezone || null,
+  };
+};
+
+const getOwnTenantProfile = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) {
+    throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  }
+  return mapTenantProfileForClient(tenant);
+};
+
+const patchOwnTenantProfile = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) {
+    throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  }
+
+  const nextMetadata = {
+    ...(tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {}),
+  };
+  if (req.body.addressLine2 !== undefined) {
+    nextMetadata.addressLine2 = sanitizeOptionalText(req.body.addressLine2, 300);
+  }
+  if (req.body.pincode !== undefined) {
+    const pincode = sanitizeOptionalText(req.body.pincode, 20);
+    if (pincode && !/^[A-Za-z0-9\- ]{3,20}$/.test(pincode)) {
+      throw new AppError('Invalid pincode format', 400, { code: 'VALIDATION_ERROR' });
+    }
+    nextMetadata.pincode = pincode;
+  }
+  if (req.body.timezone !== undefined) {
+    nextMetadata.timezone = sanitizeOptionalText(req.body.timezone, 64);
+  }
+
+  await tenant.update({
+    name: req.body.name ? sanitizeText(req.body.name, 200) : tenant.name,
+    country_code:
+      req.body.countryCode !== undefined
+        ? sanitizeOptionalText(req.body.countryCode, 10)
+        : tenant.country_code,
+    contact_name:
+      req.body.contactName !== undefined
+        ? sanitizeOptionalText(req.body.contactName, 180)
+        : tenant.contact_name,
+    contact_email:
+      req.body.contactEmail !== undefined
+        ? sanitizeOptionalText(req.body.contactEmail, 180)
+        : tenant.contact_email,
+    contact_mobile:
+      req.body.contactMobile !== undefined
+        ? sanitizeOptionalText(req.body.contactMobile, 32)
+        : tenant.contact_mobile,
+    country_name:
+      req.body.countryName !== undefined
+        ? sanitizeOptionalText(req.body.countryName, 120)
+        : tenant.country_name,
+    state_name:
+      req.body.stateName !== undefined
+        ? sanitizeOptionalText(req.body.stateName, 120)
+        : tenant.state_name,
+    district_name:
+      req.body.districtName !== undefined
+        ? sanitizeOptionalText(req.body.districtName, 120)
+        : tenant.district_name,
+    city_name:
+      req.body.cityName !== undefined
+        ? sanitizeOptionalText(req.body.cityName, 120)
+        : tenant.city_name,
+    zone_name:
+      req.body.zoneName !== undefined
+        ? sanitizeOptionalText(req.body.zoneName, 120)
+        : tenant.zone_name,
+    address_line:
+      req.body.addressLine !== undefined
+        ? sanitizeOptionalText(req.body.addressLine, 300)
+        : tenant.address_line,
+    metadata: nextMetadata,
+    updated_at: new Date(),
+  });
+
+  await createAuditLog({
+    req,
+    action: 'tenant.profile.update',
+    entityType: 'tenant',
+    entityId: tenant.id,
+    tenantId: tenant.id,
+  });
+
+  return mapTenantProfileForClient(tenant);
+};
+
 const buildGeographyTree = (rows) => {
   const map = new Map(rows.map((row) => [row.id, { ...row, children: [] }]));
   const roots = [];
@@ -2939,15 +3042,6 @@ const createUnit = async (req) => {
       throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
     }
 
-    const tenant = await Tenant.findByPk(facility.tenant_id, {
-      attributes: ['id', 'code', 'name'],
-      transaction,
-      lock: transaction.LOCK.UPDATE,
-    });
-    if (!tenant) {
-      throw new AppError('Tenant not found for facility', 404, { code: 'TENANT_NOT_FOUND' });
-    }
-
     const toiletBlock = await ToiletBlock.findByPk(req.body.toiletBlockId, {
       attributes: ['id', 'facility_id', 'code', 'name'],
       transaction,
@@ -2962,10 +3056,22 @@ const createUnit = async (req) => {
       });
     }
 
+    const toiletNameForCode =
+      sanitizeText(
+        req.body.toiletName ||
+          req.body.name ||
+          req.body.unitName ||
+          req.body.locationLabel ||
+          req.body.location_label,
+        220
+      ) ||
+      sanitizeText(unitType, 80) ||
+      'TOILET';
+
     const isAutoGeneratedCode = !requestedCode;
     let unitCode = requestedCode
       ? requestedCode.toUpperCase()
-      : await buildAutoToiletId({ facility, toiletBlock, tenant, transaction });
+      : await buildAutoToiletId({ facility, toiletBlock, toiletName: toiletNameForCode, transaction });
 
     const legacyQrCode = normalizePermanentQrCode(
       req.body.permanentQrCode || req.body.qrCode || unitCode
@@ -2978,7 +3084,12 @@ const createUnit = async (req) => {
     });
     if (duplicateCode && isAutoGeneratedCode) {
       for (let attempt = 0; attempt < 32 && duplicateCode; attempt += 1) {
-        unitCode = await buildAutoToiletId({ facility, toiletBlock, tenant, transaction });
+        unitCode = await buildAutoToiletId({
+          facility,
+          toiletBlock,
+          toiletName: toiletNameForCode,
+          transaction,
+        });
         duplicateCode = await findToiletUnitCodeConflict({
           facilityId: facility.id,
           code: unitCode,
@@ -3159,10 +3270,55 @@ const createUnit = async (req) => {
   };
 };
 
+const createUnitsBulk = async (req) => {
+  const quantity = Number(req.body.quantity);
+  if (!Number.isInteger(quantity) || quantity < 2 || quantity > 200) {
+    throw new AppError('quantity must be an integer between 2 and 200 for bulk create', 400, {
+      code: 'INVALID_BULK_QUANTITY',
+    });
+  }
+
+  if (sanitizeText(req.body.code, 120)) {
+    throw new AppError('Manual code is not allowed in bulk create. Leave code empty.', 400, {
+      code: 'BULK_CODE_NOT_ALLOWED',
+    });
+  }
+  if (sanitizeText(req.body.permanentQrCode || req.body.qrCode, 180)) {
+    throw new AppError('Manual QR value is not allowed in bulk create. Leave QR empty.', 400, {
+      code: 'BULK_QR_NOT_ALLOWED',
+    });
+  }
+
+  const createdUnits = [];
+  const originalBody = req.body;
+  try {
+    for (let index = 0; index < quantity; index += 1) {
+      req.body = {
+        ...originalBody,
+        code: undefined,
+        qrCode: undefined,
+        permanentQrCode: undefined,
+      };
+      const unit = await createUnit(req);
+      createdUnits.push(unit);
+    }
+  } finally {
+    req.body = originalBody;
+  }
+
+  return {
+    quantityRequested: quantity,
+    quantityCreated: createdUnits.length,
+    units: createdUnits,
+  };
+};
+
 module.exports = {
   listTenants,
   createTenant,
   patchTenant,
+  getOwnTenantProfile,
+  patchOwnTenantProfile,
   listGeographyTree,
   listGeographyOptions,
   createGeography,
@@ -3189,4 +3345,5 @@ module.exports = {
   QR_RESOLVE_REASON_CODES,
   buildAutoToiletId,
   createUnit,
+  createUnitsBulk,
 };

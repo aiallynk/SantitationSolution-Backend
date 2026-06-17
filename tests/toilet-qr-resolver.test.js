@@ -51,7 +51,10 @@ test('buildAutoToiletId skips codes already used anywhere in facility', async ()
   const originalQuery = sequelize.query.bind(sequelize);
   sequelize.query = async (sql, opts) => {
     const normalizedCode = opts?.replacements?.normalizedCode;
-    if (normalizedCode === 'FAC-BLK-T001' || normalizedCode === 'FAC-BLK-T002') {
+    if (
+      normalizedCode === 'NORTH-GATE-BLK-001' ||
+      normalizedCode === 'NORTH-GATE-BLK-002'
+    ) {
       return [{ id: 'existing' }];
     }
     return [];
@@ -61,8 +64,9 @@ test('buildAutoToiletId skips codes already used anywhere in facility', async ()
     const code = await buildAutoToiletId({
       facility: { id: 'facility-1', code: 'fac' },
       toiletBlock: { id: 'block-1', code: 'blk' },
+      toiletName: 'North Gate',
     });
-    assert.equal(code, 'FAC-BLK-T003');
+    assert.equal(code, 'NORTH-GATE-BLK-003');
   } finally {
     sequelize.query = originalQuery;
   }
