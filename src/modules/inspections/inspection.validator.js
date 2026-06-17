@@ -1,10 +1,66 @@
 const { isBlank, parsePositiveInteger } = require('../../utils/validators');
 const {
   ALLOWED_CONTENT_TYPES,
+  ALLOWED_CSV_CONTENT_TYPES,
   MEDIA_MAX_FILE_SIZE,
 } = require('../media/uploadPolicy');
 
 const MAX_CONTENT_LENGTH_BYTES = Number(MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024);
+
+const parseOptionalArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+};
+
+const validateCsvAttachmentPayload = (payload, key, errors = []) => {
+  const rows = parseOptionalArray(payload);
+  if (rows.length > 40) {
+    errors.push(`${key} must contain at most 40 items`);
+    return;
+  }
+  rows.forEach((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      errors.push(`${key}[${index}] must be an object`);
+      return;
+    }
+    const url = String(item.fileUrl || item.url || item.file_url || '').trim();
+    const storageKey = String(item.storageKey || item.storage_key || '').trim();
+    if (!url && !storageKey) {
+      errors.push(`${key}[${index}] must include fileUrl/url or storageKey`);
+    }
+    if (item.contentLength !== undefined) {
+      const value = Number(item.contentLength);
+      if (!Number.isFinite(value) || value < 0) {
+        errors.push(`${key}[${index}].contentLength must be >= 0`);
+      } else if (value > MAX_CONTENT_LENGTH_BYTES) {
+        errors.push(`${key}[${index}].contentLength exceeds max upload size`);
+      }
+    }
+    const mimeType = String(
+      item.mimeType || item.contentType || item.mime_type || item.content_type || ''
+    )
+      .trim()
+      .toLowerCase();
+    if (mimeType && !ALLOWED_CSV_CONTENT_TYPES.has(mimeType)) {
+      errors.push(`${key}[${index}].mimeType is not allowed`);
+    }
+    if (item.captureStage !== undefined) {
+      const captureStage = String(item.captureStage || item.capture_stage || '')
+        .trim()
+        .toLowerCase();
+      if (!['before', 'after', 'evidence'].includes(captureStage)) {
+        errors.push(`${key}[${index}].captureStage must be one of before|after|evidence`);
+      }
+    }
+  });
+};
 
 const validateCreateInspection = (req) => {
   const errors = [];
@@ -29,6 +85,33 @@ const validateSubmitInspection = (req) => {
   if (req.body.submittedAt && Number.isNaN(Date.parse(req.body.submittedAt))) {
     errors.push('submittedAt must be a valid ISO date');
   }
+  const submittedToInput =
+    req.body.submittedTo !== undefined
+      ? req.body.submittedTo
+      : req.body.submitTo !== undefined
+        ? req.body.submitTo
+        : req.body.submittedToRole;
+  if (submittedToInput !== undefined) {
+    const supportedTargets = new Set([
+      'supervisor',
+      'ops_admin_district',
+      'ops_admin_city',
+      'district_admin',
+      'city_admin',
+    ]);
+    const value = String(submittedToInput || '').trim().toLowerCase();
+    if (!supportedTargets.has(value)) {
+      errors.push('submittedTo must be one of supervisor|ops_admin_district|ops_admin_city');
+    }
+  }
+  if (req.body.severity !== undefined) {
+    const severity = String(req.body.severity || '').trim().toLowerCase();
+    if (!['low', 'medium', 'high', 'critical'].includes(severity)) {
+      errors.push('severity must be one of low|medium|high|critical');
+    }
+  }
+  validateCsvAttachmentPayload(req.body.beforeCsvFiles, 'beforeCsvFiles', errors);
+  validateCsvAttachmentPayload(req.body.afterCsvFiles, 'afterCsvFiles', errors);
   return errors;
 };
 

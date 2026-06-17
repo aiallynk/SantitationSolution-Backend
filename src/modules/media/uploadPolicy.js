@@ -13,6 +13,26 @@ const ALLOWED_CONTENT_TYPES = new Set([
   'image/heif',
 ]);
 
+const ALLOWED_VIDEO_CONTENT_TYPES = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+  'video/ogg',
+]);
+
+const ALLOWED_CSV_CONTENT_TYPES = new Set([
+  'text/csv',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'text/plain',
+]);
+
+const ALLOWED_INSPECTION_ATTACHMENT_CONTENT_TYPES = new Set([
+  ...ALLOWED_CONTENT_TYPES,
+  ...ALLOWED_VIDEO_CONTENT_TYPES,
+  ...ALLOWED_CSV_CONTENT_TYPES,
+]);
+
 const ALLOWED_IMAGE_EXTENSIONS = new Set([
   '.png',
   '.jpg',
@@ -23,6 +43,15 @@ const ALLOWED_IMAGE_EXTENSIONS = new Set([
   '.heic',
   '.heif',
 ]);
+
+const ALLOWED_VIDEO_EXTENSIONS = new Set([
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.ogv',
+]);
+
+const ALLOWED_CSV_EXTENSIONS = new Set(['.csv']);
 
 const MEDIA_MAX_FILE_SIZE = runtimeConfig.media.maxFileSizeBytes;
 
@@ -104,11 +133,131 @@ const createImageDiskUpload = ({
   });
 };
 
+const isAllowedInspectionAttachmentFile = ({ mimetype, originalName }) => {
+  const normalizedMime = normalizeContentType(mimetype);
+  const extension = path.extname(String(originalName || '')).toLowerCase();
+  const canTrustExtension =
+    (normalizedMime === '' || normalizedMime === 'application/octet-stream') &&
+    (ALLOWED_IMAGE_EXTENSIONS.has(extension) ||
+      ALLOWED_VIDEO_EXTENSIONS.has(extension) ||
+      ALLOWED_CSV_EXTENSIONS.has(extension));
+
+  if (normalizedMime.startsWith('image/') || ALLOWED_CONTENT_TYPES.has(normalizedMime)) {
+    return {
+      allowed: true,
+      kind: 'image',
+      normalizedMime,
+      extension: extension || null,
+    };
+  }
+
+  if (normalizedMime.startsWith('video/') || ALLOWED_VIDEO_CONTENT_TYPES.has(normalizedMime)) {
+    return {
+      allowed: true,
+      kind: 'video',
+      normalizedMime,
+      extension: extension || null,
+    };
+  }
+
+  if (ALLOWED_CSV_CONTENT_TYPES.has(normalizedMime) && ALLOWED_CSV_EXTENSIONS.has(extension)) {
+    return {
+      allowed: true,
+      kind: 'csv',
+      normalizedMime,
+      extension: extension || null,
+    };
+  }
+
+  if (canTrustExtension) {
+    const kind = ALLOWED_CSV_EXTENSIONS.has(extension)
+      ? 'csv'
+      : ALLOWED_VIDEO_EXTENSIONS.has(extension)
+        ? 'video'
+        : 'image';
+    return {
+      allowed: true,
+      kind,
+      normalizedMime,
+      extension: extension || null,
+    };
+  }
+
+  return {
+    allowed: false,
+    kind: null,
+    normalizedMime,
+    extension: extension || null,
+  };
+};
+
+const buildInspectionAttachmentFileFilter = () => (req, file, cb) => {
+  const result = isAllowedInspectionAttachmentFile({
+    mimetype: file?.mimetype,
+    originalName: file?.originalname,
+  });
+
+  if (!result.allowed) {
+    return cb(
+      new AppError('Only image, video, or CSV uploads are supported', 400, {
+        code: 'INVALID_MEDIA_TYPE',
+        details: {
+          mimetype: result.normalizedMime || null,
+          originalName: String(file?.originalname || '') || null,
+          extension: result.extension,
+        },
+      })
+    );
+  }
+
+  req.uploadFileKind = result.kind;
+  return cb(null, true);
+};
+
+const createInspectionAttachmentDiskUpload = ({
+  filenamePrefix = 'attachment',
+  tempSubdir = '',
+  maxFileSize = MEDIA_MAX_FILE_SIZE,
+} = {}) => {
+  const tempDir = ensureDir(
+    path.join(process.cwd(), 'uploads', 'temp', String(tempSubdir || '').trim())
+  );
+
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, tempDir),
+    filename: (req, file, cb) => {
+      const extension = path.extname(file.originalname || '');
+      cb(
+        null,
+        `${filenamePrefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`
+      );
+    },
+  });
+
+  return multer({
+    storage,
+    limits: {
+      fileSize: Number.isFinite(Number(maxFileSize))
+        ? Number(maxFileSize)
+        : MEDIA_MAX_FILE_SIZE,
+      files: 1,
+    },
+    fileFilter: buildInspectionAttachmentFileFilter(),
+  });
+};
+
 module.exports = {
   ALLOWED_CONTENT_TYPES,
+  ALLOWED_VIDEO_CONTENT_TYPES,
+  ALLOWED_CSV_CONTENT_TYPES,
+  ALLOWED_INSPECTION_ATTACHMENT_CONTENT_TYPES,
   ALLOWED_IMAGE_EXTENSIONS,
+  ALLOWED_VIDEO_EXTENSIONS,
+  ALLOWED_CSV_EXTENSIONS,
   MEDIA_MAX_FILE_SIZE,
   normalizeContentType,
   createImageDiskUpload,
+  createInspectionAttachmentDiskUpload,
   isAllowedImageFile,
+  isAllowedInspectionAttachmentFile,
 };

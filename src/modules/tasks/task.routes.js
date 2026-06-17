@@ -11,7 +11,11 @@ const {
 } = require('../../core/middleware/auth');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
-const { validateTaskCreate, validateTaskReassign } = require('./task.validator');
+const {
+  validateTaskCreate,
+  validateTaskReassign,
+  validateDispatchToiletCreate,
+} = require('./task.validator');
 
 const router = express.Router();
 
@@ -38,6 +42,13 @@ router.post(
   requireAction('task.manage'),
   validate(validateTaskCreate),
   taskController.postTask
+);
+router.post(
+  '/tasks/dispatch-board/toilet-assignment',
+  requirePermissions('task.manage'),
+  requireAction('task.assign'),
+  validate(validateDispatchToiletCreate),
+  taskController.postDispatchToiletTask
 );
 router.get(
   '/tasks/my',

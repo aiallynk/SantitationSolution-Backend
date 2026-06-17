@@ -13,6 +13,7 @@ const {
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 const { validate } = require('../../core/middleware/validate');
 const { validateTaskReassign } = require('../tasks/task.validator');
+const { validateCreateSupervisorWorker } = require('./supervisor.validator');
 const { supervisorApiRateLimit } = require('../../core/security/rateLimit');
 
 const router = express.Router();
@@ -38,6 +39,14 @@ router.get(
   requireRouteKey(RouteKeys.SUPERVISOR_WORKERS),
   requirePermissions('supervisor.workers.read'),
   supervisorController.getWorkers
+);
+
+router.post(
+  '/supervisor/workers',
+  requireRouteKey(RouteKeys.SUPERVISOR_WORKERS),
+  requirePermissions('supervisor.workers.read'),
+  validate(validateCreateSupervisorWorker),
+  supervisorController.postCreateWorker
 );
 
 router.get(

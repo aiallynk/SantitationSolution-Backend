@@ -155,7 +155,11 @@ const RouteKeyToPaths = {
   [RouteKeys.OPS_SETTINGS]: ['/ops/settings'],
   [RouteKeys.OPS_PROFILE]: ['/ops/profile'],
   [RouteKeys.SUPERVISOR_OVERVIEW]: ['/ops/supervisor/overview'],
-  [RouteKeys.SUPERVISOR_WORKERS]: ['/ops/supervisor/workers', '/ops/supervisor/workers/:workerId'],
+  [RouteKeys.SUPERVISOR_WORKERS]: [
+    '/ops/supervisor/workers',
+    '/ops/supervisor/workers/create',
+    '/ops/supervisor/workers/:workerId',
+  ],
   [RouteKeys.SUPERVISOR_ATTENDANCE]: ['/ops/supervisor/attendance'],
   [RouteKeys.SUPERVISOR_LIVE_LOCATION]: ['/ops/supervisor/live-map'],
   [RouteKeys.SUPERVISOR_CHECKIN_CHECKOUT]: ['/ops/supervisor/checkins'],

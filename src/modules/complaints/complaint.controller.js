@@ -1,5 +1,7 @@
+const path = require('path');
 const { sendSuccess } = require('../../core/http/response');
 const complaintService = require('./complaint.service');
+const PUBLIC_FEEDBACK_STARS_SCRIPT_PATH = path.join(__dirname, 'public-feedback-stars.js');
 
 const escapeHtml = (value) =>
   String(value || '')
@@ -89,6 +91,13 @@ const getPublicFeedbackForm = async (req, res) => {
   }
 };
 
+const getPublicFeedbackStarsScript = (req, res) =>
+  res
+    .status(200)
+    .set('Content-Type', 'application/javascript; charset=utf-8')
+    .set('Cache-Control', 'public, max-age=300')
+    .sendFile(PUBLIC_FEEDBACK_STARS_SCRIPT_PATH);
+
 const postPublicFeedback = async (req, res, next) => {
   try {
     const data = await complaintService.createPublicComplaint(req);
@@ -109,7 +118,17 @@ const postPublicFeedback = async (req, res, next) => {
   } catch (error) {
     if (req.accepts('html')) {
       const toiletId = encodeURIComponent(req.params.toiletId || '');
-      const message = encodeURIComponent(error?.message || 'Unable to submit feedback');
+      const normalizedCode = String(error?.code || '').trim().toUpperCase();
+      const rawMessage = String(error?.message || '').trim().toLowerCase();
+      const message = encodeURIComponent(
+        normalizedCode === 'TOILET_NOT_FOUND'
+          ? 'The feedback link is invalid or expired.'
+          : normalizedCode.startsWith('FEEDBACK_Q')
+            ? String(error?.message || 'Please complete all required ratings.')
+            : rawMessage.includes('current transaction is aborted')
+              ? 'Unable to submit feedback right now. Please try again in a few moments.'
+              : 'Unable to submit feedback right now. Please try again in a few moments.'
+      );
       return res.redirect(`/api/v1/public-feedback/toilets/${toiletId}?error=${message}`);
     }
     return next(error);
@@ -169,6 +188,7 @@ module.exports = {
   getComplaintById,
   postComplaint,
   getPublicFeedbackForm,
+  getPublicFeedbackStarsScript,
   postPublicFeedback,
   patchComplaintAssign,
   patchComplaint,

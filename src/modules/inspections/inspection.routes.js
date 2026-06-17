@@ -22,14 +22,14 @@ const {
 const { withIdempotency } = require('../../core/idempotency/idempotency.middleware');
 const { ingestionRateLimit } = require('../../core/security/rateLimit');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
-const { createImageDiskUpload } = require('../media/uploadPolicy');
+const { createInspectionAttachmentDiskUpload } = require('../media/uploadPolicy');
 const { runtimeConfig } = require('../../config/runtime');
 
 const router = express.Router();
 const INSPECTION_ROUTE_PREFIXES = ['/inspections', '/toilets', '/inspection-images'];
 
-const upload = createImageDiskUpload({
-  filenamePrefix: 'inspection',
+const upload = createInspectionAttachmentDiskUpload({
+  filenamePrefix: 'inspection-attachment',
 });
 
 router.use(INSPECTION_ROUTE_PREFIXES, protect);

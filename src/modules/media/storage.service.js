@@ -30,7 +30,19 @@ const resolveMimeType = (filePath) => {
   if (ext === '.gif') return 'image/gif';
   if (ext === '.bmp') return 'image/bmp';
   if (ext === '.heic') return 'image/heic';
+  if (ext === '.heif') return 'image/heif';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.csv') return 'text/csv';
   return 'image/jpeg';
+};
+
+const resolveContentType = ({ filePath, contentType = null }) => {
+  const normalized = String(contentType || '').trim().toLowerCase();
+  if (normalized) return normalized;
+  return resolveMimeType(filePath);
 };
 
 const uploadToCloudinary = async (filePath, targetFolder) => {
@@ -50,7 +62,7 @@ const uploadToCloudinary = async (filePath, targetFolder) => {
   };
 };
 
-const uploadToLocal = async (filePath, targetFolder) => {
+const uploadToLocal = async (filePath, targetFolder, { contentType = null } = {}) => {
   const folderPath = path.join(uploadRoot, targetFolder);
   await fs.promises.mkdir(folderPath, { recursive: true });
   const fileName = path.basename(filePath);
@@ -58,27 +70,31 @@ const uploadToLocal = async (filePath, targetFolder) => {
   await fs.promises.copyFile(filePath, destination);
   const stat = await fs.promises.stat(destination);
   const relativePath = path.relative(uploadRoot, destination).replace(/\\/g, '/');
+  const resolvedContentType = resolveContentType({ filePath, contentType });
   return {
     fileUrl: `/static/${relativePath}`,
     storageKey: relativePath,
     metadata: {
       provider: 'local',
       bytes: stat.size,
+      contentType: resolvedContentType,
     },
   };
 };
 
-const uploadToS3 = async (filePath, targetFolder) => {
+const uploadToS3 = async (filePath, targetFolder, { contentType = null } = {}) => {
   const normalizedFolder = String(targetFolder || 'sanitation')
     .replace(/\\/g, '/')
     .replace(/^\/+|\/+$/g, '');
   const extension = path.extname(filePath || '').toLowerCase() || '.jpg';
   const fileName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`;
   const objectKey = `${normalizedFolder}/${fileName}`;
+  const resolvedContentType = resolveContentType({ filePath, contentType });
 
   const uploaded = await uploadFileToS3({
     filePath,
     objectKey,
+    contentType: resolvedContentType,
   });
 
   return {
@@ -96,14 +112,28 @@ const uploadToS3 = async (filePath, targetFolder) => {
 };
 
 const uploadImage = async (filePath, targetFolder) => {
+  return uploadFile(filePath, targetFolder, {
+    contentType: resolveMimeType(filePath),
+    preferCloudinary: true,
+  });
+};
+
+const uploadFile = async (
+  filePath,
+  targetFolder,
+  { contentType = null, preferCloudinary = false } = {}
+) => {
   const allowLocalFallback = allowS3FallbackToLocal();
   const nowTs = Date.now();
   const s3BackoffActive = nowTs < s3BackoffUntilTs;
+  const resolvedContentType = resolveContentType({ filePath, contentType });
   if (isS3Enabled()) {
     const shouldSkipS3Attempt = s3BackoffActive && allowLocalFallback;
     if (!shouldSkipS3Attempt) {
       try {
-        return await uploadToS3(filePath, targetFolder);
+        return await uploadToS3(filePath, targetFolder, {
+          contentType: resolvedContentType,
+        });
       } catch (error) {
         const message = String(error?.message || '');
         const lower = message.toLowerCase();
@@ -133,10 +163,12 @@ const uploadImage = async (filePath, targetFolder) => {
       );
     }
   }
-  if (useCloudinary()) {
+  if (preferCloudinary && useCloudinary()) {
     return uploadToCloudinary(filePath, targetFolder);
   }
-  return uploadToLocal(filePath, targetFolder);
+  return uploadToLocal(filePath, targetFolder, {
+    contentType: resolvedContentType,
+  });
 };
 
 const removeTempFile = async (filePath) => {
@@ -151,6 +183,7 @@ const removeTempFile = async (filePath) => {
 };
 
 module.exports = {
+  uploadFile,
   uploadImage,
   removeTempFile,
 };

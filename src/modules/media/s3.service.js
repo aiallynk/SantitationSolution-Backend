@@ -181,6 +181,12 @@ const resolveMimeType = (filePath) => {
   if (ext === '.gif') return 'image/gif';
   if (ext === '.bmp') return 'image/bmp';
   if (ext === '.heic') return 'image/heic';
+  if (ext === '.heif') return 'image/heif';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.csv') return 'text/csv';
   return 'image/jpeg';
 };
 
@@ -236,7 +242,7 @@ const buildObjectUrl = (objectKey) => {
   return `https://${s3Config.bucket}.s3.${s3Config.region}.amazonaws.com/${encodedKey}`;
 };
 
-const uploadFileToS3 = async ({ filePath, objectKey }) => {
+const uploadFileToS3 = async ({ filePath, objectKey, contentType = null }) => {
   const client = getS3Client();
   if (!client) {
     throw new Error('S3 is not configured');
@@ -244,13 +250,14 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
 
   const stat = await fs.promises.stat(filePath);
   const body = fs.createReadStream(filePath);
-  const contentType = resolveMimeType(filePath);
+  const resolvedContentType =
+    String(contentType || '').trim() || resolveMimeType(filePath);
 
   const command = new PutObjectCommand({
     Bucket: s3Config.bucket,
     Key: objectKey,
     Body: body,
-    ContentType: contentType,
+    ContentType: resolvedContentType,
     ...(S3_OBJECT_ACL ? { ACL: S3_OBJECT_ACL } : {}),
     ...S3_ENCRYPTION_OPTIONS,
   });
@@ -263,7 +270,7 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
     objectKey,
     fileUrl: buildObjectUrl(objectKey),
     bytes: Number(stat.size || 0),
-    contentType,
+    contentType: resolvedContentType,
     eTag: response.ETag || null,
   };
 };

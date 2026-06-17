@@ -577,6 +577,9 @@ const InspectionSubmission = sequelize.define(
     idempotency_key: { type: DataTypes.STRING(200), allowNull: true },
     status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'queued_for_ai' },
     submitted_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    submitted_to_role: { type: DataTypes.STRING(80), allowNull: true },
+    submitted_to_scope: { type: DataTypes.STRING(80), allowNull: true },
+    submitted_by_user: { type: DataTypes.UUID, allowNull: true },
     acknowledged_at: { type: DataTypes.DATE, allowNull: true },
     metadata: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
@@ -1191,6 +1194,14 @@ Inspection.hasMany(InspectionSubmission, {
   as: 'inspectionSubmissions',
 });
 InspectionSubmission.belongsTo(Inspection, { foreignKey: 'inspection_id' });
+PlatformUser.hasMany(InspectionSubmission, {
+  foreignKey: 'submitted_by_user',
+  as: 'submittedInspectionSubmissions',
+});
+InspectionSubmission.belongsTo(PlatformUser, {
+  foreignKey: 'submitted_by_user',
+  as: 'submittedByUser',
+});
 InspectionSubmission.hasMany(AiProcessingJob, {
   foreignKey: 'submission_id',
   as: 'processingJobs',
