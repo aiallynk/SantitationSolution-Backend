@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { Op, QueryTypes } = require('sequelize');
+const { Op, QueryTypes, fn, col } = require('sequelize');
 const { v4: uuidv4 } = require('uuid');
 const AppError = require('../../core/errors/AppError');
 const {
@@ -14,6 +14,7 @@ const {
   PlatformUser,
   UserRole,
   Role,
+  Complaint,
 } = require('../../models');
 const { createAuditLog } = require('../audit/audit.service');
 const { normalizePagination, sanitizeText } = require('../../utils/validators');
@@ -32,6 +33,7 @@ const {
   ensureQrImagesForToilets,
 } = require('./toiletQr.service');
 const { runtimeConfig } = require('../../config/runtime');
+const { computeToiletRiskWeight } = require('./toiletMapRisk.helper');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -960,8 +962,10 @@ const QR_RESOLVE_REASON_CODES = Object.freeze({
   INVALID_QR_FORMAT: 'INVALID_QR_FORMAT',
   QR_UNSUPPORTED_VERSION: 'QR_UNSUPPORTED_VERSION',
   QR_NOT_FOUND: 'QR_NOT_FOUND',
+  QR_NOT_MAPPED: 'QR_NOT_MAPPED',
   TOILET_NOT_FOUND: 'TOILET_NOT_FOUND',
   TOILET_INACTIVE: 'TOILET_INACTIVE',
+  TOILET_NOT_IN_USER_SCOPE: 'TOILET_NOT_IN_USER_SCOPE',
   TENANT_MISMATCH: 'TENANT_MISMATCH',
   ORG_MISMATCH: 'ORG_MISMATCH',
   ASSIGNMENT_MISSING: 'ASSIGNMENT_MISSING',
@@ -977,10 +981,14 @@ const QR_RESOLVE_MESSAGES = {
     'This QR version is not supported by the app yet.',
   [QR_RESOLVE_REASON_CODES.QR_NOT_FOUND]:
     'This QR is not mapped to any toilet.',
+  [QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED]:
+    'This QR is not mapped to any toilet.',
   [QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND]:
     'Toilet not found for this QR.',
   [QR_RESOLVE_REASON_CODES.TOILET_INACTIVE]:
     'This toilet is inactive. Contact your supervisor.',
+  [QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE]:
+    'QR recognized, but this toilet is not assigned to you.',
   [QR_RESOLVE_REASON_CODES.TENANT_MISMATCH]:
     'This QR belongs to another organization.',
   [QR_RESOLVE_REASON_CODES.ORG_MISMATCH]:
@@ -1120,7 +1128,7 @@ const classifyResolvedToilet = ({ row, req }) => {
     }
   }
   if (!isFacilityInScope(req, row.facility_id || row.Facility?.id || null)) {
-    return QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED;
+    return QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE;
   }
   return QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY;
 };
@@ -1552,7 +1560,7 @@ const loadQrMappedRowsByCandidates = async ({ candidates = [] }) => {
       SELECT q.id
       FROM toilet_qr_codes q
       WHERE q.status = 'active'
-        AND UPPER(TRIM(q.qr_code)) = ANY(:candidateCodes)
+        AND UPPER(TRIM(q.qr_code)) IN (:candidateCodes)
       ORDER BY q.is_primary DESC, q.created_at DESC
       LIMIT 60
     `,
@@ -1808,7 +1816,7 @@ const resolveToiletFromQr = async ({
     const reasonCode =
       parsedMeta.extractedIdentifier && isUuidLike(parsedMeta.extractedIdentifier)
         ? QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND
-        : QR_RESOLVE_REASON_CODES.QR_NOT_FOUND;
+        : QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED;
     return buildQrResolveResult({
       status: 'failed',
       reasonCode,
@@ -1840,7 +1848,10 @@ const resolveToiletFromQr = async ({
   if (!auth.allowed) {
     return buildQrResolveResult({
       status: 'failed',
-      reasonCode: auth.reasonCode || QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED,
+      reasonCode:
+        auth.reasonCode === QR_RESOLVE_REASON_CODES.WORKER_SCOPE_DENIED
+          ? QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE
+          : auth.reasonCode || QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE,
       rawQrValue: rawInput,
       normalizedQrValue: normalizedInput,
       parsed: parsedMeta,
@@ -3006,6 +3017,293 @@ const listUnits = async (req) => {
   });
 };
 
+const normalizeMapLimit = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1000;
+  return Math.min(Math.max(Math.trunc(parsed), 1), 2500);
+};
+
+const normalizeBounds = (query = {}) => {
+  const north = toFiniteNumber(query.north, null);
+  const south = toFiniteNumber(query.south, null);
+  const east = toFiniteNumber(query.east, null);
+  const west = toFiniteNumber(query.west, null);
+  if (![north, south, east, west].every((value) => value !== null)) return null;
+  return {
+    north: Math.max(north, south),
+    south: Math.min(north, south),
+    east: Math.max(east, west),
+    west: Math.min(east, west),
+  };
+};
+
+const buildDateRangeFilter = ({ after = null, before = null } = {}) => {
+  const where = {};
+  const afterDate = after ? new Date(after) : null;
+  const beforeDate = before ? new Date(before) : null;
+  if (afterDate && Number.isFinite(afterDate.getTime())) where[Op.gte] = afterDate;
+  if (beforeDate && Number.isFinite(beforeDate.getTime())) where[Op.lte] = beforeDate;
+  return Object.keys(where).length > 0 ? where : null;
+};
+
+const normalizeUnitStatusFilter = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'all') return null;
+  if (normalized === 'operational' || normalized === 'active') {
+    return { [Op.in]: ['clean', 'moderate'] };
+  }
+  if (normalized === 'needs_cleaning' || normalized === 'needs cleaning' || normalized === 'attention') {
+    return { [Op.in]: ['poor', 'critical'] };
+  }
+  if (normalized === 'inactive' || normalized === 'maintenance' || normalized === 'under maintenance') {
+    return { [Op.in]: ['out_of_service'] };
+  }
+  return normalized;
+};
+
+const normalizeComplaintStatusFilter = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'all') return 'all';
+  if (['active', 'has_active', 'open'].includes(normalized)) return 'active';
+  if (['none', 'no_active'].includes(normalized)) return 'none';
+  return normalized;
+};
+
+const readFacilityPriority = (facility = {}) => {
+  const metadata = facility?.metadata && typeof facility.metadata === 'object' ? facility.metadata : {};
+  return (
+    metadata.priority ||
+    metadata.riskPriority ||
+    metadata.usagePriority ||
+    metadata.category ||
+    null
+  );
+};
+
+const readFacilityFootfall = (facility = {}) => {
+  const metadata = facility?.metadata && typeof facility.metadata === 'object' ? facility.metadata : {};
+  return (
+    metadata.footfall ||
+    metadata.dailyFootfall ||
+    metadata.averageFootfall ||
+    metadata.expectedUsersPerDay ||
+    null
+  );
+};
+
+const listToiletMap = async (req) => {
+  const bounds = normalizeBounds(req.query || {});
+  const andFilters = [];
+  const where = {};
+  const facilityInclude = {
+    model: Facility,
+    attributes: [
+      'id',
+      'tenant_id',
+      'code',
+      'name',
+      'address_line',
+      'latitude',
+      'longitude',
+      'geography_id',
+      'zone_geography_id',
+      'ward_geography_id',
+      'metadata',
+    ],
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+    ],
+    required: true,
+  };
+  facilityInclude.where = buildFacilityIncludeScopeWhere(req);
+
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('facilityId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.facility_id = req.query.facilityId;
+  }
+
+  const statusFilter = normalizeUnitStatusFilter(req.query.status);
+  if (statusFilter) {
+    where.status = statusFilter;
+  }
+
+  if (req.query.sector) {
+    const normalizedSector = normalizeSectorCode(req.query.sector);
+    if (normalizedSector) where.sector_code = normalizedSector;
+  }
+
+  if (req.query.wardGeographyId) {
+    if (!isGeographyInScope(req, req.query.wardGeographyId)) {
+      throw new AppError('wardGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    facilityInclude.where.ward_geography_id = req.query.wardGeographyId;
+  }
+
+  if (req.query.zoneGeographyId) {
+    if (!isGeographyInScope(req, req.query.zoneGeographyId)) {
+      throw new AppError('zoneGeographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    facilityInclude.where.zone_geography_id = req.query.zoneGeographyId;
+  }
+
+  const scoreFilter = {};
+  const scoreMin = toFiniteNumber(req.query.scoreMin, null);
+  const scoreMax = toFiniteNumber(req.query.scoreMax, null);
+  if (scoreMin !== null) scoreFilter[Op.gte] = Math.max(0, Math.min(100, scoreMin));
+  if (scoreMax !== null) scoreFilter[Op.lte] = Math.max(0, Math.min(100, scoreMax));
+  if (Object.keys(scoreFilter).length > 0) where.latest_score = scoreFilter;
+
+  const inspectedAtFilter = buildDateRangeFilter({
+    after: req.query.lastInspectedAfter || req.query.inspectedAfter,
+    before: req.query.lastInspectedBefore || req.query.inspectedBefore,
+  });
+  if (inspectedAtFilter) where.last_inspection_at = inspectedAtFilter;
+
+  const query = sanitizeOptionalText(req.query.q || req.query.search, 120);
+  if (query) {
+    const like = `%${query}%`;
+    andFilters.push({
+      [Op.or]: [
+        { code: { [Op.iLike]: like } },
+        { qr_code: { [Op.iLike]: like } },
+        { location_label: { [Op.iLike]: like } },
+        { '$Facility.name$': { [Op.iLike]: like } },
+        { '$Facility.address_line$': { [Op.iLike]: like } },
+      ],
+    });
+  }
+
+  if (bounds) {
+    const latRange = { [Op.between]: [bounds.south, bounds.north] };
+    const lngRange = { [Op.between]: [bounds.west, bounds.east] };
+    andFilters.push({
+      [Op.or]: [
+        { latitude: latRange, longitude: lngRange },
+        {
+          latitude: { [Op.is]: null },
+          longitude: { [Op.is]: null },
+          '$Facility.latitude$': latRange,
+          '$Facility.longitude$': lngRange,
+        },
+      ],
+    });
+  }
+
+  if (andFilters.length > 0) {
+    where[Op.and] = andFilters;
+  }
+
+  const rows = await ToiletUnit.findAll({
+    where,
+    include: [facilityInclude],
+    order: [
+      ['last_inspection_at', 'DESC'],
+      ['code', 'ASC'],
+    ],
+    limit: normalizeMapLimit(req.query.limit),
+    subQuery: false,
+  });
+
+  const toiletIds = rows.map((row) => row.id);
+  const activeComplaintRows =
+    toiletIds.length > 0
+      ? await Complaint.findAll({
+          where: {
+            toilet_unit_id: { [Op.in]: toiletIds },
+            status: { [Op.in]: ['open', 'assigned'] },
+          },
+          attributes: ['toilet_unit_id', [fn('COUNT', col('id')), 'count']],
+          group: ['toilet_unit_id'],
+          raw: true,
+        })
+      : [];
+  const activeComplaintCountByToilet = new Map(
+    activeComplaintRows.map((row) => [String(row.toilet_unit_id), Number(row.count || 0)])
+  );
+
+  const complaintStatusFilter = normalizeComplaintStatusFilter(req.query.complaintStatus);
+  const severityFilter = String(req.query.severity || 'all').trim().toLowerCase();
+  const expectedInspectionDays = toFiniteNumber(req.query.expectedInspectionDays, 7) || 7;
+  const now = Date.now();
+
+  return rows
+    .map((row) => {
+      const lat =
+        row.latitude !== null && row.latitude !== undefined
+          ? Number(row.latitude)
+          : row.Facility?.latitude !== null && row.Facility?.latitude !== undefined
+            ? Number(row.Facility.latitude)
+            : null;
+      const lng =
+        row.longitude !== null && row.longitude !== undefined
+          ? Number(row.longitude)
+          : row.Facility?.longitude !== null && row.Facility?.longitude !== undefined
+            ? Number(row.Facility.longitude)
+            : null;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+      const latestScore = toFiniteNumber(row.latest_score, null);
+      const activeComplaintsCount = activeComplaintCountByToilet.get(String(row.id)) || 0;
+      if (complaintStatusFilter === 'active' && activeComplaintsCount === 0) return null;
+      if (complaintStatusFilter === 'none' && activeComplaintsCount > 0) return null;
+
+      const risk = computeToiletRiskWeight({
+        latestScore,
+        activeComplaintsCount,
+        lastInspectionAt: row.last_inspection_at || null,
+        expectedInspectionDays,
+        dirtyFrequency: row.dirty_frequency,
+        lowPerformanceFrequency: row.low_performance_frequency,
+        priority: readFacilityPriority(row.Facility),
+        footfall: readFacilityFootfall(row.Facility),
+        now,
+      });
+      if (severityFilter === 'critical' && risk.riskWeight < 70 && !(latestScore !== null && latestScore < 55)) {
+        return null;
+      }
+      if (
+        (severityFilter === 'warning' || severityFilter === 'moderate') &&
+        (risk.riskWeight < 40 || risk.riskWeight >= 70)
+      ) {
+        return null;
+      }
+      if (['good', 'clean', 'low'].includes(severityFilter) && risk.riskWeight >= 40) {
+        return null;
+      }
+
+      return {
+        id: row.id,
+        toiletCode: row.code || row.qr_code || null,
+        name: row.location_label || row.code || row.Facility?.name || 'Toilet',
+        lat,
+        lng,
+        latitude: lat,
+        longitude: lng,
+        latestScore,
+        starRating: latestScore === null ? null : Number((latestScore / 20).toFixed(1)),
+        riskWeight: risk.riskWeight,
+        riskWeightNormalized: risk.riskWeightNormalized,
+        riskBreakdown: risk.breakdown,
+        scoreConfidence: risk.scoreConfidence,
+        status: row.status || null,
+        ward: row.Facility?.ward?.name || null,
+        wardGeographyId: row.Facility?.ward_geography_id || null,
+        zone: row.Facility?.zone?.name || null,
+        zoneGeographyId: row.Facility?.zone_geography_id || null,
+        facilityId: row.facility_id,
+        facilityName: row.Facility?.name || null,
+        locationLabel: row.location_label || row.Facility?.address_line || row.Facility?.name || null,
+        lastInspectionAt: row.last_inspection_at || null,
+        activeComplaintsCount,
+        totalInspections: Number(row.total_inspections || 0),
+      };
+    })
+    .filter(Boolean);
+};
+
 const createUnit = async (req) => {
   const requestedCode = sanitizeText(req.body.code, 120);
   const unitType = sanitizeText(req.body.unitType, 40);
@@ -3332,6 +3630,7 @@ module.exports = {
   listBlocks,
   createBlock,
   listUnits,
+  listToiletMap,
   resolveUnitByQr,
   resolveUnitByQrDetailed,
   resolveToiletFromQr,

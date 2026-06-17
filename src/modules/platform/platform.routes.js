@@ -216,6 +216,14 @@ router.get(
   requirePermissions('dashboard.read'),
   platformController.getToiletUnits
 );
+router.get(
+  '/toilets/map',
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(...TOILETS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.getToiletMap
+);
 // QR resolve is used by the mobile app to map scanned toilet/public QR values to a toilet unit.
 // Supervisors are allowed on mobile but may not have `inspection.create`, so keep this endpoint readable.
 router.get(

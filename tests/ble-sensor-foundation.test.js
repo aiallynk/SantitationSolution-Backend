@@ -1,0 +1,118 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const { parseSensorPayload } = require('../src/modules/sensors/sensorPayload.parser');
+const {
+  validateIngestion,
+  validateAttachSensor,
+} = require('../src/modules/sensors/sensor.validator');
+const { ROLE_PERMISSION_BUNDLES } = require('../src/core/rbac/defaultRoleBundles');
+
+/* --------------------------- payload parser ------------------------------- */
+
+test('parser maps V2 5-field payload (field_4=temp, field_5=humidity)', () => {
+  const result = parseSensorPayload('10,0.00,1.28,32.4,59.4');
+  assert.equal(result.version, 'v2');
+  assert.equal(result.fieldCount, 5);
+  assert.equal(result.parsed.temperature, 32.4);
+  assert.equal(result.parsed.humidity, 59.4);
+  // field_1..3 stay generic
+  assert.deepEqual(result.fields, {
+    field_1: 10,
+    field_2: 0,
+    field_3: 1.28,
+    field_4: 32.4,
+    field_5: 59.4,
+  });
+});
+
+test('parser names V2 fields (score, MQ135, MQ137, temp, humidity)', () => {
+  const result = parseSensorPayload('10,0.09,1.29,31.6,58.0');
+  assert.equal(result.version, 'v2');
+  assert.equal(result.parsed.score, 10);
+  assert.equal(result.parsed.mq135, 0.09);
+  assert.equal(result.parsed.mq137, 1.29);
+  assert.equal(result.parsed.temperature, 31.6);
+  assert.equal(result.parsed.humidity, 58.0);
+});
+
+test('parser always preserves the verbatim raw payload', () => {
+  const raw = '10,0.00,1.28,32.4,59.4';
+  assert.equal(parseSensorPayload(raw).raw, raw);
+});
+
+test('parser tolerates legacy V1 2-field payload (Score,Voltage)', () => {
+  const result = parseSensorPayload('8,0.13');
+  assert.equal(result.version, 'legacy_v1');
+  assert.equal(result.fieldCount, 2);
+  assert.equal(result.parsed.temperature, null);
+  assert.equal(result.parsed.humidity, null);
+  assert.equal(result.fields.field_1, 8);
+  assert.equal(result.fields.field_2, 0.13);
+});
+
+test('parser accepts array input and unknown shapes without throwing', () => {
+  const arr = parseSensorPayload([1, 2, 3, 21.5, 40]);
+  assert.equal(arr.version, 'v2');
+  assert.equal(arr.parsed.temperature, 21.5);
+
+  const unknown = parseSensorPayload('x,y,z');
+  assert.equal(unknown.version, 'unknown');
+  assert.deepEqual(unknown.fields, { field_1: null, field_2: null, field_3: null });
+
+  const empty = parseSensorPayload('');
+  assert.equal(empty.version, 'empty');
+  assert.equal(empty.fieldCount, 0);
+});
+
+test('parser extracts raw string from object envelopes', () => {
+  const result = parseSensorPayload({ raw: '10,0.00,1.28,32.4,59.4' });
+  assert.equal(result.raw, '10,0.00,1.28,32.4,59.4');
+  assert.equal(result.parsed.humidity, 59.4);
+});
+
+/* ------------------------------ validators -------------------------------- */
+
+test('validateAttachSensor requires deviceId and a valid toiletUnitId', () => {
+  assert.deepEqual(validateAttachSensor({ body: {} }), [
+    'deviceId is required',
+    'toiletUnitId is required',
+  ]);
+  assert.deepEqual(
+    validateAttachSensor({ body: { deviceId: 'Wand_1234', toiletUnitId: 'not-a-uuid' } }),
+    ['toiletUnitId must be a valid id']
+  );
+  assert.deepEqual(
+    validateAttachSensor({
+      body: { deviceId: 'Wand_1234', toiletUnitId: '11111111-1111-4111-8111-111111111111' },
+    }),
+    []
+  );
+});
+
+test('validateIngestion rejects an invalid toiletUnitId when provided', () => {
+  assert.deepEqual(
+    validateIngestion({ body: { deviceId: 'Wand_1234', toiletUnitId: 'bad' } }),
+    ['toiletUnitId must be a valid id']
+  );
+  assert.deepEqual(
+    validateIngestion({
+      body: { deviceId: 'Wand_1234', toiletUnitId: '11111111-1111-4111-8111-111111111111' },
+    }),
+    []
+  );
+});
+
+/* ------------------------------ RBAC bundles ------------------------------ */
+
+test('field worker bundle grants sensor manage/ingest/read for mobile commissioning', () => {
+  const fieldWorker = ROLE_PERMISSION_BUNDLES.field_worker || [];
+  assert.ok(fieldWorker.includes('sensor.manage'), 'sensor.manage missing for field_worker');
+  assert.ok(fieldWorker.includes('sensor.ingest'), 'sensor.ingest missing for field_worker');
+  assert.ok(fieldWorker.includes('sensor.read'), 'sensor.read missing for field_worker');
+});
+
+test('management roles can manage sensors from the web', () => {
+  assert.ok((ROLE_PERMISSION_BUNDLES.tenant_admin || []).includes('sensor.manage'));
+  assert.ok((ROLE_PERMISSION_BUNDLES.facility_manager || []).includes('sensor.manage'));
+});

@@ -10,6 +10,7 @@ const {
   validateInspectionImageUploadSession,
   validateInspectionImageConfirmUpload,
   validateSubmitInspection,
+  validateInspectionSensorReading,
   validateReviewInspection,
 } = require('./inspection.validator');
 const {
@@ -89,6 +90,15 @@ router.post(
   inspectionController.postInspectionImageConfirmUpload
 );
 router.get('/inspections/:id', requirePermissions('dashboard.read'), inspectionController.getInspectionById);
+// Optional, additive: link a BLE sensor snapshot to an inspection. Never part of the
+// submit lifecycle — failure here must never block QR -> Before -> After -> Submit.
+router.post(
+  '/inspections/:id/sensor-reading',
+  requirePermissions('inspection.create'),
+  withIdempotency('inspection.sensor_link', { ttlMs: 24 * 60 * 60 * 1000 }),
+  validate(validateInspectionSensorReading),
+  inspectionController.postInspectionSensorReading
+);
 router.post(
   '/inspections/:id/media/sessions',
   requirePermissions('inspection.create'),

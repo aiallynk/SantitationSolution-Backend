@@ -11,8 +11,10 @@ const {
   AiAnalysisResult,
   PlatformUser,
   AuditLog,
+  SensorReading,
+  SensorDevice,
 } = require('../../models');
-const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { uploadImage, removeTempFile } = require('../media/storage.service');
 const {
   normalizeMediaUrl,
@@ -745,6 +747,10 @@ const mapInspection = (
     reviewRequired: Boolean(inspection.review_required),
     lastProcessingError: inspection.last_processing_error || null,
     overallStatus: inspection.overall_status,
+    sensorSnapshot:
+      inspection.sensor_snapshot && typeof inspection.sensor_snapshot === 'object'
+        ? inspection.sensor_snapshot
+        : null,
     beforeImageCount:
       beforeMedia.length > 0
         ? beforeMedia.length
@@ -1835,6 +1841,79 @@ const getInspectionById = async (req) => {
   return mapInspection(inspection, { withAnalysis: true, reviewByInspectionId: reviewMap });
 };
 
+/* -------------------------------------------------------------------------- */
+/* Sensor snapshot link — attach an optional BLE reading snapshot to an        */
+/* inspection. Purely additive metadata: it never blocks or alters submit/AI   */
+/* scoring. Validates tenant/facility scope and, when a persisted              */
+/* sensorReadingId is supplied, that the reading is same-tenant and (if the    */
+/* device is commissioned) belongs to this inspection's toilet.                */
+/* -------------------------------------------------------------------------- */
+const linkInspectionSensorReading = async (req) => {
+  const inspection = await Inspection.findByPk(req.params.id);
+  if (!inspection) {
+    throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && inspection.tenant_id !== req.user.tenantId) {
+    throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  assertInspectionScope(req, inspection);
+
+  const snapshotInput =
+    req.body.sensorSnapshot && typeof req.body.sensorSnapshot === 'object'
+      ? req.body.sensorSnapshot
+      : {};
+  const sensorReadingId =
+    sanitizeText(req.body.sensorReadingId, 80) || snapshotInput.sensorReadingId || null;
+  let resolvedDeviceId =
+    sanitizeText(req.body.sensorDeviceId, 140) || snapshotInput.sensorDeviceId || null;
+
+  // When a persisted reading id is given, enforce cross-tenant + toilet mapping.
+  if (sensorReadingId && isUuid(String(sensorReadingId))) {
+    const reading = await SensorReading.findByPk(sensorReadingId);
+    if (reading) {
+      const device = await SensorDevice.findByPk(reading.device_id);
+      if (device) {
+        if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
+          throw new AppError('Sensor reading belongs to another tenant', 403, {
+            code: 'SCOPE_FORBIDDEN',
+          });
+        }
+        if (
+          inspection.toilet_unit_id &&
+          device.toilet_unit_id &&
+          String(device.toilet_unit_id) !== String(inspection.toilet_unit_id)
+        ) {
+          throw new AppError('Sensor is attached to a different toilet than this inspection', 409, {
+            code: 'SENSOR_TOILET_MISMATCH',
+          });
+        }
+        resolvedDeviceId = resolvedDeviceId || device.id;
+      }
+    }
+  }
+
+  const snapshot = {
+    ...snapshotInput,
+    sensorReadingId: sensorReadingId || null,
+    sensorDeviceId: resolvedDeviceId || null,
+    linkedAt: new Date().toISOString(),
+    linkedByUserId: req.user.id || null,
+  };
+
+  await inspection.update({ sensor_snapshot: snapshot, updated_at: new Date() });
+
+  await createAuditLog({
+    req,
+    tenantId: inspection.tenant_id,
+    action: 'inspection.sensor_link',
+    entityType: 'inspection',
+    entityId: inspection.id,
+    details: { sensorReadingId: snapshot.sensorReadingId, sensorDeviceId: snapshot.sensorDeviceId },
+  });
+
+  return { inspectionId: inspection.id, sensorSnapshot: snapshot };
+};
+
 const startInspection = async (req) => createInspection(req);
 
 const getInspectionImages = async (req) => {
@@ -1891,6 +1970,7 @@ module.exports = {
   reviewInspection,
   listInspections,
   getInspectionById,
+  linkInspectionSensorReading,
   getInspectionImages,
   getInspectionImageJobs,
   getInspectionImageById,

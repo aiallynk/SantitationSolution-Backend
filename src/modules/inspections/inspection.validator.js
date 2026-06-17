@@ -167,6 +167,21 @@ const validateInspectionImageConfirmUpload = (req) => {
   return errors;
 };
 
+const validateInspectionSensorReading = (req) => {
+  const errors = [];
+  if (isBlank(req.params.id)) errors.push('inspection id is required');
+  const hasReadingId = !isBlank(req.body.sensorReadingId);
+  const snapshot = req.body.sensorSnapshot;
+  const hasSnapshot = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot);
+  if (!hasReadingId && !hasSnapshot) {
+    errors.push('sensorReadingId or sensorSnapshot is required');
+  }
+  if (req.body.sensorReadingId && String(req.body.sensorReadingId).length > 80) {
+    errors.push('sensorReadingId must be 80 characters or fewer');
+  }
+  return errors;
+};
+
 const validateReviewInspection = (req) => {
   const errors = [];
   if (isBlank(req.params.id)) errors.push('inspection id is required');
@@ -195,5 +210,6 @@ module.exports = {
   validateInspectionImageUploadSession,
   validateInspectionImageConfirmUpload,
   validateSubmitInspection,
+  validateInspectionSensorReading,
   validateReviewInspection,
 };

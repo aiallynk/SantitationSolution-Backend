@@ -30,6 +30,7 @@ const PERMISSION_DEFINITIONS = [
   ['alerts.manage', 'Manage alerts'],
   ['sensor.ingest', 'Ingest sensor data'],
   ['sensor.read', 'Read sensor data'],
+  ['sensor.manage', 'Manage sensor devices'],
   ['super_admin.read', 'Read super admin metrics'],
   ['super_admin.write', 'Manage platform features'],
   ['users.manage', 'Manage users'],

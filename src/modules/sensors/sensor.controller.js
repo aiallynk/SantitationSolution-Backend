@@ -14,6 +14,93 @@ const postIngestion = async (req, res, next) => {
   }
 };
 
+const postRegisterSensor = async (req, res, next) => {
+  try {
+    const data = await sensorService.registerSensor(req);
+    return sendSuccess(res, {
+      statusCode: data.created ? 201 : 200,
+      message: data.created ? 'Sensor registered successfully' : 'Sensor already registered',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const postAttachSensor = async (req, res, next) => {
+  try {
+    const data = await sensorService.attachSensor(req);
+    return sendSuccess(res, {
+      statusCode: data.created ? 201 : 200,
+      message: data.alreadyAttached ? 'Sensor already attached' : 'Sensor attached successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const postReplaceSensor = async (req, res, next) => {
+  try {
+    const data = await sensorService.replaceSensor(req);
+    return sendSuccess(res, {
+      message: 'Sensor replaced successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const postDetachSensor = async (req, res, next) => {
+  try {
+    const data = await sensorService.detachSensor(req);
+    return sendSuccess(res, {
+      message: 'Sensor detached successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletLatestReading = async (req, res, next) => {
+  try {
+    const data = await sensorService.getToiletLatestReading(req);
+    return sendSuccess(res, {
+      message: 'Latest toilet sensor reading fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletReadingHistory = async (req, res, next) => {
+  try {
+    const result = await sensorService.getToiletReadingHistory(req);
+    return sendSuccess(res, {
+      message: 'Toilet sensor history fetched successfully',
+      data: result.items,
+      meta: result.meta,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletReadingSummary = async (req, res, next) => {
+  try {
+    const data = await sensorService.getToiletReadingSummary(req);
+    return sendSuccess(res, {
+      message: 'Toilet sensor summary fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getSensors = async (req, res, next) => {
   try {
     const result = await sensorService.listSensors(req);
@@ -66,6 +153,13 @@ const getLiveAlerts = async (req, res, next) => {
 
 module.exports = {
   postIngestion,
+  postRegisterSensor,
+  postAttachSensor,
+  postReplaceSensor,
+  postDetachSensor,
+  getToiletLatestReading,
+  getToiletReadingHistory,
+  getToiletReadingSummary,
   getSensors,
   getSensorReadings,
   getFacilityLiveMetrics,
