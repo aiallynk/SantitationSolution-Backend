@@ -556,6 +556,61 @@ const hydrateInspectionMediaForDisplay = async (
   }
 };
 
+const hydrateInspectionSubmissionAttachmentsForDisplay = async (
+  inspection,
+  { mediaUrlCache = null } = {}
+) => {
+  const submissions = Array.isArray(inspection?.inspectionSubmissions)
+    ? inspection.inspectionSubmissions
+    : [];
+
+  for (const submission of submissions) {
+    if (!submission || !submission.metadata || typeof submission.metadata !== 'object') {
+      continue;
+    }
+
+    const metadata = submission.metadata;
+
+    // Process beforeMedia
+    if (Array.isArray(metadata.beforeMedia)) {
+      for (const media of metadata.beforeMedia) {
+        if (media && typeof media === 'object') {
+          const urls = await resolveMediaPairUrls(
+            {
+              fileUrl: media.file_url,
+              thumbnailUrl: media.thumbnail_url || media.file_url,
+              storageKey: media.storage_key || null,
+            },
+            { cache: mediaUrlCache }
+          );
+          media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
+          media.thumbnail_url =
+            urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
+        }
+      }
+    }
+
+    // Process afterMedia
+    if (Array.isArray(metadata.afterMedia)) {
+      for (const media of metadata.afterMedia) {
+        if (media && typeof media === 'object') {
+          const urls = await resolveMediaPairUrls(
+            {
+              fileUrl: media.file_url,
+              thumbnailUrl: media.thumbnail_url || media.file_url,
+              storageKey: media.storage_key || null,
+            },
+            { cache: mediaUrlCache }
+          );
+          media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
+          media.thumbnail_url =
+            urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
+        }
+      }
+    }
+  }
+};
+
 const loadLatestReviewByInspectionIds = async (inspectionIds) => {
   if (!Array.isArray(inspectionIds) || inspectionIds.length === 0) {
     return new Map();
@@ -720,6 +775,54 @@ const mapInspectionMediaItem = (item) => {
     assignmentId: item.assignment_id || null,
     metadata: item.metadata,
   };
+};
+
+const normalizeCsvAttachmentCollection = (items, { captureStage = null } = {}) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const fileUrl = String(item.fileUrl || item.url || item.file_url || '').trim();
+      const storageKey = String(item.storageKey || item.storage_key || '').trim();
+      const mimeType = String(item.mimeType || item.contentType || item.mime_type || item.content_type || '').trim().toLowerCase();
+      const stage = item.captureStage || item.capture_stage || captureStage || 'evidence';
+      return {
+        fileUrl: fileUrl || null,
+        storageKey: storageKey || null,
+        mimeType: mimeType || null,
+        contentLength: item.contentLength !== undefined ? Number(item.contentLength) : null,
+        captureStage: stage,
+        fileName: String(item.fileName || item.file_name || '').trim() || null,
+        uploadedAt: item.uploadedAt || item.uploaded_at || null,
+      };
+    });
+};
+
+const normalizeSubmittedMediaCollection = (items, { captureStage = null } = {}) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const fileUrl = String(item.fileUrl || item.url || item.file_url || '').trim();
+      const storageKey = String(item.storageKey || item.storage_key || '').trim();
+      const mimeType = String(item.mimeType || item.contentType || item.mime_type || item.content_type || '').trim().toLowerCase();
+      const stage = item.captureStage || item.capture_stage || captureStage || 'evidence';
+      return {
+        fileUrl: fileUrl || null,
+        thumbnailUrl: String(item.thumbnailUrl || item.thumbnail_url || item.fileUrl || item.file_url || '').trim() || null,
+        storageKey: storageKey || null,
+        mimeType: mimeType || null,
+        contentLength: item.contentLength !== undefined ? Number(item.contentLength) : null,
+        captureStage: stage,
+        fileName: String(item.fileName || item.file_name || '').trim() || null,
+        uploadedAt: item.uploadedAt || item.uploaded_at || null,
+        clientImageId: String(item.clientImageId || item.client_image_id || '').trim() || null,
+      };
+    });
 };
 
 const mapInspection = (
