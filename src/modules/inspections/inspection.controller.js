@@ -163,6 +163,18 @@ const getInspectionById = async (req, res, next) => {
   }
 };
 
+const postInspectionSensorReading = async (req, res, next) => {
+  try {
+    const data = await inspectionService.linkInspectionSensorReading(req);
+    return sendSuccess(res, {
+      message: 'Sensor reading linked to inspection successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getMyInspections = async (req, res, next) => {
   try {
     const result = await inspectionService.listInspections(req, true);
@@ -325,6 +337,7 @@ module.exports = {
   postInspectionMediaRetry,
   postSubmitInspection,
   getInspectionById,
+  postInspectionSensorReading,
   getInspectionImages,
   getInspectionImageJobs,
   getInspectionImageById,

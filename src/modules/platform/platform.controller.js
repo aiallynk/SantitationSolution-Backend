@@ -168,6 +168,19 @@ const getToiletUnits = async (req, res, next) => {
   }
 };
 
+const getToiletMap = async (req, res, next) => {
+  try {
+    const data = await platformService.listToiletMap(req);
+    return sendSuccess(res, {
+      message: 'Toilet map data fetched successfully',
+      data,
+      meta: { total: data.length },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getToiletUnitByQr = async (req, res, next) => {
   try {
     const data = await platformService.resolveUnitByQr(req);
@@ -286,6 +299,7 @@ module.exports = {
   getToiletBlocks,
   postToiletBlock,
   getToiletUnits,
+  getToiletMap,
   getToiletUnitByQr,
   postToiletUnitByQr,
   postToiletUnit,

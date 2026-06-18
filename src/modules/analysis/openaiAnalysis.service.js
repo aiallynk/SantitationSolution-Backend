@@ -63,7 +63,37 @@ Hard scoring rules:
 
 Return JSON only.
 
-Return this strict schema:
+Return this production schema first:
+{
+  "overallScore": 0,
+  "starRating": 0.0,
+  "confidence": 0.0,
+  "imageQuality": {
+    "usable": true,
+    "score": 0.0,
+    "reason": ""
+  },
+  "severity": "low | medium | high | critical",
+  "dimensions": {
+    "bowlPan": 0,
+    "floor": 0,
+    "walls": 0,
+    "trash": 0,
+    "wetness": 0,
+    "stains": 0,
+    "visibleWaste": 0,
+    "usability": 0
+  },
+  "detectedIssues": [],
+  "positiveFindings": [],
+  "capApplied": false,
+  "capReason": "",
+  "reasoningSummary": ""
+}
+
+Dimension numbers are 0-100 cleanliness/safety scores where 100 is best. For wetness, stains, trash, and visibleWaste, 100 means dry, unstained, no trash, and no visible waste.
+
+For internal compatibility also include this strict schema when possible:
 {
   "score_0_100": 0,
   "star_rating_0_5": 0.0,
@@ -431,78 +461,135 @@ const normalizeStrictCriticalFindings = (value, detectedIssues = []) => {
 const isStrictSanitationPayload = (raw) => {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   if (Number.isFinite(Number(raw.score_0_100))) return true;
+  if (Number.isFinite(Number(raw.overallScore))) return true;
+  if (Number.isFinite(Number(raw.starRating)) && raw.dimensions && typeof raw.dimensions === 'object') return true;
   if (raw.critical_findings && typeof raw.critical_findings === 'object') return true;
+  if (raw.detectedIssues && Array.isArray(raw.detectedIssues)) return true;
   if (typeof raw.cleanliness_level === 'string' && typeof raw.hygiene_risk === 'string') return true;
   return false;
 };
 
 const normalizeStrictSanitationPayload = (raw) => {
   const readFirst = readFirstKey;
-  const scoreRaw = readFirst(raw, ['score_0_100', 'overall_cleanliness_score', 'hygiene_score_0_100']);
+  const dimensions =
+    raw.dimensions && typeof raw.dimensions === 'object' && !Array.isArray(raw.dimensions)
+      ? raw.dimensions
+      : {};
+  const imageQuality =
+    raw.imageQuality && typeof raw.imageQuality === 'object' && !Array.isArray(raw.imageQuality)
+      ? raw.imageQuality
+      : {};
+  const scoreRaw = readFirst(raw, [
+    'score_0_100',
+    'overallScore',
+    'overall_cleanliness_score',
+    'hygiene_score_0_100',
+  ]);
   if (!Number.isFinite(Number(scoreRaw))) {
     throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Strict scoring key "score_0_100" must be numeric');
   }
   const score = toScore(scoreRaw, 0);
 
-  const starRaw = readFirst(raw, ['star_rating_0_5']);
+  const starRaw = readFirst(raw, ['star_rating_0_5', 'starRating']);
   const starRating =
     Number.isFinite(Number(starRaw)) && Number(starRaw) >= 0 && Number(starRaw) <= 5
       ? Number(Number(starRaw).toFixed(1))
       : starRatingFromScore(score);
 
-  const cleanlinessLevelRaw = String(readFirst(raw, ['cleanliness_level']) || '')
+  const cleanlinessLevelRaw = String(readFirst(raw, ['cleanliness_level', 'cleanlinessLevel']) || '')
     .trim()
     .toLowerCase();
   const cleanlinessLevel = STRICT_CLEANLINESS_LEVEL_TYPES.has(cleanlinessLevelRaw)
     ? cleanlinessLevelRaw
     : strictCleanlinessLevelFromScore(score);
 
-  const hygieneRiskRaw = String(readFirst(raw, ['hygiene_risk']) || '')
+  const hygieneRiskRaw = String(readFirst(raw, ['hygiene_risk', 'hygieneRisk']) || '')
     .trim()
     .toLowerCase();
   const hygieneRisk = STRICT_HYGIENE_RISK_TYPES.has(hygieneRiskRaw)
     ? hygieneRiskRaw
     : strictHygieneRiskFromScore(score);
 
-  const issues = normalizeArray(readFirst(raw, ['detected_issues', 'issues', 'issue_tags']) || []);
-  const criticalFindings = normalizeStrictCriticalFindings(readFirst(raw, ['critical_findings']), issues);
-  const positiveObservations = normalizeArray(readFirst(raw, ['positive_observations']) || []);
-  const scoreReason = String(readFirst(raw, ['score_reason', 'reasoning_summary', 'explanation_summary']) || '')
+  const issues = normalizeArray(
+    readFirst(raw, ['detected_issues', 'detectedIssues', 'issues', 'issue_tags']) || []
+  );
+  const criticalFindings = normalizeStrictCriticalFindings(
+    readFirst(raw, ['critical_findings', 'criticalFindings']),
+    issues
+  );
+  const positiveObservations = normalizeArray(
+    readFirst(raw, ['positive_observations', 'positiveFindings', 'positiveObservations']) || []
+  );
+  const scoreReason = String(
+    readFirst(raw, ['score_reason', 'reasoningSummary', 'reasoning_summary', 'explanation_summary']) ||
+      ''
+  )
     .trim()
     .slice(0, 1800);
-  const confidenceScore = toConfidence(readFirst(raw, ['confidence', 'confidence_score']), 0.65);
-  const requiresRetake = Boolean(
-    toBooleanOrNull(readFirst(raw, ['requires_retake'])) ||
-      readFirst(raw, ['requires_retake']) === true
+  const confidenceScore = toConfidence(
+    readFirst(raw, ['confidence', 'confidence_score']) ?? imageQuality.confidence,
+    0.65
   );
-  const retakeReason = String(readFirst(raw, ['retake_reason']) || '')
+  const requiresRetake = Boolean(
+    toBooleanOrNull(readFirst(raw, ['requires_retake', 'requiresRetake'])) ||
+      readFirst(raw, ['requires_retake', 'requiresRetake']) === true ||
+      imageQuality.usable === false
+  );
+  const retakeReason = String(readFirst(raw, ['retake_reason', 'retakeReason']) || imageQuality.reason || '')
     .trim()
     .slice(0, 500);
 
-  const floorCleanliness = toScore(readFirst(raw, ['floor_cleanliness', 'floor_score']), score);
-  const commodeCleanliness = toScore(
-    readFirst(raw, ['commode_urinal_cleanliness', 'commode_score']),
+  const floorCleanliness = toScore(
+    readFirst(raw, ['floor_cleanliness', 'floor_score']) ?? dimensions.floor,
     score
   );
+  const commodeCleanliness = toScore(
+    readFirst(raw, ['commode_urinal_cleanliness', 'commode_score']) ??
+      dimensions.bowlPan ??
+      dimensions.commode ??
+      dimensions.pan,
+    score
+  );
+  const stainDimension = dimensions.stains;
+  const wetnessDimension = dimensions.wetness;
   const stainPresence = toScore(
-    readFirst(raw, ['stain_presence']),
+    readFirst(raw, ['stain_presence']) ??
+      (Number.isFinite(Number(stainDimension)) ? 100 - Number(stainDimension) : undefined),
     criticalFindings.heavy_stains ? 70 : 22
   );
   const waterStagnation = toScore(
-    readFirst(raw, ['water_stagnation']),
+    readFirst(raw, ['water_stagnation']) ??
+      (Number.isFinite(Number(wetnessDimension)) ? 100 - Number(wetnessDimension) : undefined),
     criticalFindings.waterlogging ? 72 : 18
   );
   const garbagePresenceRaw = readFirst(raw, ['garbage_presence']);
+  const trashCleanliness = Number.isFinite(Number(dimensions.trash)) ? Number(dimensions.trash) : null;
+  const visibleWasteCleanliness = Number.isFinite(Number(dimensions.visibleWaste))
+    ? Number(dimensions.visibleWaste)
+    : null;
   const garbagePresence =
     toBooleanOrNull(garbagePresenceRaw) ??
-    Boolean(criticalFindings.trash_or_waste || issues.some((issue) => issue.includes('waste')));
+    Boolean(
+      criticalFindings.trash_or_waste ||
+        (trashCleanliness !== null && trashCleanliness < 50) ||
+        (visibleWasteCleanliness !== null && visibleWasteCleanliness < 50) ||
+        issues.some((issue) => issue.includes('waste'))
+    );
 
-  const severityLevel =
-    hygieneRisk === 'severe' || hygieneRisk === 'high'
-      ? 'high'
-      : hygieneRisk === 'medium'
-        ? 'medium'
-        : 'low';
+  const severityRaw = String(readFirst(raw, ['severity', 'severity_level']) || '')
+    .trim()
+    .toLowerCase();
+
+  let severityLevel = 'low';
+  if (severityRaw === 'critical') {
+    severityLevel = 'high';
+  } else if (SCORING_SEVERITY_TYPES.has(severityRaw)) {
+    severityLevel = severityRaw;
+  } else if (hygieneRisk === 'severe' || hygieneRisk === 'high') {
+    severityLevel = 'high';
+  } else if (hygieneRisk === 'medium') {
+    severityLevel = 'medium';
+  }
 
   const reviewRequiredRaw = toBooleanOrNull(readFirst(raw, ['human_review_required', 'review_required']));
   const humanReviewRequired =
@@ -526,6 +613,35 @@ const normalizeStrictSanitationPayload = (raw) => {
     confidence: confidenceScore,
     requires_retake: requiresRetake,
     retake_reason: retakeReason || '',
+    cap_applied: Boolean(toBooleanOrNull(readFirst(raw, ['capApplied', 'cap_applied']))),
+    cap_reason: String(readFirst(raw, ['capReason', 'cap_reason']) || '').trim().slice(0, 500),
+    image_quality: imageQuality,
+    dimensions: {
+      bowlPan: dimensions.bowlPan !== undefined ? toScore(dimensions.bowlPan, commodeCleanliness) : commodeCleanliness,
+      floor: dimensions.floor !== undefined ? toScore(dimensions.floor, floorCleanliness) : floorCleanliness,
+      walls: dimensions.walls !== undefined ? toScore(dimensions.walls, score) : score,
+      trash:
+        trashCleanliness !== null
+          ? toScore(trashCleanliness, garbagePresence ? 0 : 100)
+          : garbagePresence
+            ? 0
+            : 100,
+      wetness:
+        wetnessDimension !== undefined
+          ? toScore(wetnessDimension, 100 - waterStagnation)
+          : 100 - waterStagnation,
+      stains:
+        stainDimension !== undefined
+          ? toScore(stainDimension, 100 - stainPresence)
+          : 100 - stainPresence,
+      visibleWaste:
+        visibleWasteCleanliness !== null
+          ? toScore(visibleWasteCleanliness, garbagePresence ? 0 : 100)
+          : garbagePresence
+            ? 0
+            : 100,
+      usability: dimensions.usability !== undefined ? toScore(dimensions.usability, score) : score,
+    },
 
     floor_cleanliness: floorCleanliness,
     commode_urinal_cleanliness: commodeCleanliness,
@@ -841,6 +957,7 @@ const callOpenAiVisionJson = async ({
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let payload;
+  const callStartMs = Date.now();
 
   try {
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -895,10 +1012,11 @@ const callOpenAiVisionJson = async ({
     responseId: payload?.id || null,
     usage: payload?.usage || null,
     rawContent,
+    latencyMs: Date.now() - callStartMs,
   };
 };
 
-const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
+const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext = {} }) => {
   assertOpenAiAnalysisConfigured();
 
   const selected = Array.isArray(mediaRows) ? mediaRows[0] : null;
@@ -990,6 +1108,47 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows }) => {
   const wetnessCleanliness = clamp(100 - strictJson.water_stagnation, 0, 100);
   const stainCleanliness = clamp(100 - strictJson.stain_presence, 0, 100);
   const litterScore = strictJson.garbage_presence ? 0 : 100;
+
+  // Fire-and-forget usage logging — never blocks the analysis result
+  try {
+    const { logUsage } = require('../ai/aiUsageLogger.service');
+    const totalInputTokens =
+      (Number(detectionPass.usage?.prompt_tokens) || 0) +
+      (Number(scoringPass.usage?.prompt_tokens) || 0);
+    const totalOutputTokens =
+      (Number(detectionPass.usage?.completion_tokens) || 0) +
+      (Number(scoringPass.usage?.completion_tokens) || 0);
+    const combinedLatencyMs =
+      (Number(detectionPass.latencyMs) || 0) + (Number(scoringPass.latencyMs) || 0);
+    void logUsage({
+      tenantId: usageContext.tenantId || inspection.tenant_id || null,
+      userId: usageContext.userId || null,
+      workerId: usageContext.workerId || null,
+      inspectionId: inspection.id || null,
+      toiletId: usageContext.toiletId || inspection.toilet_unit_id || null,
+      userRole: usageContext.userRole || null,
+      featureKey: 'TOILET_IMAGE_SCORING',
+      featureName: 'Toilet Image Scoring',
+      provider: 'openai',
+      modelName: model,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      imageCount: 1,
+      status: 'success',
+      latencyMs: combinedLatencyMs,
+      isEstimated: totalInputTokens === 0,
+      metadata: {
+        reason: 'Scoring toilet cleanliness from inspection image',
+        source: usageContext.source || 'worker_mobile_app',
+        detectionResponseId: detectionPass.responseId || null,
+        scoringResponseId: scoringPass.responseId || null,
+        score: strictJson.overall_cleanliness_score,
+        inspectionId: inspection.id,
+      },
+    });
+  } catch (_) {
+    // best effort
+  }
 
   return {
     modelName: model,
@@ -1092,4 +1251,3 @@ module.exports = {
     applyCriticalPenaltyCaps,
   },
 };
-

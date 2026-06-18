@@ -85,3 +85,46 @@ test('legacy scoring payload still normalizes', () => {
   assert.equal(out.overall_cleanliness_score, 68);
   assert.equal(out.scoring_rubric, undefined);
 });
+
+test('production camelCase scoring payload normalizes to strict sanitation fields', () => {
+  const out = normalizeScoringPayload({
+    overallScore: 41,
+    starRating: 2.1,
+    confidence: 0.82,
+    imageQuality: {
+      usable: true,
+      score: 0.91,
+      reason: 'clear image',
+    },
+    severity: 'high',
+    dimensions: {
+      bowlPan: 35,
+      floor: 62,
+      walls: 74,
+      trash: 88,
+      wetness: 40,
+      stains: 30,
+      visibleWaste: 92,
+      usability: 55,
+    },
+    detectedIssues: ['dirty pan', 'wet floor'],
+    positiveFindings: ['walls mostly clean'],
+    capApplied: true,
+    capReason: 'dirty commode cap',
+    reasoningSummary: 'Bowl/pan is stained and the floor is wet.',
+  });
+
+  assert.equal(out.scoring_rubric, 'sanitation_strict_v2');
+  assert.equal(out.overall_cleanliness_score, 41);
+  assert.equal(out.star_rating_0_5, 2.1);
+  assert.equal(out.commode_urinal_cleanliness, 35);
+  assert.equal(out.floor_cleanliness, 62);
+  assert.equal(out.water_stagnation, 60);
+  assert.equal(out.stain_presence, 70);
+  assert.equal(out.garbage_presence, false);
+  assert.equal(out.severity_level, 'high');
+  assert.equal(out.cap_applied, true);
+  assert.equal(out.cap_reason, 'dirty commode cap');
+  assert.ok(out.detected_issues.includes('dirty pan'));
+  assert.ok(out.positive_observations.includes('walls mostly clean'));
+});

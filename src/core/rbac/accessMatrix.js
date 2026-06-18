@@ -87,6 +87,7 @@ const RouteKeys = {
   SUPERVISOR_CLEANLINESS: 'SUPERVISOR_CLEANLINESS',
   SUPERVISOR_ALERTS: 'SUPERVISOR_ALERTS',
   SUPERVISOR_REPORTS: 'SUPERVISOR_REPORTS',
+  OPS_AI_CONSUMPTION: 'OPS_AI_CONSUMPTION',
 };
 
 const RouteKeyToPaths = {
@@ -129,6 +130,7 @@ const RouteKeyToPaths = {
     '/sa/policy',
     '/sa/reliability',
     '/sa/settings',
+    '/sa/consumption',
   ],
   [RouteKeys.OPS_OVERVIEW]: ['/ops/overview'],
   [RouteKeys.OPS_MONITORING]: ['/ops/monitoring'],
@@ -168,6 +170,7 @@ const RouteKeyToPaths = {
   [RouteKeys.SUPERVISOR_CLEANLINESS]: ['/ops/supervisor/cleanliness'],
   [RouteKeys.SUPERVISOR_ALERTS]: ['/ops/supervisor/alerts'],
   [RouteKeys.SUPERVISOR_REPORTS]: ['/ops/supervisor/reports'],
+  [RouteKeys.OPS_AI_CONSUMPTION]: ['/ops/consumption'],
 };
 
 const ROLE_PRIORITY = new Map([
@@ -203,6 +206,7 @@ const OPS_ADMIN_ROUTE_KEYS = [
   RouteKeys.OPS_AUDIT,
   RouteKeys.OPS_SETTINGS,
   RouteKeys.OPS_PROFILE,
+  RouteKeys.OPS_AI_CONSUMPTION,
 ];
 
 const OPS_ADMIN_ACTION_KEYS = [
@@ -280,6 +284,7 @@ const TENANT_ADMIN_PERMISSION_CODES = [
   'task.manage',
   'alerts.manage',
   'sensor.read',
+  'sensor.manage',
   'users.manage',
   'reports.read',
   'reports.export',
@@ -293,6 +298,7 @@ const FACILITY_MANAGER_PERMISSION_CODES = [
   'task.manage',
   'alerts.manage',
   'sensor.read',
+  'sensor.manage',
   'reports.read',
 ];
 
@@ -355,6 +361,10 @@ const FIELD_WORKER_PERMISSION_CODES = [
   'auth.read',
   'inspection.create',
   'dashboard.read',
+  // BLE sensor commissioning + ingestion + read happen from the worker's mobile app.
+  'sensor.manage',
+  'sensor.ingest',
+  'sensor.read',
 ];
 
 const createGeoAdminEntry = ({

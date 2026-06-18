@@ -371,6 +371,137 @@ const toGarbageScore = (strictJson, result) => {
   return 0;
 };
 
+const normalizeSha256 = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return /^[a-f0-9]{32,128}$/.test(normalized) ? normalized : null;
+};
+
+const readAiScoringMetadata = (mediaRow) =>
+  mediaRow?.metadata &&
+  typeof mediaRow.metadata === 'object' &&
+  !Array.isArray(mediaRow.metadata) &&
+  mediaRow.metadata.ai_scoring &&
+  typeof mediaRow.metadata.ai_scoring === 'object'
+    ? mediaRow.metadata.ai_scoring
+    : null;
+
+const buildCachedImageResultFromMediaRow = (
+  mediaRow,
+  { provider = 'cached', imageId = null, rawResultSource = 'media_row' } = {}
+) => {
+  const cachedScoring = readAiScoringMetadata(mediaRow);
+  const overallScore = Number(mediaRow.overall_score || 0);
+  const floorScore = Number(mediaRow.floor_score || 0);
+  const commodeScore = Number(mediaRow.commode_score || 0);
+  const stainScore = Number(mediaRow.stain_score || 0);
+  const waterScore = Number(mediaRow.water_score || 0);
+  const garbageScore = Number(mediaRow.garbage_score || 0);
+  const confidenceScore =
+    mediaRow.confidence_score !== null && mediaRow.confidence_score !== undefined
+      ? Number(mediaRow.confidence_score)
+      : null;
+  const issueTags = Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [];
+  const starRating =
+    cachedScoring?.star_rating_0_5 !== undefined
+      ? Number(cachedScoring.star_rating_0_5)
+      : Number((overallScore / 20).toFixed(1));
+  const strictJson = {
+    ...(cachedScoring || {}),
+    floor_cleanliness: Math.round(floorScore),
+    commode_urinal_cleanliness: Math.round(commodeScore),
+    stain_presence: Math.round(stainScore),
+    water_stagnation: Math.round(waterScore),
+    garbage_presence: garbageScore > 50,
+    overall_cleanliness_score: Math.round(overallScore),
+    confidence_score: confidenceScore,
+    detected_issues: issueTags,
+    severity_level: mediaRow.severity || 'medium',
+    human_review_required: Boolean(mediaRow.review_required),
+    explanation_summary: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+    score_0_100:
+      cachedScoring?.score_0_100 !== undefined
+        ? Number(cachedScoring.score_0_100)
+        : Math.round(overallScore),
+    star_rating_0_5: starRating,
+    hygiene_risk: cachedScoring?.hygiene_risk || scoreToHygieneRisk(overallScore),
+    cleanliness_level: cachedScoring?.cleanliness_level || null,
+    critical_findings:
+      cachedScoring?.critical_findings && typeof cachedScoring.critical_findings === 'object'
+        ? cachedScoring.critical_findings
+        : inferCriticalFindingsFromStrictJson(
+            {
+              stain_presence: stainScore,
+              water_stagnation: waterScore,
+              garbage_presence: garbageScore > 50,
+            },
+            issueTags
+          ),
+    requires_retake: Boolean(cachedScoring?.requires_retake),
+    retake_reason: cachedScoring?.retake_reason || '',
+  };
+
+  return {
+    imageId: imageId || mediaRow.id,
+    strictJson,
+    result: {
+      overallCleanlinessScore: overallScore,
+      cleanlinessScore: floorScore,
+      hygieneScore: commodeScore,
+      stainScore: 100 - stainScore,
+      wetnessScore: 100 - waterScore,
+      litterScore: 100 - garbageScore,
+      confidenceScore,
+      issueTags,
+      reviewRequired: Boolean(mediaRow.review_required),
+      severityLabel: mediaRow.severity || 'medium',
+      modelName: runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
+      modelVersion: mediaRow.model_version || 'openai-chat-completions-v4',
+      provider,
+      promptVersion: mediaRow.prompt_version || PROMPT_VERSION,
+      scoringVersion: mediaRow.scoring_version || SCORING_VERSION,
+      explanationText: mediaRow.explanation_summary || mediaRow.issue_summary || null,
+      rawResult: {
+        strictJson,
+        cache: {
+          source: rawResultSource,
+          sourceImageId: mediaRow.id,
+        },
+      },
+    },
+    scoringRejected: false,
+  };
+};
+
+const findReusableScoredMediaByHash = async ({ mediaRow, inspection }) => {
+  const hash = normalizeSha256(mediaRow?.sha256);
+  if (!hash) return null;
+
+  return InspectionMedia.findOne({
+    where: {
+      sha256: hash,
+      id: { [Op.ne]: mediaRow.id },
+      ai_status: 'AI_COMPLETED',
+      scoring_version: SCORING_VERSION,
+      overall_score: { [Op.ne]: null },
+      [Op.or]: [{ scoring_rejected: false }, { scoring_rejected: { [Op.is]: null } }],
+    },
+    include: [
+      {
+        model: Inspection,
+        attributes: ['id', 'tenant_id'],
+        required: true,
+        where: {
+          tenant_id: inspection.tenant_id,
+        },
+      },
+    ],
+    order: [
+      ['ai_processed_at', 'DESC'],
+      ['updated_at', 'DESC'],
+    ],
+  });
+};
+
 const weightedOverallScore = (strictJson) => {
   const floor = clamp(Number(strictJson?.floor_cleanliness || 0), 0, 100);
   const commode = clamp(Number(strictJson?.commode_urinal_cleanliness || 0), 0, 100);
@@ -617,6 +748,150 @@ const compareAgainstBeforeHashes = async ({ inspectionId, captureStage, perceptu
     suspicious: maxSimilarity !== null && maxSimilarity >= FRAUD_SIMILARITY_THRESHOLD,
     similarImageId: similarImageId || null,
   };
+};
+
+const reuseScoringFromMedia = async ({
+  targetMediaRow,
+  sourceMediaRow,
+  inspection,
+  qualityResult,
+  perceptualHash,
+  processingMs,
+}) => {
+  const similarityResult = await compareAgainstBeforeHashes({
+    inspectionId: inspection.id,
+    captureStage: targetMediaRow.capture_stage,
+    perceptualHash: perceptualHash || sourceMediaRow.perceptual_hash,
+    imageId: targetMediaRow.id,
+  });
+  const sourceScoring = readAiScoringMetadata(sourceMediaRow);
+  const existingMetadata =
+    targetMediaRow.metadata &&
+    typeof targetMediaRow.metadata === 'object' &&
+    !Array.isArray(targetMediaRow.metadata)
+      ? targetMediaRow.metadata
+      : {};
+  const qualityValidationStatus = String(qualityResult?.validationStatus || '').toUpperCase();
+  const qualityWarning = qualityValidationStatus && qualityValidationStatus !== 'VALID';
+  const validationReasons = [
+    `AI scoring reused from identical image ${sourceMediaRow.id}`,
+    qualityWarning ? qualityResult?.validationReason || 'Image quality warning detected' : null,
+    similarityResult?.suspicious
+      ? `After image is too similar to before image ${similarityResult.similarImageId}`
+      : null,
+  ].filter(Boolean);
+  const validationStatus = similarityResult?.suspicious
+    ? 'POSSIBLE_DUPLICATE_REVIEW'
+    : qualityWarning
+      ? 'QUALITY_WARNING'
+      : sourceMediaRow.validation_status || 'VALID';
+  const reviewRequired =
+    Boolean(sourceMediaRow.review_required) ||
+    Boolean(similarityResult?.suspicious) ||
+    qualityWarning;
+  const cacheMetadata = {
+    source: 'sha256',
+    source_image_id: sourceMediaRow.id,
+    source_inspection_id: sourceMediaRow.inspection_id,
+    source_sha256: normalizeSha256(sourceMediaRow.sha256),
+    reused_at: new Date().toISOString(),
+    scoring_version: sourceMediaRow.scoring_version || SCORING_VERSION,
+  };
+  const metadata = {
+    ...existingMetadata,
+    ai_scoring: {
+      ...(sourceScoring || {}),
+      cache_reuse: cacheMetadata,
+    },
+    ai_cache_reuse: cacheMetadata,
+    ai_supervisor_flags:
+      sourceMediaRow.metadata &&
+      typeof sourceMediaRow.metadata === 'object' &&
+      !Array.isArray(sourceMediaRow.metadata)
+        ? sourceMediaRow.metadata.ai_supervisor_flags || []
+        : [],
+  };
+
+  await targetMediaRow.update({
+    ai_status: 'AI_COMPLETED',
+    processing_state: IMAGE_PROCESSING_STATES.AI_COMPLETED,
+    image_quality_status:
+      qualityResult?.imageQualityStatus || sourceMediaRow.image_quality_status || 'ok',
+    overall_score: sourceMediaRow.overall_score,
+    confidence_score: sourceMediaRow.confidence_score,
+    floor_score: sourceMediaRow.floor_score,
+    commode_score: sourceMediaRow.commode_score,
+    stain_score: sourceMediaRow.stain_score,
+    garbage_score: sourceMediaRow.garbage_score,
+    water_score: sourceMediaRow.water_score,
+    issue_tags: Array.isArray(sourceMediaRow.issue_tags) ? sourceMediaRow.issue_tags : [],
+    issue_summary: sourceMediaRow.issue_summary || null,
+    severity: sourceMediaRow.severity || 'medium',
+    review_required: reviewRequired,
+    model_version: sourceMediaRow.model_version || null,
+    prompt_version: sourceMediaRow.prompt_version || PROMPT_VERSION,
+    scoring_version: sourceMediaRow.scoring_version || SCORING_VERSION,
+    ai_processed_at: new Date(),
+    ai_error: null,
+    last_error_code: null,
+    last_error_message: null,
+    next_retry_at: null,
+    image_quality_score: qualityResult?.imageQualityScore || sourceMediaRow.image_quality_score || null,
+    toilet_detected: Boolean(sourceMediaRow.toilet_detected),
+    validation_status: validationStatus,
+    validation_reason: validationReasons.join(' | ').slice(0, 500) || null,
+    visibility_score: sourceMediaRow.visibility_score || null,
+    perceptual_hash: perceptualHash || sourceMediaRow.perceptual_hash || null,
+    similarity_score: similarityResult?.maxSimilarity || null,
+    scoring_rejected: false,
+    explanation_summary: sourceMediaRow.explanation_summary || null,
+    metadata,
+    updated_at: new Date(),
+  });
+
+  const cachedResult = buildCachedImageResultFromMediaRow(sourceMediaRow, {
+    provider: 'hash_cache',
+    imageId: targetMediaRow.id,
+    rawResultSource: 'sha256',
+  });
+  cachedResult.strictJson = {
+    ...cachedResult.strictJson,
+    human_review_required: reviewRequired,
+  };
+  cachedResult.result.reviewRequired = reviewRequired;
+  cachedResult.result.rawResult.cache = {
+    ...cachedResult.result.rawResult.cache,
+    reusedImageId: targetMediaRow.id,
+    similarityScore: similarityResult?.maxSimilarity || null,
+    suspiciousSimilarity: Boolean(similarityResult?.suspicious),
+  };
+
+  await InspectionEvent.create({
+    tenant_id: inspection.tenant_id,
+    inspection_id: inspection.id,
+    toilet_id: targetMediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+    image_id: targetMediaRow.id,
+    event_type: 'analysis.image.cache_reused',
+    event_status: 'AI_COMPLETED',
+    source: 'worker',
+    payload: {
+      imageId: targetMediaRow.id,
+      sourceImageId: sourceMediaRow.id,
+      sourceInspectionId: sourceMediaRow.inspection_id,
+      stage: targetMediaRow.capture_stage,
+      sha256: normalizeSha256(targetMediaRow.sha256),
+      score: round2(sourceMediaRow.overall_score),
+      confidence: round2(sourceMediaRow.confidence_score),
+      validationStatus,
+      reviewRequired,
+      similarityScore: similarityResult?.maxSimilarity || null,
+      suspiciousSimilarity: Boolean(similarityResult?.suspicious),
+      processingMs,
+    },
+    occurred_at: new Date(),
+  });
+
+  return cachedResult;
 };
 
 const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
@@ -897,72 +1172,7 @@ const runInspectionAnalysis = async ({
       mediaRow.overall_score !== undefined &&
       !Boolean(mediaRow.scoring_rejected)
     ) {
-      const cachedScoring =
-        mediaRow.metadata &&
-        typeof mediaRow.metadata === 'object' &&
-        !Array.isArray(mediaRow.metadata) &&
-        mediaRow.metadata.ai_scoring &&
-        typeof mediaRow.metadata.ai_scoring === 'object'
-          ? mediaRow.metadata.ai_scoring
-          : null;
-      imageResults.push({
-        imageId: mediaRow.id,
-        strictJson: {
-          floor_cleanliness: Math.round(Number(mediaRow.floor_score || 0)),
-          commode_urinal_cleanliness: Math.round(Number(mediaRow.commode_score || 0)),
-          stain_presence: Math.round(Number(mediaRow.stain_score || 0)),
-          water_stagnation: Math.round(Number(mediaRow.water_score || 0)),
-          garbage_presence: Number(mediaRow.garbage_score || 0) > 50,
-          overall_cleanliness_score: Math.round(Number(mediaRow.overall_score || 0)),
-          confidence_score:
-            mediaRow.confidence_score !== null && mediaRow.confidence_score !== undefined
-              ? Number(mediaRow.confidence_score)
-              : null,
-          detected_issues: Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [],
-          severity_level: mediaRow.severity || 'medium',
-          human_review_required: Boolean(mediaRow.review_required),
-          explanation_summary: mediaRow.explanation_summary || mediaRow.issue_summary || null,
-          score_0_100:
-            cachedScoring?.score_0_100 !== undefined
-              ? Number(cachedScoring.score_0_100)
-              : Math.round(Number(mediaRow.overall_score || 0)),
-          star_rating_0_5:
-            cachedScoring?.star_rating_0_5 !== undefined
-              ? Number(cachedScoring.star_rating_0_5)
-              : Number((Number(mediaRow.overall_score || 0) / 20).toFixed(1)),
-          hygiene_risk: cachedScoring?.hygiene_risk || null,
-          cleanliness_level: cachedScoring?.cleanliness_level || null,
-          critical_findings:
-            cachedScoring?.critical_findings &&
-            typeof cachedScoring.critical_findings === 'object'
-              ? cachedScoring.critical_findings
-              : null,
-          requires_retake: Boolean(cachedScoring?.requires_retake),
-          retake_reason: cachedScoring?.retake_reason || '',
-        },
-        result: {
-          overallCleanlinessScore: Number(mediaRow.overall_score || 0),
-          cleanlinessScore: Number(mediaRow.floor_score || 0),
-          hygieneScore: Number(mediaRow.commode_score || 0),
-          stainScore: 100 - Number(mediaRow.stain_score || 0),
-          wetnessScore: 100 - Number(mediaRow.water_score || 0),
-          litterScore: 100 - Number(mediaRow.garbage_score || 0),
-          confidenceScore:
-            mediaRow.confidence_score !== null && mediaRow.confidence_score !== undefined
-              ? Number(mediaRow.confidence_score)
-              : null,
-          issueTags: Array.isArray(mediaRow.issue_tags) ? mediaRow.issue_tags : [],
-          reviewRequired: Boolean(mediaRow.review_required),
-          severityLabel: mediaRow.severity || 'medium',
-          modelName: runtimeConfig.analysis.openaiModel || 'gpt-4o-mini',
-          modelVersion: mediaRow.model_version || 'openai-chat-completions-v4',
-          provider: 'cached',
-          explanationText: mediaRow.explanation_summary || mediaRow.issue_summary || null,
-          rawResult: {
-            strictJson: cachedScoring || null,
-          },
-        },
-      });
+      imageResults.push(buildCachedImageResultFromMediaRow(mediaRow));
       continue;
     }
 
@@ -1020,9 +1230,36 @@ const runInspectionAnalysis = async ({
         throw validationError;
       }
 
+      if (!forceReprocess) {
+        const reusableMedia = await findReusableScoredMediaByHash({
+          mediaRow,
+          inspection,
+        });
+        if (reusableMedia) {
+          const cachedResult = await reuseScoringFromMedia({
+            targetMediaRow: mediaRow,
+            sourceMediaRow: reusableMedia,
+            inspection,
+            qualityResult,
+            perceptualHash,
+            processingMs: Date.now() - mediaStartedAt,
+          });
+          imageResults.push(cachedResult);
+          continue;
+        }
+      }
+
       const providerResult = await analyzeInspectionWithOpenAI({
         inspection,
         mediaRows: [mediaRow],
+        usageContext: {
+          tenantId: inspection.tenant_id || req?.user?.tenantId || null,
+          userId: req?.user?.id || null,
+          workerId: mediaRow.worker_id || inspection.inspector_user_id || null,
+          toiletId: mediaRow.toilet_unit_id || inspection.toilet_unit_id || null,
+          userRole: Array.isArray(req?.user?.roleCodes) ? req.user.roleCodes[0] : null,
+          source: 'worker_mobile_app',
+        },
       });
       const processingMs = Date.now() - mediaStartedAt;
       const result = normalizeResultFromProvider({

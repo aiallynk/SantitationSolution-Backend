@@ -431,6 +431,9 @@ const Inspection = sequelize.define(
       type: DataTypes.ENUM('clean', 'moderate', 'poor', 'critical'),
       allowNull: true,
     },
+    // Optional snapshot of the BLE sensor reading at inspection time. Never required
+    // for submit/scoring; NULL when no sensor was connected.
+    sensor_snapshot: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'inspections', timestamps: false }
@@ -697,6 +700,7 @@ const SensorReading = sequelize.define(
   {
     id: defineUuidId(),
     device_id: { type: DataTypes.UUID, allowNull: false },
+    client_reading_id: { type: DataTypes.STRING(120), allowNull: true },
     timestamp: { type: DataTypes.DATE, allowNull: false },
     odor_ppm: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
     ammonia_ppm: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
@@ -943,6 +947,43 @@ const IntegrationConfig = sequelize.define(
     ...commonTimestamps,
   },
   { tableName: 'integration_configs', timestamps: false }
+);
+
+const AiUsageLog = sequelize.define(
+  'AiUsageLog',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    user_id: { type: DataTypes.UUID, allowNull: true },
+    worker_id: { type: DataTypes.UUID, allowNull: true },
+    inspection_id: { type: DataTypes.UUID, allowNull: true },
+    toilet_id: { type: DataTypes.UUID, allowNull: true },
+    user_role: { type: DataTypes.STRING(80), allowNull: true },
+    feature_key: { type: DataTypes.STRING(120), allowNull: false },
+    feature_name: { type: DataTypes.STRING(200), allowNull: false },
+    ai_provider: { type: DataTypes.STRING(60), allowNull: false, defaultValue: 'openai' },
+    model_name: { type: DataTypes.STRING(120), allowNull: false },
+    input_tokens: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    output_tokens: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    total_tokens: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    image_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    video_frame_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    cost_usd: { type: DataTypes.DECIMAL(12, 8), allowNull: false, defaultValue: 0 },
+    cost_inr: { type: DataTypes.DECIMAL(12, 4), allowNull: false, defaultValue: 0 },
+    usd_to_inr_rate: { type: DataTypes.DECIMAL(8, 4), allowNull: false, defaultValue: 84.0 },
+    is_estimated: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    status: {
+      type: DataTypes.ENUM('success', 'failed', 'partial'),
+      allowNull: false,
+      defaultValue: 'success',
+    },
+    latency_ms: { type: DataTypes.INTEGER, allowNull: true },
+    error_message: { type: DataTypes.TEXT, allowNull: true },
+    provider_request_id: { type: DataTypes.STRING(200), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'ai_usage_logs', timestamps: false }
 );
 
 const SuperAdminProject = sequelize.define(
@@ -1325,6 +1366,13 @@ SuperAdminBackupRecord.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 SuperAdminSyncFailure.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 SuperAdminTenantHealth.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 
+AiUsageLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(AiUsageLog, { foreignKey: 'tenant_id', as: 'aiUsageLogs' });
+AiUsageLog.belongsTo(PlatformUser, { foreignKey: 'user_id', as: 'user' });
+AiUsageLog.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
+AiUsageLog.belongsTo(Inspection, { foreignKey: 'inspection_id', as: 'inspection' });
+AiUsageLog.belongsTo(ToiletUnit, { foreignKey: 'toilet_id', as: 'toilet' });
+
 module.exports = {
   sequelize,
   PlatformUser,
@@ -1374,4 +1422,5 @@ module.exports = {
   SuperAdminSyncFailure,
   SuperAdminTenantHealth,
   PasswordResetToken,
+  AiUsageLog,
 };

@@ -21,6 +21,7 @@ const liveRoutes = require('../../modules/live/live.routes');
 const auditRoutes = require('../../modules/audit/audit.routes');
 const appUpdateRoutes = require('../../modules/appUpdate/appUpdate.routes');
 const workerRoutes = require('../../modules/worker/worker.routes');
+const consumptionRoutes = require('../../modules/consumption/consumption.routes');
 const { protect } = require('../../core/middleware/auth');
 const { validate } = require('../../core/middleware/validate');
 
@@ -48,5 +49,6 @@ router.use(notificationRoutes);
 router.use(liveRoutes);
 router.use(auditRoutes);
 router.use(workerRoutes);
+router.use(consumptionRoutes);
 
 module.exports = router;
