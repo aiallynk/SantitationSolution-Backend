@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const {
   S3Client,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -210,14 +212,14 @@ const getS3Client = () => {
   return cachedS3Client;
 };
 
-const buildObjectUrl = (objectKey) => {
+const buildObjectUrl = (objectKey, { bucketName = s3Config.bucket } = {}) => {
   const normalizedObjectKey = normalizeObjectKey(objectKey);
   if (!normalizedObjectKey) {
     return null;
   }
 
   if (s3Config.mediaUrlMode !== 'public') {
-    return `s3://${s3Config.bucket}/${normalizedObjectKey}`;
+    return `s3://${bucketName}/${normalizedObjectKey}`;
   }
 
   const encodedKey = encodeObjectKey(objectKey);
@@ -228,15 +230,15 @@ const buildObjectUrl = (objectKey) => {
   if (s3Config.endpoint) {
     const endpoint = s3Config.endpoint.replace(/\/+$/, '');
     if (s3Config.forcePathStyle) {
-      return `${endpoint}/${encodeURIComponent(s3Config.bucket)}/${encodedKey}`;
+      return `${endpoint}/${encodeURIComponent(bucketName)}/${encodedKey}`;
     }
     return `${endpoint}/${encodedKey}`;
   }
 
-  return `https://${s3Config.bucket}.s3.${s3Config.region}.amazonaws.com/${encodedKey}`;
+  return `https://${bucketName}.s3.${s3Config.region}.amazonaws.com/${encodedKey}`;
 };
 
-const uploadFileToS3 = async ({ filePath, objectKey }) => {
+const uploadFileToS3 = async ({ filePath, objectKey, bucketName = s3Config.bucket }) => {
   const client = getS3Client();
   if (!client) {
     throw new Error('S3 is not configured');
@@ -247,7 +249,7 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
   const contentType = resolveMimeType(filePath);
 
   const command = new PutObjectCommand({
-    Bucket: s3Config.bucket,
+    Bucket: bucketName,
     Key: objectKey,
     Body: body,
     ContentType: contentType,
@@ -258,11 +260,47 @@ const uploadFileToS3 = async ({ filePath, objectKey }) => {
   const response = await client.send(command);
 
   return {
-    bucket: s3Config.bucket,
+    bucket: bucketName,
     region: s3Config.region,
     objectKey,
-    fileUrl: buildObjectUrl(objectKey),
+    fileUrl: buildObjectUrl(objectKey, { bucketName }),
     bytes: Number(stat.size || 0),
+    contentType,
+    eTag: response.ETag || null,
+  };
+};
+
+const uploadBufferToS3 = async ({
+  buffer,
+  objectKey,
+  contentType = 'application/octet-stream',
+  metadata = null,
+  bucketName = s3Config.bucket,
+}) => {
+  const client = getS3Client();
+  if (!client) {
+    throw new Error('S3 is not configured');
+  }
+
+  const body = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
+  const command = new PutObjectCommand({
+    Bucket: bucketName,
+    Key: objectKey,
+    Body: body,
+    ContentType: contentType,
+    ...(metadata && typeof metadata === 'object' ? { Metadata: metadata } : {}),
+    ...(S3_OBJECT_ACL ? { ACL: S3_OBJECT_ACL } : {}),
+    ...S3_ENCRYPTION_OPTIONS,
+  });
+
+  const response = await client.send(command);
+
+  return {
+    bucket: bucketName,
+    region: s3Config.region,
+    objectKey,
+    fileUrl: buildObjectUrl(objectKey, { bucketName }),
+    bytes: Number(body.length || 0),
     contentType,
     eTag: response.ETag || null,
   };
@@ -321,15 +359,16 @@ const getPresignedPutObjectUrl = async ({
 const getPresignedGetObjectUrl = async ({
   storageKey,
   expiresInSeconds = Number(runtimeConfig.media.s3PresignedGetTtlSec || 900),
+  bucketName = s3Config.bucket,
 }) => {
   const client = getS3Client();
   if (!client) return null;
 
-  const objectKey = normalizeS3ObjectKey(storageKey);
+  const objectKey = normalizeS3ObjectKey(storageKey, { bucketName });
   if (!objectKey) return null;
 
   const command = new GetObjectCommand({
-    Bucket: s3Config.bucket,
+    Bucket: bucketName,
     Key: objectKey,
   });
   const safeExpires = Math.min(Math.max(Number(expiresInSeconds || 900), 60), 3600);
@@ -352,7 +391,7 @@ const streamToBuffer = async (stream, maxBytes = MAX_S3_BUFFER_BYTES) => {
   return Buffer.concat(chunks);
 };
 
-const normalizeS3ObjectKey = (storageKey) => {
+const normalizeS3ObjectKey = (storageKey, { bucketName = s3Config.bucket } = {}) => {
   const normalized = String(storageKey || '').trim();
   if (!normalized) return '';
   if (!normalized.startsWith('s3://')) return normalized;
@@ -361,11 +400,76 @@ const normalizeS3ObjectKey = (storageKey) => {
   const parts = withoutScheme.split('/').filter(Boolean);
   if (parts.length === 0) return '';
 
-  const bucketName = parts[0];
-  if (bucketName === s3Config.bucket) {
+  const candidateBucketName = parts[0];
+  if (candidateBucketName === bucketName || candidateBucketName === s3Config.bucket) {
     return parts.slice(1).join('/');
   }
   return parts.slice(1).join('/') || withoutScheme;
+};
+
+const deleteObjectFromS3 = async ({ storageKey, bucketName = s3Config.bucket }) => {
+  const client = getS3Client();
+  if (!client) return false;
+  const objectKey = normalizeS3ObjectKey(storageKey, { bucketName });
+  if (!objectKey) return false;
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: bucketName,
+      Key: objectKey,
+    })
+  );
+  return true;
+};
+
+const calculateS3Usage = async ({
+  prefix = '',
+  bucketName = s3Config.bucket,
+  maxPages = 10_000,
+} = {}) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  const normalizedPrefix = normalizeObjectKey(prefix);
+  let continuationToken = null;
+  let totalBytes = 0;
+  let objectCount = 0;
+  let latestModifiedAt = null;
+  let pageCount = 0;
+  let truncated = false;
+
+  do {
+    pageCount += 1;
+    const response = await client.send(
+      new ListObjectsV2Command({
+        Bucket: bucketName,
+        Prefix: normalizedPrefix || undefined,
+        ContinuationToken: continuationToken || undefined,
+        MaxKeys: 1000,
+      })
+    );
+
+    for (const object of response.Contents || []) {
+      objectCount += 1;
+      totalBytes += Number(object.Size || 0);
+      const modifiedAt = object.LastModified ? new Date(object.LastModified).toISOString() : null;
+      if (modifiedAt && (!latestModifiedAt || modifiedAt > latestModifiedAt)) {
+        latestModifiedAt = modifiedAt;
+      }
+    }
+
+    continuationToken = response.NextContinuationToken || null;
+    truncated = Boolean(response.IsTruncated);
+  } while (continuationToken && pageCount < maxPages);
+
+  return {
+    bucketName,
+    prefix: normalizedPrefix,
+    totalBytes,
+    objectCount,
+    latestModifiedAt,
+    truncated: Boolean(continuationToken || truncated),
+    pageCount,
+  };
 };
 
 const getObjectDataUrlFromS3 = async (storageKey) => {
@@ -461,6 +565,9 @@ const headObjectFromS3 = async (storageKey) => {
 module.exports = {
   isS3Enabled,
   uploadFileToS3,
+  uploadBufferToS3,
+  deleteObjectFromS3,
+  calculateS3Usage,
   getPresignedPutObjectUrl,
   getPresignedGetObjectUrl,
   getObjectDataUrlFromS3,

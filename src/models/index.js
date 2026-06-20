@@ -1087,6 +1087,89 @@ const SuperAdminBackupRecord = sequelize.define(
   { tableName: 'super_admin_backup_records', timestamps: false }
 );
 
+const BackupSchedule = sequelize.define(
+  'BackupSchedule',
+  {
+    id: defineUuidId(),
+    scope: { type: DataTypes.STRING(20), allowNull: false },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    frequency: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'daily' },
+    cron_expression: { type: DataTypes.STRING(120), allowNull: true },
+    timezone: { type: DataTypes.STRING(80), allowNull: false, defaultValue: 'Asia/Kolkata' },
+    run_time: { type: DataTypes.TIME, allowNull: true },
+    enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    retention_days: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 7 },
+    include_storage_metadata: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    include_storage_files: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    created_by: { type: DataTypes.UUID, allowNull: true },
+    updated_by: { type: DataTypes.UUID, allowNull: true },
+    last_run_at: { type: DataTypes.DATE, allowNull: true },
+    next_run_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'backup_schedules', timestamps: false }
+);
+
+const BackupJob = sequelize.define(
+  'BackupJob',
+  {
+    id: defineUuidId(),
+    schedule_id: { type: DataTypes.UUID, allowNull: true },
+    scope: { type: DataTypes.STRING(20), allowNull: false },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'queued' },
+    triggered_by: { type: DataTypes.STRING(20), allowNull: false },
+    requested_by: { type: DataTypes.UUID, allowNull: true },
+    started_at: { type: DataTypes.DATE, allowNull: true },
+    completed_at: { type: DataTypes.DATE, allowNull: true },
+    duration_ms: { type: DataTypes.INTEGER, allowNull: true },
+    file_path: { type: DataTypes.STRING(700), allowNull: true },
+    file_name: { type: DataTypes.STRING(260), allowNull: true },
+    file_size_bytes: { type: DataTypes.BIGINT, allowNull: true },
+    checksum_sha256: { type: DataTypes.STRING(128), allowNull: true },
+    error_message: { type: DataTypes.STRING(2000), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'backup_jobs', timestamps: false }
+);
+
+const BackupFile = sequelize.define(
+  'BackupFile',
+  {
+    id: defineUuidId(),
+    backup_job_id: { type: DataTypes.UUID, allowNull: false },
+    storage_provider: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'local' },
+    bucket_name: { type: DataTypes.STRING(180), allowNull: true },
+    file_path: { type: DataTypes.STRING(700), allowNull: false },
+    file_name: { type: DataTypes.STRING(260), allowNull: false },
+    size_bytes: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    checksum_sha256: { type: DataTypes.STRING(128), allowNull: true },
+    content_type: { type: DataTypes.STRING(120), allowNull: false, defaultValue: 'application/zip' },
+    metadata: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'backup_files', timestamps: false }
+);
+
+const BackupAuditLog = sequelize.define(
+  'BackupAuditLog',
+  {
+    id: defineUuidId(),
+    action: { type: DataTypes.STRING(120), allowNull: false },
+    actor_user_id: { type: DataTypes.UUID, allowNull: true },
+    backup_job_id: { type: DataTypes.UUID, allowNull: true },
+    backup_schedule_id: { type: DataTypes.UUID, allowNull: true },
+    scope: { type: DataTypes.STRING(20), allowNull: true },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    ip_address: { type: DataTypes.STRING(80), allowNull: true },
+    user_agent: { type: DataTypes.STRING(500), allowNull: true },
+    details: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'backup_audit_logs', timestamps: false }
+);
+
 const SuperAdminSyncFailure = sequelize.define(
   'SuperAdminSyncFailure',
   {
@@ -1352,6 +1435,23 @@ SuperAdminSupportTicket.belongsTo(PlatformUser, { foreignKey: 'opened_by_user_id
 SuperAdminSupportTicket.belongsTo(PlatformUser, { foreignKey: 'assigned_to_user_id', as: 'assignedTo' });
 SuperAdminReleaseRecord.belongsTo(PlatformUser, { foreignKey: 'deployed_by_user_id', as: 'deployedBy' });
 SuperAdminBackupRecord.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+BackupSchedule.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(BackupSchedule, { foreignKey: 'tenant_id', as: 'backupSchedules' });
+BackupSchedule.belongsTo(PlatformUser, { foreignKey: 'created_by', as: 'createdBy' });
+BackupSchedule.belongsTo(PlatformUser, { foreignKey: 'updated_by', as: 'updatedBy' });
+BackupJob.belongsTo(BackupSchedule, { foreignKey: 'schedule_id', as: 'schedule' });
+BackupSchedule.hasMany(BackupJob, { foreignKey: 'schedule_id', as: 'jobs' });
+BackupJob.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(BackupJob, { foreignKey: 'tenant_id', as: 'backupJobs' });
+BackupJob.belongsTo(PlatformUser, { foreignKey: 'requested_by', as: 'requestedBy' });
+BackupFile.belongsTo(BackupJob, { foreignKey: 'backup_job_id', as: 'job' });
+BackupJob.hasMany(BackupFile, { foreignKey: 'backup_job_id', as: 'files' });
+BackupAuditLog.belongsTo(BackupJob, { foreignKey: 'backup_job_id', as: 'job' });
+BackupJob.hasMany(BackupAuditLog, { foreignKey: 'backup_job_id', as: 'auditLogs' });
+BackupAuditLog.belongsTo(BackupSchedule, { foreignKey: 'backup_schedule_id', as: 'schedule' });
+BackupSchedule.hasMany(BackupAuditLog, { foreignKey: 'backup_schedule_id', as: 'auditLogs' });
+BackupAuditLog.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
+BackupAuditLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 SuperAdminSyncFailure.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 SuperAdminTenantHealth.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 
@@ -1408,6 +1508,10 @@ module.exports = {
   SuperAdminSupportTicket,
   SuperAdminReleaseRecord,
   SuperAdminBackupRecord,
+  BackupSchedule,
+  BackupJob,
+  BackupFile,
+  BackupAuditLog,
   SuperAdminSyncFailure,
   SuperAdminTenantHealth,
   PasswordResetToken,

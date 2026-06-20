@@ -134,6 +134,25 @@ const parseOptionalNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+const toNumberOrNull = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const normalizeSensorSnapshot = (snapshot) => {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null;
+  const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
+  return {
+    ...snapshot,
+    // Field 1 is firmware-provided sensor channel (legacy "sensor toilet score"), NOT final cleanliness score.
+    field1: toNumberOrNull(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore),
+    field2: toNumberOrNull(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135),
+    field3: toNumberOrNull(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137),
+    temperature: toNumberOrNull(snapshot.temperature),
+    humidity: toNumberOrNull(snapshot.humidity),
+    sensorToiletScore: toNumberOrNull(snapshot.sensorToiletScore ?? snapshot.score ?? snapshot.field1 ?? snapshot.field_1),
+    readingTime: readingTime || null,
+  };
+};
 
 const starFromScore = (value) => {
   const parsed = Number(value);
@@ -747,10 +766,7 @@ const mapInspection = (
     reviewRequired: Boolean(inspection.review_required),
     lastProcessingError: inspection.last_processing_error || null,
     overallStatus: inspection.overall_status,
-    sensorSnapshot:
-      inspection.sensor_snapshot && typeof inspection.sensor_snapshot === 'object'
-        ? inspection.sensor_snapshot
-        : null,
+    sensorSnapshot: normalizeSensorSnapshot(inspection.sensor_snapshot),
     beforeImageCount:
       beforeMedia.length > 0
         ? beforeMedia.length
@@ -882,6 +898,31 @@ const mapInspection = (
             typeof result.raw_result.strictJson === 'object'
               ? result.raw_result.strictJson.hygiene_risk || null
               : null,
+          sensorImpact:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(result.raw_result.strictJson.sensor_impact || 0)
+              : 0,
+          environmentalScore:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? (result.raw_result.strictJson.environmental_score ?? null)
+              : null,
+          visualScore:
+            result.raw_result &&
+            typeof result.raw_result === 'object' &&
+            result.raw_result.strictJson &&
+            typeof result.raw_result.strictJson === 'object'
+              ? Number(
+                  result.raw_result.strictJson.visual_score ??
+                    result.raw_result.strictJson.overall_cleanliness_score ??
+                    result.cleanliness_score
+                )
+              : Number(result.cleanliness_score),
           requiresRetake:
             result.raw_result &&
             typeof result.raw_result === 'object' &&

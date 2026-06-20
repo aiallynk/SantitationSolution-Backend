@@ -2,8 +2,15 @@ const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = rateLimit;
 const { runtimeConfig } = require('../../config/runtime');
 
-const isIngestionPath = (req) =>
-  /^\/api\/v1\/inspections\/[^/]+\/media(?:\/|$)/i.test(String(req.originalUrl || req.path || ''));
+const isIngestionPath = (req) => {
+  const path = String(req.originalUrl || req.url || req.path || '')
+    .split('?')[0]
+    .toLowerCase();
+  return (
+    /^\/api\/v1\/inspections\/[^/]+\/media(?:\/|$)/i.test(path) ||
+    path.includes('/sensor-ingestion/')
+  );
+};
 const isInfraPath = (req) => {
   const path = String(req.path || req.originalUrl || '').split('?')[0];
   return path === '/health' || path === '/ready' || path === '/';
@@ -52,6 +59,10 @@ const ingestionRateLimit = rateLimit({
   max: Number(runtimeConfig.security.ingestRateLimitMax || 5000),
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = req.user?.id || req.user?.userId || null;
+    return userId ? `ingestuid:${userId}` : `ingestip:${ipKeyGenerator(req.ip || '')}`;
+  },
   message: {
     success: false,
     code: 'INGEST_RATE_LIMIT_EXCEEDED',
@@ -59,4 +70,25 @@ const ingestionRateLimit = rateLimit({
   },
 });
 
-module.exports = { apiRateLimit, ingestionRateLimit, supervisorApiRateLimit };
+const sensorIngestionRateLimit = rateLimit({
+  windowMs: Number(runtimeConfig.security.rateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.sensorIngestRateLimitMax || 1200),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = req.user?.id || req.user?.userId || null;
+    return userId ? `sensoruid:${userId}` : `sensorip:${ipKeyGenerator(req.ip || '')}`;
+  },
+  message: {
+    success: false,
+    code: 'SENSOR_INGEST_RATE_LIMIT_EXCEEDED',
+    message: 'Sensor upload traffic is high, please retry shortly',
+  },
+});
+
+module.exports = {
+  apiRateLimit,
+  ingestionRateLimit,
+  sensorIngestionRateLimit,
+  supervisorApiRateLimit,
+};

@@ -1,5 +1,6 @@
 const express = require('express');
 const superAdminController = require('./superAdmin.controller');
+const backupController = require('../backups/backup.controller');
 const {
   validateTenantProvision,
   validateTenantPatch,
@@ -25,6 +26,8 @@ const { validate } = require('../../core/middleware/validate');
 const { RouteKeys, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
 const router = express.Router();
+
+router.post('/backups/scheduled-run', backupController.runScheduledBackups);
 
 router.use(
   protect,
@@ -92,6 +95,18 @@ router.get('/integrations', validate(validateListQuery), superAdminController.li
 router.post('/integrations', validate(validateIntegrationUpsert), superAdminController.upsertIntegration);
 router.get('/releases', validate(validateListQuery), superAdminController.listReleases);
 router.post('/releases', validate(validateReleaseCreate), superAdminController.createRelease);
+router.get('/backups/stats', backupController.getStats);
+router.get('/backups/jobs', backupController.listJobs);
+router.post('/backups/run', backupController.triggerManualBackup);
+router.get('/backups/jobs/:id/file', backupController.downloadLocalFile);
+router.get('/backups/jobs/:id', backupController.getJobDetails);
+router.post('/backups/jobs/:id/download', backupController.createDownloadUrl);
+router.post('/backups/jobs/:id/retry', backupController.retryBackup);
+router.post('/backups/cleanup', backupController.cleanupExpiredBackups);
+router.get('/backups/schedules', backupController.listSchedules);
+router.post('/backups/schedules', backupController.upsertSchedule);
+router.patch('/backups/schedules/:id', backupController.upsertSchedule);
+router.delete('/backups/schedules/:id', backupController.deleteSchedule);
 router.get('/backups', validate(validateListQuery), superAdminController.listBackups);
 router.post('/backups', validate(validateBackupCreate), superAdminController.createBackup);
 router.get('/policy', superAdminController.getPolicy);

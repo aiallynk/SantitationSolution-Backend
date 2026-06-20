@@ -12,6 +12,7 @@ const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
 const PROMPT_VERSION = 'sanitation-detection-v4-strict';
 const SCORING_VERSION = 'sanitation-rubric-v1';
+const SENSOR_CONTEXT_VERSION = 'sensor-context-v1';
 
 const DETECTION_PROMPT = `
 You are a sanitation inspection AI.
@@ -127,6 +128,15 @@ For backward compatibility also include legacy fields when possible:
 - severity_level
 - human_review_required
 - explanation_summary
+
+Sensor-context addendum:
+- You may receive optional "Sensor context" metadata (temperature, humidity, generic fields, sensor status, reading age minutes).
+- Visual evidence remains PRIMARY. Sensor values are SECONDARY supporting evidence.
+- Never replace visual score with sensor score.
+- If sensor context indicates abnormal environment (very high humidity, abnormal gas channels, stale/offline reading), reduce confidence and apply a moderate score penalty.
+- If image and sensor context disagree, explicitly mention this disagreement in reasoning.
+- Return "sensorImpact" as an integer in range [-25, 0] indicating score reduction from sensor context (0 if no impact).
+- Return "environmentalScore" in range [0,100] when sensor context is present, otherwise null.
 `.trim();
 
 const DETECTION_SCENE_TYPES = new Set(['toilet', 'urinal', 'other', 'unclear']);
@@ -901,12 +911,67 @@ const normalizeScoringPayload = (parsed) => {
     throw schemaError('OPENAI_SCORING_PARSE_FAILED', 'Scoring pass did not return a JSON object');
   }
   if (isStrictSanitationPayload(parsed)) {
-    return normalizeStrictSanitationPayload(parsed);
+    const strict = normalizeStrictSanitationPayload(parsed);
+    strict.sensor_impact = toNumberOrNull(readFirstKey(parsed, ['sensorImpact', 'sensor_impact']));
+    strict.environmental_score = toNumberOrNull(readFirstKey(parsed, ['environmentalScore', 'environmental_score']));
+    if (strict.sensor_impact !== null) {
+      strict.sensor_impact = clamp(Math.round(strict.sensor_impact), -25, 0);
+    }
+    if (strict.environmental_score !== null) {
+      strict.environmental_score = clamp(Number(strict.environmental_score), 0, 100);
+    }
+    return strict;
   }
   if (isRubricPayload(parsed)) {
-    return normalizeRubricScoringPayload(parsed);
+    const rubric = normalizeRubricScoringPayload(parsed);
+    rubric.sensor_impact = toNumberOrNull(readFirstKey(parsed, ['sensorImpact', 'sensor_impact']));
+    rubric.environmental_score = toNumberOrNull(readFirstKey(parsed, ['environmentalScore', 'environmental_score']));
+    if (rubric.sensor_impact !== null) rubric.sensor_impact = clamp(Math.round(rubric.sensor_impact), -25, 0);
+    if (rubric.environmental_score !== null) rubric.environmental_score = clamp(Number(rubric.environmental_score), 0, 100);
+    return rubric;
   }
-  return normalizeLegacyScoringPayload(parsed);
+  const legacy = normalizeLegacyScoringPayload(parsed);
+  legacy.sensor_impact = toNumberOrNull(readFirstKey(parsed, ['sensorImpact', 'sensor_impact']));
+  legacy.environmental_score = toNumberOrNull(readFirstKey(parsed, ['environmentalScore', 'environmental_score']));
+  if (legacy.sensor_impact !== null) legacy.sensor_impact = clamp(Math.round(legacy.sensor_impact), -25, 0);
+  if (legacy.environmental_score !== null) legacy.environmental_score = clamp(Number(legacy.environmental_score), 0, 100);
+  return legacy;
+};
+
+const toNumberOrNull = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildSensorContext = (snapshot = null) => {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
+  const readingTs = readingTime ? new Date(readingTime).getTime() : null;
+  const ageMinutes = Number.isFinite(readingTs)
+    ? Math.max(0, Math.floor((Date.now() - readingTs) / 60000))
+    : null;
+  const temperature = toNumberOrNull(snapshot.temperature);
+  const humidity = toNumberOrNull(snapshot.humidity);
+  const field1 = toNumberOrNull(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore);
+  const field2 = toNumberOrNull(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135);
+  const field3 = toNumberOrNull(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137);
+  const battery = toNumberOrNull(snapshot.battery ?? snapshot.batteryLevel);
+  const rssi = toNumberOrNull(snapshot.rssi ?? snapshot.signalStrength);
+  const hasData = [temperature, humidity, field1, field2, field3, battery, rssi].some((v) => v !== null);
+  if (!hasData) return null;
+  return {
+    version: SENSOR_CONTEXT_VERSION,
+    temperature,
+    humidity,
+    field1,
+    field2,
+    field3,
+    battery,
+    rssi,
+    sensorStatus: String(snapshot.sensorStatus || 'ONLINE').toUpperCase(),
+    readingAgeMinutes: ageMinutes,
+    readingTime: readingTime || null,
+  };
 };
 
 const getOpenAiAnalysisConfigState = () => {
@@ -1016,7 +1081,7 @@ const callOpenAiVisionJson = async ({
   };
 };
 
-const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext = {} }) => {
+const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext = {}, sensorSnapshot = null }) => {
   assertOpenAiAnalysisConfigured();
 
   const selected = Array.isArray(mediaRows) ? mediaRows[0] : null;
@@ -1032,11 +1097,15 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext
   }
 
   const model = runtimeConfig.analysis.openaiModel || 'gpt-4o-mini';
+  const sensorContext = buildSensorContext(sensorSnapshot);
   const contextText = [
     `inspection_id=${inspection.id}`,
     `facility_id=${inspection.facility_id}`,
     'Ignore any overlay watermark text (GPS/time/worker/toilet/stage/score).',
     'Evaluate only visible hygiene condition in the scene.',
+    sensorContext
+      ? `Sensor context (secondary evidence): ${JSON.stringify(sensorContext)}`
+      : 'Sensor context: unavailable',
   ].join(', ');
 
   const [detectionPass, scoringPass] = await Promise.all([
@@ -1057,6 +1126,13 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext
   ]);
   const detection = normalizeDetectionPayload(detectionPass.parsed);
   const strictJson = normalizeScoringPayload(scoringPass.parsed);
+  const sensorImpact = Number.isFinite(Number(strictJson.sensor_impact))
+    ? clamp(Math.round(Number(strictJson.sensor_impact)), -25, 0)
+    : 0;
+  const environmentalScore =
+    strictJson.environmental_score !== null && strictJson.environmental_score !== undefined
+      ? clamp(Number(strictJson.environmental_score), 0, 100)
+      : null;
   const detectionWarnings = [];
   const adjustedIssues = Array.isArray(strictJson.detected_issues)
     ? [...strictJson.detected_issues]
@@ -1208,6 +1284,8 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext
       provider: 'openai',
       strictJson: {
         ...strictJson,
+        sensor_impact: sensorImpact,
+        environmental_score: environmentalScore,
         confidence_score: Number(adjustedConfidence.toFixed(4)),
         human_review_required: adjustedReviewRequired,
         detected_issues: normalizedIssueTags,
@@ -1215,6 +1293,7 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext
       },
       detection,
       detectionWarnings,
+      sensorContext,
       promptVersion: PROMPT_VERSION,
       scoringVersion: SCORING_VERSION,
       responseIds: [detectionPass.responseId, scoringPass.responseId].filter(Boolean),
