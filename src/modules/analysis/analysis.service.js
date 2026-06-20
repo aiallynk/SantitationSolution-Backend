@@ -52,6 +52,73 @@ const mean = (values = []) => {
   if (valid.length === 0) return null;
   return valid.reduce((sum, item) => sum + item, 0) / valid.length;
 };
+const toSensorNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const parseSensorContext = (snapshot = null) => {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
+  const readingTs = readingTime ? new Date(readingTime).getTime() : null;
+  const readingAgeMinutes = Number.isFinite(readingTs)
+    ? Math.max(0, Math.floor((Date.now() - readingTs) / 60000))
+    : null;
+  const context = {
+    temperature: toSensorNumber(snapshot.temperature),
+    humidity: toSensorNumber(snapshot.humidity),
+    field1: toSensorNumber(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore),
+    field2: toSensorNumber(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135),
+    field3: toSensorNumber(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137),
+    battery: toSensorNumber(snapshot.battery ?? snapshot.batteryLevel),
+    rssi: toSensorNumber(snapshot.rssi ?? snapshot.signalStrength),
+    readingAgeMinutes,
+    sensorStatus: String(snapshot.sensorStatus || 'ONLINE').toUpperCase(),
+    readingTime: readingTime || null,
+  };
+  const hasMetric = Object.entries(context).some(([k, v]) => k !== 'sensorStatus' && k !== 'readingTime' && v !== null);
+  return hasMetric ? context : null;
+};
+const computeSensorImpact = (context = null) => {
+  if (!context) return { sensorImpact: 0, environmentalScore: null, reasons: [] };
+  let impact = 0;
+  const reasons = [];
+  if (context.sensorStatus === 'OFFLINE') {
+    impact -= 6;
+    reasons.push('sensor_offline');
+  }
+  if (context.readingAgeMinutes !== null && context.readingAgeMinutes > 15) {
+    impact -= Math.min(6, Math.floor((context.readingAgeMinutes - 15) / 15) + 1);
+    reasons.push('stale_sensor_reading');
+  }
+  if (context.humidity !== null && context.humidity >= 90) {
+    impact -= 7;
+    reasons.push('very_high_humidity');
+  } else if (context.humidity !== null && context.humidity >= 80) {
+    impact -= 4;
+    reasons.push('high_humidity');
+  } else if (context.humidity !== null && context.humidity <= 10) {
+    impact -= 3;
+    reasons.push('very_low_humidity');
+  }
+  if (context.temperature !== null && context.temperature >= 40) {
+    impact -= 6;
+    reasons.push('very_high_temperature');
+  } else if (context.temperature !== null && context.temperature >= 35) {
+    impact -= 3;
+    reasons.push('high_temperature');
+  }
+  if (context.field2 !== null && context.field2 > 0) {
+    impact -= 2;
+    reasons.push('field2_risk_signal');
+  }
+  if (context.field3 !== null && context.field3 > 0) {
+    impact -= 2;
+    reasons.push('field3_risk_signal');
+  }
+  const sensorImpact = clamp(Math.round(impact), -25, 0);
+  const environmentalScore = clamp(100 + sensorImpact, 0, 100);
+  return { sensorImpact, environmentalScore, reasons };
+};
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
 const FRAUD_SIMILARITY_THRESHOLD = runtimeConfig.analysis.fraudSimilarityThreshold;
 const AI_IMAGE_MAX_RETRIES = Math.max(runtimeConfig.analysis.aiImageMaxRetries, 1);
@@ -277,6 +344,9 @@ const normalizeResultFromProvider = ({ providerResult, processingMs }) => {
         ? source.anomalyFlags
         : {},
     processingMs,
+    sensorImpact: clamp(Number(source.sensorImpact ?? source.rawResult?.strictJson?.sensor_impact ?? 0), -25, 0),
+    environmentalScore:
+      source.environmentalScore ?? source.rawResult?.strictJson?.environmental_score ?? null,
   };
 
   const strictJsonFromSource =
@@ -1252,6 +1322,7 @@ const runInspectionAnalysis = async ({
       const providerResult = await analyzeInspectionWithOpenAI({
         inspection,
         mediaRows: [mediaRow],
+        sensorSnapshot: inspection.sensor_snapshot || null,
         usageContext: {
           tenantId: inspection.tenant_id || req?.user?.tenantId || null,
           userId: req?.user?.id || null,
@@ -1267,6 +1338,10 @@ const runInspectionAnalysis = async ({
         processingMs,
       });
       const strictJson = result.rawResult?.strictJson || null;
+      const inspectionSensorContext = parseSensorContext(inspection.sensor_snapshot || null);
+      const localSensorFusion = computeSensorImpact(inspectionSensorContext);
+      const modelSensorImpact = Number.isFinite(Number(result.sensorImpact)) ? Number(result.sensorImpact) : 0;
+      const appliedSensorImpact = Math.min(0, Math.max(modelSensorImpact, localSensorFusion.sensorImpact));
       if (!strictJson || typeof strictJson !== 'object') {
         const parsingError = new Error('Scoring response is missing strict JSON payload');
         parsingError.code = 'SCORING_PARSE_FAILED';
@@ -1331,7 +1406,8 @@ const runInspectionAnalysis = async ({
         visibility_score: visibilityScore,
         image_quality_status: quality,
       });
-      const overallScore = Number(singleImagePost.score_0_100 || 0);
+      const visualScore = Number(singleImagePost.score_0_100 || 0);
+      const overallScore = clamp(visualScore + appliedSensorImpact, 0, 100);
       const finalConfidence = Number(singleImagePost.confidence || confidence || 0);
       const floorScore =
         strictJson && strictJson.floor_cleanliness !== undefined
@@ -1415,6 +1491,15 @@ const runInspectionAnalysis = async ({
         ...strictJson,
         ...singleImagePost,
         overall_cleanliness_score: overallScore,
+        visual_score: visualScore,
+        environmental_score:
+          result.environmentalScore !== null && result.environmentalScore !== undefined
+            ? Number(result.environmentalScore)
+            : localSensorFusion.environmentalScore,
+        sensor_impact: appliedSensorImpact,
+        sensor_context: inspectionSensorContext,
+        sensor_reasons:
+          localSensorFusion.reasons.length > 0 ? localSensorFusion.reasons : undefined,
         confidence_score: finalConfidence,
         critical_findings: singleImagePost.critical_findings,
         detected_issues: issues,
@@ -1491,6 +1576,9 @@ const runInspectionAnalysis = async ({
       });
 
       result.overallCleanlinessScore = round2(overallScore);
+      result.visualScore = round2(visualScore);
+      result.sensorImpact = appliedSensorImpact;
+      result.environmentalScore = strictJsonFinal.environmental_score ?? null;
       result.confidenceScore = round2(finalConfidence);
       result.reviewRequired = Boolean(reviewRequired);
       result.issueTags = issues;
@@ -2205,6 +2293,9 @@ const runInspectionAnalysis = async ({
       reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
       overallStatus: result.overallStatus,
       strictJson: result.rawResult?.strictJson || null,
+          sensorImpact: result.sensorImpact,
+          environmentalScore: result.environmentalScore,
+          visualScore: result.visualScore ?? null,
       processedAt,
       scoreLabel: scoreLabel(result.overallCleanlinessScore),
       imageResultsCount: imageResults.length,
@@ -2252,6 +2343,9 @@ const runInspectionAnalysis = async ({
       failedImageIds,
       overallStatus: result.overallStatus,
       confidenceScore: result.confidenceScore,
+      sensorImpact: result.sensorImpact || 0,
+      environmentalScore: result.environmentalScore ?? null,
+      visualScore: result.visualScore ?? null,
       reviewRequired: Boolean(refreshedInspection?.review_required || result.reviewRequired),
       inspectionStatus: refreshedInspection?.status || aggregate?.status || null,
       processingMs,
@@ -2336,6 +2430,16 @@ const getAnalysisResult = async (inspectionId, req) => {
       strictJson: computedStrictJson,
       rawResult,
       processedAt: analysis.processed_at,
+      sensorImpact:
+        Number(computedStrictJson.sensor_impact ?? rawResult?.strictJson?.sensor_impact ?? 0) || 0,
+      environmentalScore:
+        computedStrictJson.environmental_score ??
+        rawResult?.strictJson?.environmental_score ??
+        null,
+      visualScore:
+        computedStrictJson.visual_score ??
+        rawResult?.strictJson?.visual_score ??
+        Number(computedStrictJson.overall_cleanliness_score || 0),
       overallStatus: inspection.overall_status,
     },
   };

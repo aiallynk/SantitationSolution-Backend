@@ -1,6 +1,7 @@
 const defaults = Object.freeze({
   app: {
     ingestRateLimitMax: 5000,
+    sensorIngestRateLimitMax: 1200,
   },
   server: {
     headersTimeoutMs: 125_000,
@@ -90,6 +91,19 @@ const defaults = Object.freeze({
     ammoniaPpmThreshold: 35,
     h2sPpmThreshold: 10,
     methanePpmThreshold: 90,
+    // BLE wand environmental thresholds. Physically-meaningful metrics
+    // (temperature °C, humidity %) ship with sane defaults. The MQ gas channels
+    // are raw, uncalibrated analog values whose firmware meaning is not finally
+    // confirmed, so their thresholds default to null (disabled) — operators must
+    // set calibrated values before any MQ alert fires. `null` => metric disabled.
+    sensor: {
+      temperature: { highWarningC: 35, highCriticalC: 40, lowWarningC: null, lowCriticalC: null },
+      humidity: { highWarningPct: 80, highCriticalPct: 90, lowWarningPct: 15, lowCriticalPct: 8 },
+      mq135: { warning: null, critical: null },
+      mq137: { warning: null, critical: null },
+      battery: { lowWarningPct: 20, lowCriticalPct: 10 },
+      offline: { warningMinutes: 30, criticalMinutes: 180 },
+    },
   },
   automation: {
     criticalComplaintValues: ['critical', 'emergency', 'very_bad', 'very bad'],

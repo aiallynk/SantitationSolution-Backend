@@ -204,3 +204,49 @@ test('ingestion blocks facility-scoped supervisors outside their scope', async (
     (error) => error.statusCode === 403 && error.code === 'SCOPE_FORBIDDEN'
   );
 });
+
+test('ingestion allows field workers in the same tenant outside facility scope', async () => {
+  installHappyPathStubs({ device: makeDevice({ facility_id: FACILITY_B }) });
+
+  const result = await sensorService.ingestSensorReading(
+    reqFor(
+      {
+        deviceId: 'Wand_1234',
+        clientReadingId: 'client-6',
+        rawPayload: '10,0.00,1.28,32.4,59.4',
+      },
+      {
+        scopeLevel: 'facility',
+        scopeFacilityIds: [FACILITY_A],
+        roleCodes: ['field_worker'],
+      }
+    )
+  );
+
+  assert.equal(result.duplicate, false);
+  assert.equal(Number(result.reading.temperature), 32.4);
+});
+
+test('ingestion allows unattached devices for tenant field workers', async () => {
+  installHappyPathStubs({
+    device: makeDevice({ facility_id: null, toilet_unit_id: null, status: 'inactive' }),
+  });
+
+  const result = await sensorService.ingestSensorReading(
+    reqFor(
+      {
+        deviceId: 'Wand_1234',
+        clientReadingId: 'client-7',
+        rawPayload: '10,0.00,1.28,32.4,59.4',
+      },
+      {
+        scopeLevel: 'facility',
+        scopeFacilityIds: [FACILITY_A],
+        roleCodes: ['field_worker'],
+      }
+    )
+  );
+
+  assert.equal(result.duplicate, false);
+  assert.equal(Number(result.reading.humidity), 59.4);
+});

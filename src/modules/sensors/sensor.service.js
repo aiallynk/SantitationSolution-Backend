@@ -6,6 +6,8 @@ const {
   Alert,
   Facility,
   ToiletUnit,
+  Inspection,
+  InspectionMedia,
 } = require('../../models');
 const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { resolveDateRange, applyDateRangeToWhere } = require('../../utils/dateRange');
@@ -15,18 +17,73 @@ const {
   buildAccessContextFromUser,
   applyScopeToQuery,
   isFacilityInScope,
+  hasFieldInspectionRole,
 } = require('../../core/rbac/scopeWhere');
 const { runtimeConfig } = require('../../config/runtime');
 const { parseSensorPayload } = require('./sensorPayload.parser');
+const { toSensorMetrics } = require('./sensorMetrics');
+const {
+  getSensorThresholds,
+  evaluateSensorMetrics,
+  evaluateOfflineStatus,
+  STATUS,
+} = require('./sensorThreshold.service');
 
 const DEFAULT_BLE_DEVICE_TYPE = 'sanitation_wand';
 
-const THRESHOLDS = {
-  odor_ppm: runtimeConfig.alerts.odorPpmThreshold,
-  ammonia_ppm: runtimeConfig.alerts.ammoniaPpmThreshold,
-  h2s_ppm: runtimeConfig.alerts.h2sPpmThreshold,
-  methane_ppm: runtimeConfig.alerts.methanePpmThreshold,
+const ANALYTICS_METRICS = Object.freeze({
+  temperature: { key: 'temperature', label: 'Temperature', unit: 'C', precision: 1 },
+  humidity: { key: 'humidity', label: 'Humidity', unit: '%', precision: 1 },
+  mq135: { key: 'mq135', label: 'Air quality MQ135', unit: 'raw', precision: 0 },
+  mq137: { key: 'mq137', label: 'Ammonia MQ137', unit: 'raw', precision: 0 },
+  battery: { key: 'battery', label: 'Battery', unit: '%', precision: 0 },
+  rssi: { key: 'rssi', label: 'Signal', unit: 'dBm', precision: 0 },
+});
+
+const STATUS_RANK = Object.freeze({
+  normal: 0,
+  stale: 1,
+  warning: 2,
+  critical: 3,
+});
+
+const normalizeMetricKey = (value) => {
+  const key = String(value || '').trim().toLowerCase();
+  return ANALYTICS_METRICS[key] ? key : 'humidity';
 };
+
+const normalizeGranularity = (value) => {
+  const key = String(value || '').trim().toLowerCase();
+  if (['hour', 'hourly'].includes(key)) return 'hourly';
+  if (['week', 'weekly'].includes(key)) return 'weekly';
+  return 'daily';
+};
+
+const statusLower = (value) => String(value || STATUS.NORMAL).toLowerCase();
+
+const worseStatus = (...values) =>
+  values
+    .map((value) => statusLower(value))
+    .filter(Boolean)
+    .sort((left, right) => (STATUS_RANK[right] || 0) - (STATUS_RANK[left] || 0))[0] || 'normal';
+
+const SENSOR_ALERT_TYPE_SET = new Set([
+  'SENSOR_OFFLINE',
+  'HIGH_TEMPERATURE',
+  'LOW_TEMPERATURE',
+  'HIGH_HUMIDITY',
+  'LOW_HUMIDITY',
+  'AIR_QUALITY_ALERT',
+  'MQ_ALERT',
+  'LOW_BATTERY',
+]);
+
+const ALERT_SEVERITY_BY_LEVEL = Object.freeze({
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  critical: 'critical',
+});
 
 const parseNumeric = (value) => {
   if (value === undefined || value === null || value === '') {
@@ -34,6 +91,18 @@ const parseNumeric = (value) => {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toIso = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const parseCsvIds = (value) => {
+  if (!value) return [];
+  const source = Array.isArray(value) ? value : String(value).split(',');
+  return uniqueIds(source).filter((id) => isUuid(id));
 };
 
 const scopedWhere = (req, where = {}, domainType = 'sensor') =>
@@ -61,6 +130,209 @@ const mapReading = (row) => ({
   rawPayload: row.raw_payload,
 });
 
+const getMetricConfig = (metricKey) => ANALYTICS_METRICS[normalizeMetricKey(metricKey)];
+
+const metricValue = (metrics, metricKey) => {
+  const key = normalizeMetricKey(metricKey);
+  const value = metrics?.[key];
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+};
+
+const roundMetric = (value, metricKey) => {
+  if (!Number.isFinite(Number(value))) return null;
+  const precision = getMetricConfig(metricKey).precision;
+  return Number(Number(value).toFixed(precision));
+};
+
+const evaluateReading = (reading, device = null, now = new Date()) => {
+  const metrics = toSensorMetrics(reading);
+  const threshold = evaluateSensorMetrics(metrics);
+  const lastSeen = device?.last_seen_at || device?.lastSeenAt || reading?.timestamp || metrics.readingTime || null;
+  const offline = evaluateOfflineStatus(lastSeen, now);
+  const status = worseStatus(threshold.overallStatus, offline.status === STATUS.NORMAL ? 'normal' : 'stale');
+  return {
+    metrics,
+    threshold,
+    offline,
+    status,
+  };
+};
+
+const bucketStart = (dateValue, granularity) => {
+  const date = dateValue instanceof Date ? new Date(dateValue) : new Date(dateValue);
+  if (Number.isNaN(date.getTime())) return null;
+  if (granularity === 'hourly') {
+    date.setMinutes(0, 0, 0);
+    return date.toISOString();
+  }
+  if (granularity === 'weekly') {
+    const day = date.getUTCDay();
+    const diff = day === 0 ? 6 : day - 1;
+    date.setUTCDate(date.getUTCDate() - diff);
+  }
+  date.setUTCHours(0, 0, 0, 0);
+  return date.toISOString();
+};
+
+const aggregateTimeSeries = ({ readings, devicesById, metricKey, granularity }) => {
+  const buckets = new Map();
+  for (const reading of readings) {
+    const key = bucketStart(reading.timestamp, granularity);
+    if (!key) continue;
+    const device = devicesById.get(String(reading.device_id || reading.deviceId || '')) || null;
+    const evaluation = evaluateReading(reading, device);
+    const value = metricValue(evaluation.metrics, metricKey);
+    if (value === null) continue;
+    const bucket = buckets.get(key) || {
+      timestamp: key,
+      min: value,
+      max: value,
+      sum: 0,
+      count: 0,
+      breachCount: 0,
+      warningCount: 0,
+      criticalCount: 0,
+    };
+    bucket.min = Math.min(bucket.min, value);
+    bucket.max = Math.max(bucket.max, value);
+    bucket.sum += value;
+    bucket.count += 1;
+    const metricStatus = statusLower(evaluation.threshold.metrics?.[normalizeMetricKey(metricKey)]?.status);
+    if (metricStatus === 'warning' || metricStatus === 'critical') bucket.breachCount += 1;
+    if (metricStatus === 'warning') bucket.warningCount += 1;
+    if (metricStatus === 'critical') bucket.criticalCount += 1;
+    buckets.set(key, bucket);
+  }
+  return [...buckets.values()]
+    .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)))
+    .map((point) => ({
+      timestamp: point.timestamp,
+      min: roundMetric(point.min, metricKey),
+      max: roundMetric(point.max, metricKey),
+      avg: roundMetric(point.sum / Math.max(point.count, 1), metricKey),
+      count: point.count,
+      breachCount: point.breachCount,
+      warningCount: point.warningCount,
+      criticalCount: point.criticalCount,
+    }));
+};
+
+const buildBreachSeries = ({ readings, devicesById, granularity = 'daily' }) => {
+  const buckets = new Map();
+  for (const reading of readings) {
+    const key = bucketStart(reading.timestamp, granularity);
+    if (!key) continue;
+    const device = devicesById.get(String(reading.device_id || reading.deviceId || '')) || null;
+    const evaluation = evaluateReading(reading, device);
+    const status = statusLower(evaluation.threshold.overallStatus);
+    const bucket = buckets.get(key) || { timestamp: key, warning: 0, critical: 0 };
+    if (status === 'warning') bucket.warning += 1;
+    if (status === 'critical') bucket.critical += 1;
+    buckets.set(key, bucket);
+  }
+  return [...buckets.values()].sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)));
+};
+
+const getMetricThresholdSummary = (metricKey) => {
+  const thresholds = getSensorThresholds();
+  const key = normalizeMetricKey(metricKey);
+  if (key === 'temperature') {
+    return {
+      warningMin: thresholds.temperature.lowWarningC,
+      warningMax: thresholds.temperature.highWarningC,
+      criticalMin: thresholds.temperature.lowCriticalC,
+      criticalMax: thresholds.temperature.highCriticalC,
+    };
+  }
+  if (key === 'humidity') {
+    return {
+      warningMin: thresholds.humidity.lowWarningPct,
+      warningMax: thresholds.humidity.highWarningPct,
+      criticalMin: thresholds.humidity.lowCriticalPct,
+      criticalMax: thresholds.humidity.highCriticalPct,
+    };
+  }
+  if (key === 'mq135') return { warningMax: thresholds.mq135.warning, criticalMax: thresholds.mq135.critical };
+  if (key === 'mq137') return { warningMax: thresholds.mq137.warning, criticalMax: thresholds.mq137.critical };
+  if (key === 'battery') return { warningMin: thresholds.battery.lowWarningPct, criticalMin: thresholds.battery.lowCriticalPct };
+  return {};
+};
+
+const mapMetricCard = ({ metricKey, latestReading, previousReading, device }) => {
+  const config = getMetricConfig(metricKey);
+  if (!latestReading) {
+    return {
+      key: config.key,
+      label: config.label,
+      unit: config.unit,
+      value: null,
+      status: 'stale',
+      lastUpdatedAt: null,
+      trend: null,
+      threshold: getMetricThresholdSummary(metricKey),
+    };
+  }
+  const latestEval = evaluateReading(latestReading, device);
+  const previousEval = previousReading ? evaluateReading(previousReading, device) : null;
+  const value = metricValue(latestEval.metrics, metricKey);
+  const previousValue = previousEval ? metricValue(previousEval.metrics, metricKey) : null;
+  const metricStatus = statusLower(latestEval.threshold.metrics?.[normalizeMetricKey(metricKey)]?.status);
+  return {
+    key: config.key,
+    label: config.label,
+    unit: config.unit,
+    value: roundMetric(value, metricKey),
+    status: value === null ? 'stale' : worseStatus(metricStatus, latestEval.status === 'stale' ? 'stale' : 'normal'),
+    lastUpdatedAt: latestReading.timestamp || null,
+    trend:
+      value === null || previousValue === null
+        ? null
+        : Number((Number(value) - Number(previousValue)).toFixed(config.precision)),
+    threshold: getMetricThresholdSummary(metricKey),
+  };
+};
+
+const buildDeviceLabelMaps = async (devices) => {
+  const facilityIds = uniqueIds(devices.map((row) => row.facility_id));
+  const toiletIds = uniqueIds(devices.map((row) => row.toilet_unit_id));
+  const [facilities, toilets] = await Promise.all([
+    facilityIds.length
+      ? Facility.findAll({ where: { id: { [Op.in]: facilityIds } }, attributes: ['id', 'code', 'name'], raw: true })
+      : [],
+    toiletIds.length
+      ? ToiletUnit.findAll({ where: { id: { [Op.in]: toiletIds } }, attributes: ['id', 'code', 'location_label'], raw: true })
+      : [],
+  ]);
+  return {
+    facilitiesById: new Map(facilities.map((row) => [String(row.id), row])),
+    toiletsById: new Map(toilets.map((row) => [String(row.id), row])),
+  };
+};
+
+const mapOperationalDeviceStatus = ({ device, latestReading, previousReading, facilitiesById, toiletsById }) => {
+  const evaluation = latestReading ? evaluateReading(latestReading, device) : evaluateReading({ timestamp: device.last_seen_at }, device);
+  const facility = facilitiesById.get(String(device.facility_id || '')) || null;
+  const toilet = toiletsById.get(String(device.toilet_unit_id || '')) || null;
+  return {
+    deviceId: device.id,
+    externalDeviceId: device.device_id,
+    tenantId: device.tenant_id,
+    facilityId: device.facility_id,
+    facilityName: facility?.name || null,
+    facilityCode: facility?.code || null,
+    toiletUnitId: device.toilet_unit_id,
+    toiletCode: toilet?.code || null,
+    toiletName: toilet?.location_label || toilet?.code || null,
+    status: latestReading ? evaluation.status : 'stale',
+    lastCapturedAt: latestReading?.timestamp || null,
+    lastSeenAt: device.last_seen_at || null,
+    staleMinutes: evaluation.offline.minutes,
+    metrics: Object.keys(ANALYTICS_METRICS).map((metricKey) =>
+      mapMetricCard({ metricKey, latestReading, previousReading, device })
+    ),
+  };
+};
+
 const mapDevice = (device) => ({
   id: device.id,
   tenantId: device.tenant_id,
@@ -76,38 +348,41 @@ const mapDevice = (device) => ({
   metadata: device.metadata || null,
 });
 
-const shouldAlert = (reading) => {
-  if (reading.odor_ppm != null && Number(reading.odor_ppm) > THRESHOLDS.odor_ppm) return true;
-  if (reading.ammonia_ppm != null && Number(reading.ammonia_ppm) > THRESHOLDS.ammonia_ppm) return true;
-  if (reading.h2s_ppm != null && Number(reading.h2s_ppm) > THRESHOLDS.h2s_ppm) return true;
-  if (reading.methane_ppm != null && Number(reading.methane_ppm) > THRESHOLDS.methane_ppm) return true;
-  return false;
-};
+const mapSeverity = (severity) => ALERT_SEVERITY_BY_LEVEL[String(severity || '').toLowerCase()] || 'medium';
 
-const createSensorAlertIfNeeded = async (device, reading) => {
-  if (!shouldAlert(reading)) {
-    return null;
-  }
-
-  const open = await Alert.findOne({
+const upsertSensorAlert = async ({
+  device,
+  alertType,
+  severity,
+  message,
+}) => {
+  const active = await Alert.findOne({
     where: {
       source_type: 'sensor',
       source_id: device.id,
-      status: {
-        [Op.in]: ['open', 'acknowledged'],
-      },
+      alert_type: alertType,
+      status: { [Op.in]: ['open', 'acknowledged'] },
     },
+    order: [['created_at', 'DESC']],
   });
-  if (open) return open;
+  if (active) {
+    // refresh severity/message without creating duplicates
+    await active.update({
+      severity: mapSeverity(severity),
+      message: message || active.message,
+      updated_at: new Date(),
+    });
+    return active;
+  }
 
   const alert = await Alert.create({
     tenant_id: device.tenant_id,
-    alert_type: 'sensor_threshold_breach',
-    severity: 'high',
+    alert_type: alertType,
+    severity: mapSeverity(severity),
     source_type: 'sensor',
     source_id: device.id,
     facility_id: device.facility_id,
-    message: `Sensor ${device.device_id} exceeded threshold values`,
+    message,
     status: 'open',
     created_at: new Date(),
     updated_at: new Date(),
@@ -123,13 +398,175 @@ const createSensorAlertIfNeeded = async (device, reading) => {
   return alert;
 };
 
-const assertDeviceInScope = (req, device) => {
+const resolveSensorAlertType = async ({ deviceId, alertType }) => {
+  const active = await Alert.findOne({
+    where: {
+      source_type: 'sensor',
+      source_id: deviceId,
+      alert_type: alertType,
+      status: { [Op.in]: ['open', 'acknowledged'] },
+    },
+    order: [['created_at', 'DESC']],
+  });
+  if (!active) return null;
+  await active.update({
+    status: 'resolved',
+    resolved_at: new Date(),
+    updated_at: new Date(),
+  });
+  eventBus.emit(EVENTS.ALERT_UPDATED, {
+    id: active.id,
+    tenantId: active.tenant_id,
+    facilityId: active.facility_id,
+    severity: active.severity,
+    status: active.status,
+  });
+  return active;
+};
+
+const emitThresholdAlerts = async ({ device, metrics }) => {
+  const evaluation = evaluateSensorMetrics(metrics);
+  const activeAlertTypes = new Set(evaluation.alerts.map((item) => item.type));
+
+  for (const candidate of evaluation.alerts) {
+    const metricLabel = candidate.metric === 'mq135'
+      ? 'MQ135'
+      : candidate.metric === 'mq137'
+        ? 'MQ137'
+        : candidate.metric;
+    await upsertSensorAlert({
+      device,
+      alertType: candidate.type,
+      severity: candidate.severity,
+      message: `Sensor ${device.device_id} ${metricLabel} ${candidate.direction === 'low' ? 'below' : 'above'} threshold (${candidate.value} vs ${candidate.threshold})`,
+    });
+  }
+
+  // Auto-resolve stale alerts for metrics that returned to NORMAL.
+  const existingActive = await Alert.findAll({
+    where: {
+      source_type: 'sensor',
+      source_id: device.id,
+      status: { [Op.in]: ['open', 'acknowledged'] },
+      alert_type: { [Op.in]: [...SENSOR_ALERT_TYPE_SET] },
+    },
+  });
+  for (const alert of existingActive) {
+    if (alert.alert_type === 'SENSOR_OFFLINE') continue;
+    if (!activeAlertTypes.has(alert.alert_type)) {
+      await resolveSensorAlertType({ deviceId: device.id, alertType: alert.alert_type });
+    }
+  }
+
+  return evaluation;
+};
+
+const resolveOfflineAlertOnReading = async (device) => {
+  await resolveSensorAlertType({ deviceId: device.id, alertType: 'SENSOR_OFFLINE' });
+};
+
+const assertDeviceInScope = (req, device, { ingestion = false } = {}) => {
   if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
     throw new AppError('Sensor device out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (!isFacilityInScope(req, device.facility_id || null)) {
-    throw new AppError('Sensor device out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  if (!device.facility_id) {
+    return;
   }
+  if (isFacilityInScope(req, device.facility_id)) {
+    return;
+  }
+  // Mobile field workers ingest BLE readings tenant-wide (same policy as QR inspections).
+  if (ingestion && hasFieldInspectionRole(req)) {
+    return;
+  }
+  throw new AppError('Sensor device out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+};
+
+const uniqueIds = (values = []) =>
+  [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+
+const pickLatestIso = (...values) => {
+  let latest = null;
+  let latestMs = -1;
+  for (const value of values) {
+    if (!value) continue;
+    const date = value instanceof Date ? value : new Date(value);
+    const ms = date.getTime();
+    if (Number.isNaN(ms)) continue;
+    if (ms > latestMs) {
+      latestMs = ms;
+      latest = date.toISOString();
+    }
+  }
+  return latest;
+};
+
+const batchLatestReadingsByDeviceId = async (deviceIds = []) => {
+  const ids = uniqueIds(deviceIds);
+  if (ids.length === 0) return new Map();
+  const rows = await SensorReading.findAll({
+    where: { device_id: { [Op.in]: ids } },
+    order: [['timestamp', 'DESC']],
+    limit: Math.max(100, ids.length * 8),
+  });
+  const latestByDeviceId = new Map();
+  for (const row of rows) {
+    const key = String(row.device_id || '');
+    if (!key || latestByDeviceId.has(key)) continue;
+    latestByDeviceId.set(key, row);
+  }
+  return latestByDeviceId;
+};
+
+const batchReadingCountsByDeviceId = async (deviceIds = []) => {
+  const ids = uniqueIds(deviceIds);
+  if (ids.length === 0) return new Map();
+  const rows = await SensorReading.findAll({
+    where: { device_id: { [Op.in]: ids } },
+    attributes: ['device_id', [fn('COUNT', col('id')), 'reading_count']],
+    group: ['device_id'],
+    raw: true,
+  });
+  return new Map(
+    rows.map((row) => [String(row.device_id || ''), Number(row.reading_count || 0)])
+  );
+};
+
+const mapDeviceListItem = (device, ctx = {}) => {
+  const base = mapDevice(device);
+  const latestReading = ctx.latestReading || null;
+  const metadata =
+    device.metadata && typeof device.metadata === 'object' && !Array.isArray(device.metadata)
+      ? device.metadata
+      : {};
+  const metrics = latestReading
+    ? toSensorMetrics(latestReading)
+    : toSensorMetrics({
+        lastSeenAt: base.lastSeenAt,
+        batteryLevel: metadata.lastBattery,
+        signalStrength: metadata.rssi,
+      });
+  const effectiveLastSeen = pickLatestIso(base.lastSeenAt, latestReading?.timestamp);
+  const offline = evaluateOfflineStatus(effectiveLastSeen, ctx.now || new Date());
+  const isOnline = offline.status === STATUS.NORMAL;
+
+  return {
+    ...base,
+    facilityCode: ctx.facility?.code || null,
+    facilityName: ctx.facility?.name || null,
+    toiletUnitCode: ctx.toilet?.code || null,
+    readingCount: ctx.readingCount ?? 0,
+    latestReading,
+    metrics,
+    connectivityStatus: offline.status,
+    connectivityMinutes: offline.minutes,
+    isOnline,
+    latestTemperature: metrics.temperature,
+    latestHumidity: metrics.humidity,
+    signalStrength: metrics.rssi,
+    batteryLevel: metrics.battery,
+    lastSeenAt: effectiveLastSeen || base.lastSeenAt,
+  };
 };
 
 // Resolve a toilet unit + its parent facility and validate tenant/facility scope for the caller.
@@ -177,7 +614,7 @@ const ingestSensorReading = async (req) => {
   if (!device) {
     throw new AppError('Sensor device not found', 404, { code: 'SENSOR_NOT_FOUND' });
   }
-  assertDeviceInScope(req, device);
+  assertDeviceInScope(req, device, { ingestion: true });
 
   // If the client claims a toilet, the backend mapping must already confirm it.
   const claimedToiletUnitId = req.body.toiletUnitId || null;
@@ -222,6 +659,13 @@ const ingestSensorReading = async (req) => {
         fieldCount: parsed.fieldCount,
         fields: parsed.fields,
         parsed: parsed.parsed,
+        metrics_v1: toSensorMetrics({
+          ...parsed.parsed,
+          readingTime: timestamp,
+          batteryLevel: parseNumeric(req.body.batteryLevel),
+          signalStrength,
+          raw: parsed.raw,
+        }),
         clientReadingId,
       }
     : req.body.rawPayload || req.body;
@@ -260,7 +704,12 @@ const ingestSensorReading = async (req) => {
   }
 
   await device.update({ last_seen_at: timestamp, updated_at: new Date() });
-  await createSensorAlertIfNeeded(device, reading);
+  const metrics = toSensorMetrics({
+    ...mapReading(reading),
+    timestamp,
+  });
+  await emitThresholdAlerts({ device, metrics });
+  await resolveOfflineAlertOnReading(device);
 
   eventBus.emit(EVENTS.SENSOR_READING, {
     tenantId: device.tenant_id,
@@ -284,6 +733,38 @@ const ingestSensorReading = async (req) => {
     reading: mapReading(reading),
     duplicate: false,
   };
+};
+
+const checkSensorOfflineAlerts = async (req) => {
+  let where = scopedWhere(req, {}, 'sensor');
+  where = { ...where, status: { [Op.ne]: 'inactive' } };
+
+  const devices = await SensorDevice.findAll({
+    where,
+    attributes: ['id', 'tenant_id', 'facility_id', 'device_id', 'last_seen_at'],
+    order: [['last_seen_at', 'ASC']],
+  });
+
+  let opened = 0;
+  let resolved = 0;
+  for (const device of devices) {
+    const offline = evaluateOfflineStatus(device.last_seen_at, new Date());
+    if (offline.status === STATUS.NORMAL) {
+      const previous = await resolveSensorAlertType({ deviceId: device.id, alertType: 'SENSOR_OFFLINE' });
+      if (previous) resolved += 1;
+      continue;
+    }
+    const severity = offline.status === STATUS.CRITICAL ? 'critical' : 'medium';
+    const alert = await upsertSensorAlert({
+      device,
+      alertType: 'SENSOR_OFFLINE',
+      severity,
+      message: `Sensor ${device.device_id} offline for ${offline.minutes} minutes`,
+    });
+    if (alert) opened += 1;
+  }
+
+  return { checked: devices.length, opened, resolved };
 };
 
 /* -------------------------------------------------------------------------- */
@@ -705,13 +1186,49 @@ const listSensors = async (req) => {
 
   const { rows, count } = await SensorDevice.findAndCountAll({
     where,
-    order: [['last_seen_at', 'DESC']],
+    order: [['last_seen_at', 'DESC NULLS LAST']],
     limit,
     offset,
   });
 
+  const deviceIds = rows.map((row) => row.id);
+  const now = new Date();
+  const [latestByDeviceId, readingCountByDeviceId] = await Promise.all([
+    batchLatestReadingsByDeviceId(deviceIds),
+    batchReadingCountsByDeviceId(deviceIds),
+  ]);
+
+  const facilityIds = uniqueIds(rows.map((row) => row.facility_id));
+  const toiletUnitIds = uniqueIds(rows.map((row) => row.toilet_unit_id));
+  const [facilities, toilets] = await Promise.all([
+    facilityIds.length
+      ? Facility.findAll({
+          where: { id: { [Op.in]: facilityIds } },
+          attributes: ['id', 'code', 'name'],
+        })
+      : [],
+    toiletUnitIds.length
+      ? ToiletUnit.findAll({
+          where: { id: { [Op.in]: toiletUnitIds } },
+          attributes: ['id', 'code', 'facility_id'],
+        })
+      : [],
+  ]);
+  const facilityById = new Map(facilities.map((row) => [String(row.id), row]));
+  const toiletById = new Map(toilets.map((row) => [String(row.id), row]));
+
   return {
-    items: rows.map(mapDevice),
+    items: rows.map((device) => {
+      const deviceKey = String(device.id);
+      const latestRow = latestByDeviceId.get(deviceKey) || null;
+      return mapDeviceListItem(device, {
+        now,
+        facility: facilityById.get(String(device.facility_id || '')) || null,
+        toilet: toiletById.get(String(device.toilet_unit_id || '')) || null,
+        latestReading: latestRow ? mapReading(latestRow) : null,
+        readingCount: readingCountByDeviceId.get(deviceKey) || 0,
+      });
+    }),
     meta: { page, limit, total: count, totalPages: Math.max(1, Math.ceil(count / limit)) },
   };
 };
@@ -724,7 +1241,7 @@ const listSensorReadings = async (req) => {
   if (!req.user.isSuperAdmin && device.tenant_id !== req.user.tenantId) {
     throw new AppError('Sensor out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
-  if (!isFacilityInScope(req, device.facility_id || null)) {
+  if (device.facility_id && !isFacilityInScope(req, device.facility_id)) {
     throw new AppError('Sensor out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   const { page, limit, offset } = normalizePagination(req.query);
@@ -831,6 +1348,377 @@ const getLiveAlerts = async (req) => {
   }));
 };
 
+const resolveAnalyticsDevices = async (req, { activeOnly = false } = {}) => {
+  let where = scopedWhere(req, {}, 'sensor');
+  if (activeOnly) where.status = 'active';
+  if (req.query.status) where.status = req.query.status;
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+    }
+    where.facility_id = req.query.facilityId;
+  }
+  if (req.query.toiletUnitId || req.query.toiletId) {
+    where.toilet_unit_id = req.query.toiletUnitId || req.query.toiletId;
+  }
+  const toiletUnitIds = parseCsvIds(req.query.toiletUnitIds || req.query.toiletIds);
+  if (toiletUnitIds.length > 0) {
+    where.toilet_unit_id = { [Op.in]: toiletUnitIds };
+  }
+  return SensorDevice.findAll({
+    where,
+    order: [['last_seen_at', 'DESC NULLS LAST']],
+    limit: Math.min(Number(req.query.deviceLimit || 1000), 5000),
+  });
+};
+
+const loadReadingsForDevices = async ({ deviceIds, range, limit = 10000 }) => {
+  if (deviceIds.length === 0) return [];
+  let where = { device_id: { [Op.in]: deviceIds } };
+  where = applyDateRangeToWhere(where, 'timestamp', range);
+  return SensorReading.findAll({
+    where,
+    order: [['timestamp', 'ASC']],
+    limit: Math.min(Number(limit || 10000), 20000),
+    raw: true,
+  });
+};
+
+const buildComparisonRows = ({ devices, latestByDeviceId, readings, metricKey, facilitiesById, toiletsById }) => {
+  const grouped = new Map();
+  for (const device of devices) {
+    grouped.set(String(device.id), {
+      device,
+      values: [],
+      breachCount: 0,
+      latestCapturedAt: latestByDeviceId.get(String(device.id))?.timestamp || null,
+    });
+  }
+  for (const reading of readings) {
+    const key = String(reading.device_id || '');
+    const group = grouped.get(key);
+    if (!group) continue;
+    const evaluation = evaluateReading(reading, group.device);
+    const value = metricValue(evaluation.metrics, metricKey);
+    if (value !== null) group.values.push(value);
+    const metricStatus = statusLower(evaluation.threshold.metrics?.[normalizeMetricKey(metricKey)]?.status);
+    if (metricStatus === 'warning' || metricStatus === 'critical') group.breachCount += 1;
+  }
+
+  return [...grouped.values()]
+    .map((group) => {
+      const facility = facilitiesById.get(String(group.device.facility_id || '')) || null;
+      const toilet = toiletsById.get(String(group.device.toilet_unit_id || '')) || null;
+      const latest = latestByDeviceId.get(String(group.device.id)) || null;
+      const latestEval = latest ? evaluateReading(latest, group.device) : null;
+      const avg =
+        group.values.length > 0
+          ? group.values.reduce((sum, value) => sum + value, 0) / group.values.length
+          : null;
+      const max = group.values.length > 0 ? Math.max(...group.values) : null;
+      return {
+        deviceId: group.device.id,
+        toiletId: group.device.toilet_unit_id,
+        toiletName: toilet?.location_label || toilet?.code || group.device.device_id,
+        toiletCode: toilet?.code || null,
+        facilityId: group.device.facility_id,
+        facilityName: facility?.name || null,
+        avgValue: roundMetric(avg, metricKey),
+        maxValue: roundMetric(max, metricKey),
+        breachCount: group.breachCount,
+        lastCapturedAt: group.latestCapturedAt,
+        status: latestEval ? latestEval.status : 'stale',
+      };
+    })
+    .sort((left, right) => right.breachCount - left.breachCount || Number(right.maxValue || 0) - Number(left.maxValue || 0));
+};
+
+const getSensorAnalyticsOverview = async (req) => {
+  const metricKey = normalizeMetricKey(req.query.metric);
+  const granularity = normalizeGranularity(req.query.granularity || 'hourly');
+  const range = resolveDateRange(req.query, { maxDays: 90, defaultRange: req.query.range || 'last7' });
+  const devices = await resolveAnalyticsDevices(req);
+  const deviceIds = devices.map((device) => device.id);
+  const [latestByDeviceId, readings, labels] = await Promise.all([
+    batchLatestReadingsByDeviceId(deviceIds),
+    loadReadingsForDevices({ deviceIds, range, limit: req.query.limit || 12000 }),
+    buildDeviceLabelMaps(devices),
+  ]);
+  const previousByDeviceId = new Map();
+  for (const reading of readings.slice().reverse()) {
+    const key = String(reading.device_id || '');
+    if (!latestByDeviceId.has(key)) continue;
+    const latest = latestByDeviceId.get(key);
+    if (String(latest.id) === String(reading.id)) continue;
+    if (!previousByDeviceId.has(key)) previousByDeviceId.set(key, reading);
+  }
+
+  const devicesById = new Map(devices.map((device) => [String(device.id), device]));
+  const latestStatuses = devices.map((device) =>
+    mapOperationalDeviceStatus({
+      device,
+      latestReading: latestByDeviceId.get(String(device.id)) || null,
+      previousReading: previousByDeviceId.get(String(device.id)) || null,
+      facilitiesById: labels.facilitiesById,
+      toiletsById: labels.toiletsById,
+    })
+  );
+  const statusCounts = latestStatuses.reduce(
+    (acc, row) => {
+      acc[row.status] = Number(acc[row.status] || 0) + 1;
+      return acc;
+    },
+    { normal: 0, warning: 0, critical: 0, stale: 0 }
+  );
+  const comparison = buildComparisonRows({
+    devices,
+    latestByDeviceId,
+    readings,
+    metricKey,
+    facilitiesById: labels.facilitiesById,
+    toiletsById: labels.toiletsById,
+  });
+
+  return {
+    metric: getMetricConfig(metricKey),
+    range: range.range,
+    dateRange: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    summary: {
+      monitoredToilets: uniqueIds(devices.map((device) => device.toilet_unit_id)).length,
+      activeSensors: devices.filter((device) => device.status === 'active').length,
+      totalSensors: devices.length,
+      normalCount: statusCounts.normal || 0,
+      warningCount: statusCounts.warning || 0,
+      criticalCount: statusCounts.critical || 0,
+      staleCount: statusCounts.stale || 0,
+      readingCount: readings.length,
+    },
+    latest: latestStatuses,
+    topAttention: latestStatuses
+      .filter((row) => ['critical', 'warning', 'stale'].includes(row.status))
+      .sort((left, right) => (STATUS_RANK[right.status] || 0) - (STATUS_RANK[left.status] || 0))
+      .slice(0, 5),
+    timeSeries: aggregateTimeSeries({ readings, devicesById, metricKey, granularity }),
+    breachSeries: buildBreachSeries({ readings, devicesById, granularity: 'daily' }),
+    comparison: comparison.slice(0, 20),
+    health: {
+      activeSensors: devices.filter((device) => device.status === 'active').length,
+      staleSensors: statusCounts.stale || 0,
+      lowBatterySensors: latestStatuses.filter((row) =>
+        row.metrics.some((metric) => metric.key === 'battery' && metric.status !== 'normal' && metric.value !== null)
+      ).length,
+      lastSyncAt: latestStatuses
+        .map((row) => row.lastCapturedAt || row.lastSeenAt)
+        .filter(Boolean)
+        .sort()
+        .pop() || null,
+      signalIssues: latestStatuses.filter((row) =>
+        row.metrics.some((metric) => metric.key === 'rssi' && metric.value !== null && Number(metric.value) < -85)
+      ).length,
+    },
+  };
+};
+
+const getSensorTimeSeries = async (req) => {
+  const metricKey = normalizeMetricKey(req.query.metric);
+  const granularity = normalizeGranularity(req.query.granularity);
+  const range = resolveDateRange(req.query, { maxDays: 180, defaultRange: req.query.range || 'last7' });
+  const devices = await resolveAnalyticsDevices(req);
+  const deviceIds = devices.map((device) => device.id);
+  const readings = await loadReadingsForDevices({ deviceIds, range, limit: req.query.limit || 20000 });
+  const devicesById = new Map(devices.map((device) => [String(device.id), device]));
+  return {
+    metric: getMetricConfig(metricKey),
+    threshold: getMetricThresholdSummary(metricKey),
+    granularity,
+    range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    points: aggregateTimeSeries({ readings, devicesById, metricKey, granularity }),
+  };
+};
+
+const getSensorComparison = async (req) => {
+  const metricKey = normalizeMetricKey(req.query.metric);
+  const range = resolveDateRange(req.query, { maxDays: 180, defaultRange: req.query.range || 'last7' });
+  const devices = await resolveAnalyticsDevices(req);
+  const deviceIds = devices.map((device) => device.id);
+  const [latestByDeviceId, readings, labels] = await Promise.all([
+    batchLatestReadingsByDeviceId(deviceIds),
+    loadReadingsForDevices({ deviceIds, range, limit: req.query.limit || 20000 }),
+    buildDeviceLabelMaps(devices),
+  ]);
+  return {
+    metric: getMetricConfig(metricKey),
+    range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    items: buildComparisonRows({
+      devices,
+      latestByDeviceId,
+      readings,
+      metricKey,
+      facilitiesById: labels.facilitiesById,
+      toiletsById: labels.toiletsById,
+    }),
+  };
+};
+
+const getImageLinkedSensorEvidence = async (req) => {
+  const range = resolveDateRange(req.query, { maxDays: 180, defaultRange: req.query.range || 'last7' });
+  let where = scopedWhere(req, { sensor_snapshot: { [Op.ne]: null } }, 'sensor');
+  where = applyDateRangeToWhere(where, 'captured_at', range);
+  if (req.query.toiletUnitId || req.query.toiletId) {
+    const toiletUnitId = req.query.toiletUnitId || req.query.toiletId;
+    await resolveToiletInScope(req, toiletUnitId);
+    where.toilet_unit_id = toiletUnitId;
+  }
+  const inspections = await Inspection.findAll({
+    where,
+    attributes: ['id', 'tenant_id', 'facility_id', 'toilet_unit_id', 'captured_at', 'submitted_at', 'sensor_snapshot'],
+    order: [['captured_at', 'DESC']],
+    limit: Math.min(Number(req.query.limit || 25), 100),
+    raw: true,
+  });
+  const inspectionIds = inspections.map((row) => row.id);
+  const images = inspectionIds.length
+    ? await InspectionMedia.findAll({
+        where: { inspection_id: { [Op.in]: inspectionIds } },
+        attributes: ['id', 'inspection_id', 'capture_stage', 'file_url', 'thumbnail_url', 'captured_at', 'overall_score', 'severity'],
+        order: [['captured_at', 'DESC NULLS LAST']],
+        raw: true,
+      })
+    : [];
+  const imagesByInspection = new Map();
+  for (const image of images) {
+    const list = imagesByInspection.get(String(image.inspection_id)) || [];
+    list.push({
+      id: image.id,
+      imageUrl: image.file_url,
+      thumbnailUrl: image.thumbnail_url || image.file_url,
+      captureStage: image.capture_stage,
+      capturedAt: image.captured_at,
+      score: image.overall_score == null ? null : Number(image.overall_score),
+      severity: image.severity || null,
+    });
+    imagesByInspection.set(String(image.inspection_id), list);
+  }
+
+  return {
+    range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    items: inspections.map((inspection) => {
+      const snapshot = inspection.sensor_snapshot || {};
+      const metrics = toSensorMetrics(snapshot);
+      const threshold = evaluateSensorMetrics(metrics);
+      return {
+        inspectionId: inspection.id,
+        tenantId: inspection.tenant_id,
+        facilityId: inspection.facility_id,
+        toiletUnitId: inspection.toilet_unit_id,
+        capturedAt: inspection.submitted_at || inspection.captured_at,
+        status: statusLower(threshold.overallStatus),
+        // Read-only provenance so the UI can mark synthetic historical backfill
+        // rows distinctly from live BLE telemetry. Sourced from inspections.sensor_snapshot;
+        // never from sensor_readings/sensor_devices.
+        isSynthetic: snapshot.isSynthetic === true,
+        isBackfilled: snapshot.isBackfilled === true,
+        sensorDataSource: snapshot.sensorDataSource || null,
+        backfillBatchId: snapshot.backfillBatchId || null,
+        metrics: Object.keys(ANALYTICS_METRICS)
+          .map((metricKey) => {
+            const value = metricValue(metrics, metricKey);
+            if (value === null) return null;
+            return {
+              key: metricKey,
+              label: ANALYTICS_METRICS[metricKey].label,
+              unit: ANALYTICS_METRICS[metricKey].unit,
+              value: roundMetric(value, metricKey),
+              status: statusLower(threshold.metrics?.[metricKey]?.status),
+            };
+          })
+          .filter(Boolean),
+        images: imagesByInspection.get(String(inspection.id)) || [],
+      };
+    }),
+  };
+};
+
+const buildRecommendations = ({ latestStatuses, breachSeries }) => {
+  const recommendations = [];
+  const stale = latestStatuses.filter((row) => row.status === 'stale');
+  const critical = latestStatuses.filter((row) => row.status === 'critical');
+  const warning = latestStatuses.filter((row) => row.status === 'warning');
+  const recentCriticalBreaches = breachSeries.reduce((sum, row) => sum + Number(row.critical || 0), 0);
+
+  if (critical.length > 0 || recentCriticalBreaches >= 3) {
+    recommendations.push({
+      severity: 'critical',
+      message: 'Critical sensor readings are recurring. Prioritize cleaning and review linked inspection evidence.',
+    });
+  }
+  if (warning.length > 0 && critical.length === 0) {
+    recommendations.push({
+      severity: 'warning',
+      message: 'Some readings are outside configured thresholds. Check ventilation and cleaning schedule for this toilet.',
+    });
+  }
+  if (stale.length > 0) {
+    recommendations.push({
+      severity: 'warning',
+      message: 'Sensor readings are stale. Check device connectivity before relying on current readings.',
+    });
+  }
+  if (recommendations.length === 0 && latestStatuses.length > 0) {
+    recommendations.push({
+      severity: 'normal',
+      message: 'Sensor readings are within configured thresholds for the selected period.',
+    });
+  }
+  return recommendations;
+};
+
+const getToiletSensorAnalysis = async (req) => {
+  const metricKey = normalizeMetricKey(req.query.metric);
+  const granularity = normalizeGranularity(req.query.granularity || 'hourly');
+  const range = resolveDateRange(req.query, { maxDays: 180, defaultRange: req.query.range || 'last7' });
+  const { toilet, devices } = await resolveToiletDevices(req);
+  const deviceIds = devices.map((device) => device.id);
+  const [latestByDeviceId, readings, labels] = await Promise.all([
+    batchLatestReadingsByDeviceId(deviceIds),
+    loadReadingsForDevices({ deviceIds, range, limit: req.query.limit || 10000 }),
+    buildDeviceLabelMaps(devices),
+  ]);
+  const devicesById = new Map(devices.map((device) => [String(device.id), device]));
+  const latestStatuses = devices.map((device) =>
+    mapOperationalDeviceStatus({
+      device,
+      latestReading: latestByDeviceId.get(String(device.id)) || null,
+      previousReading: null,
+      facilitiesById: labels.facilitiesById,
+      toiletsById: labels.toiletsById,
+    })
+  );
+  const timeSeries = aggregateTimeSeries({ readings, devicesById, metricKey, granularity });
+  const breachSeries = buildBreachSeries({ readings, devicesById, granularity: 'daily' });
+  const evidence = await getImageLinkedSensorEvidence({
+    ...req,
+    query: { ...req.query, toiletUnitId: toilet.id, limit: req.query.evidenceLimit || 12 },
+  });
+  return {
+    toiletUnitId: toilet.id,
+    metric: getMetricConfig(metricKey),
+    range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    summary: {
+      deviceCount: devices.length,
+      activeDeviceCount: devices.filter((device) => device.status === 'active').length,
+      readingCount: readings.length,
+      status: latestStatuses.reduce((current, row) => worseStatus(current, row.status), 'normal'),
+      breachCount: breachSeries.reduce((sum, row) => sum + Number(row.warning || 0) + Number(row.critical || 0), 0),
+    },
+    latest: latestStatuses,
+    timeSeries,
+    breachSeries,
+    evidence: evidence.items || [],
+    recommendations: buildRecommendations({ latestStatuses, breachSeries }),
+  };
+};
+
 module.exports = {
   ingestSensorReading,
   registerSensor,
@@ -844,4 +1732,10 @@ module.exports = {
   listSensorReadings,
   getFacilityLiveMetrics,
   getLiveAlerts,
+  getSensorAnalyticsOverview,
+  getSensorTimeSeries,
+  getSensorComparison,
+  getImageLinkedSensorEvidence,
+  getToiletSensorAnalysis,
+  checkSensorOfflineAlerts,
 };

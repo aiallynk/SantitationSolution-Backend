@@ -151,6 +151,78 @@ const getLiveAlerts = async (req, res, next) => {
   }
 };
 
+const getSensorAnalyticsOverview = async (req, res, next) => {
+  try {
+    const data = await sensorService.getSensorAnalyticsOverview(req);
+    return sendSuccess(res, {
+      message: 'Sensor analytics overview fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getSensorTimeSeries = async (req, res, next) => {
+  try {
+    const data = await sensorService.getSensorTimeSeries(req);
+    return sendSuccess(res, {
+      message: 'Sensor time series fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getSensorComparison = async (req, res, next) => {
+  try {
+    const data = await sensorService.getSensorComparison(req);
+    return sendSuccess(res, {
+      message: 'Sensor toilet comparison fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getSensorImageEvidence = async (req, res, next) => {
+  try {
+    const data = await sensorService.getImageLinkedSensorEvidence(req);
+    return sendSuccess(res, {
+      message: 'Image-linked sensor evidence fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getToiletSensorAnalysis = async (req, res, next) => {
+  try {
+    const data = await sensorService.getToiletSensorAnalysis(req);
+    return sendSuccess(res, {
+      message: 'Toilet sensor analysis fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const postOfflineAlertCheck = async (req, res, next) => {
+  try {
+    const data = await sensorService.checkSensorOfflineAlerts(req);
+    return sendSuccess(res, {
+      message: 'Sensor offline alerts evaluated successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   postIngestion,
   postRegisterSensor,
@@ -164,4 +236,10 @@ module.exports = {
   getSensorReadings,
   getFacilityLiveMetrics,
   getLiveAlerts,
+  getSensorAnalyticsOverview,
+  getSensorTimeSeries,
+  getSensorComparison,
+  getSensorImageEvidence,
+  getToiletSensorAnalysis,
+  postOfflineAlertCheck,
 };

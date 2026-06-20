@@ -17,13 +17,20 @@ const {
   validateSensorListQuery,
 } = require('./sensor.validator');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
+const { sensorIngestionRateLimit } = require('../../core/security/rateLimit');
 
 const router = express.Router();
 const SENSOR_ROUTE_PREFIXES = ['/sensor-ingestion', '/sensors', '/facilities', '/alerts'];
 
 router.use(SENSOR_ROUTE_PREFIXES, protect);
 
-router.post('/sensor-ingestion/readings', requirePermissions('sensor.ingest'), validate(validateIngestion), sensorController.postIngestion);
+router.post(
+  '/sensor-ingestion/readings',
+  sensorIngestionRateLimit,
+  requirePermissions('sensor.ingest'),
+  validate(validateIngestion),
+  sensorController.postIngestion
+);
 
 /* -------------------------------------------------------------------------- */
 /* Registration — record a discovered device without a toilet mapping.         */
@@ -99,6 +106,42 @@ router.get(
   requireAnyPermissions('sensor.read', 'dashboard.read'),
   sensorController.getToiletReadingSummary
 );
+router.get(
+  '/sensors/by-toilet/:toiletUnitId/analysis',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE, SurfaceTypes.MOBILE_ONLY),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getToiletSensorAnalysis
+);
+
+router.get(
+  '/sensors/analytics/overview',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getSensorAnalyticsOverview
+);
+router.get(
+  '/sensors/analytics/time-series',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getSensorTimeSeries
+);
+router.get(
+  '/sensors/analytics/comparison',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getSensorComparison
+);
+router.get(
+  '/sensors/analytics/image-evidence',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getSensorImageEvidence
+);
 
 router.get(
   '/sensors',
@@ -137,6 +180,14 @@ router.get(
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
   requirePermissions('alerts.manage'),
   sensorController.getLiveAlerts
+);
+router.post(
+  '/alerts/sensors/offline/check',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requirePermissions('alerts.manage'),
+  sensorController.postOfflineAlertCheck
 );
 
 module.exports = router;

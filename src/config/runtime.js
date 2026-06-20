@@ -167,6 +167,11 @@ const runtimeConfig = Object.freeze({
     rateLimitMax: asNumber(rawEnv.RATE_LIMIT_MAX, 300, { min: 10 }),
     supervisorRateLimitMax: asNumber(rawEnv.SUPERVISOR_RATE_LIMIT_MAX, 2000, { min: 50 }),
     ingestRateLimitMax: defaults.app.ingestRateLimitMax,
+    sensorIngestRateLimitMax: asNumber(
+      rawEnv.SENSOR_INGEST_RATE_LIMIT_MAX,
+      defaults.app.sensorIngestRateLimitMax,
+      { min: 60 }
+    ),
   },
   server: {
     requestTimeoutMs,
@@ -251,6 +256,18 @@ const runtimeConfig = Object.freeze({
       bucketKeyEnabled: asBool(rawEnv.AWS_S3_BUCKET_KEY_ENABLED, true),
     },
   },
+  backup: {
+    storageProvider: asText(rawEnv.BACKUP_STORAGE_PROVIDER, '').toLowerCase(),
+    bucketName: asText(rawEnv.BACKUP_BUCKET_NAME, ''),
+    prefix: asText(rawEnv.BACKUP_STORAGE_PREFIX, 'sanitation/backups'),
+    usagePrefix: asText(rawEnv.BACKUP_USAGE_PREFIX, 'sanitation'),
+    includeBucketUsage: asBool(rawEnv.BACKUP_INCLUDE_BUCKET_USAGE, true),
+    localDir: asText(rawEnv.BACKUP_LOCAL_DIR, 'db-backups'),
+    signedUrlTtlSec: asNumber(rawEnv.BACKUP_SIGNED_URL_TTL_SEC, 600, { min: 60, max: 900 }),
+    cronSecret: asText(rawEnv.BACKUP_CRON_SECRET, ''),
+    defaultRetentionDays: asNumber(rawEnv.BACKUP_RETENTION_DAYS, 7, { min: 1, max: 365 }),
+    exportPageSize: asNumber(rawEnv.BACKUP_EXPORT_PAGE_SIZE, 1000, { min: 100, max: 5000 }),
+  },
   redis: {
     enabled: asBool(rawEnv.REDIS_ENABLED, false),
     url: asText(rawEnv.REDIS_URL, ''),
@@ -332,6 +349,38 @@ const runtimeConfig = Object.freeze({
     ammoniaPpmThreshold: defaults.alerts.ammoniaPpmThreshold,
     h2sPpmThreshold: defaults.alerts.h2sPpmThreshold,
     methanePpmThreshold: defaults.alerts.methanePpmThreshold,
+    // BLE wand environmental thresholds (configurable via env; null disables a
+    // bound). MQ channels stay disabled by default until calibrated.
+    sensor: {
+      temperature: {
+        highWarningC: asNumber(rawEnv.SENSOR_TEMP_HIGH_WARNING_C, defaults.alerts.sensor.temperature.highWarningC),
+        highCriticalC: asNumber(rawEnv.SENSOR_TEMP_HIGH_CRITICAL_C, defaults.alerts.sensor.temperature.highCriticalC),
+        lowWarningC: asNumber(rawEnv.SENSOR_TEMP_LOW_WARNING_C, defaults.alerts.sensor.temperature.lowWarningC),
+        lowCriticalC: asNumber(rawEnv.SENSOR_TEMP_LOW_CRITICAL_C, defaults.alerts.sensor.temperature.lowCriticalC),
+      },
+      humidity: {
+        highWarningPct: asNumber(rawEnv.SENSOR_HUMIDITY_HIGH_WARNING_PCT, defaults.alerts.sensor.humidity.highWarningPct),
+        highCriticalPct: asNumber(rawEnv.SENSOR_HUMIDITY_HIGH_CRITICAL_PCT, defaults.alerts.sensor.humidity.highCriticalPct),
+        lowWarningPct: asNumber(rawEnv.SENSOR_HUMIDITY_LOW_WARNING_PCT, defaults.alerts.sensor.humidity.lowWarningPct),
+        lowCriticalPct: asNumber(rawEnv.SENSOR_HUMIDITY_LOW_CRITICAL_PCT, defaults.alerts.sensor.humidity.lowCriticalPct),
+      },
+      mq135: {
+        warning: asNumber(rawEnv.SENSOR_MQ135_WARNING, defaults.alerts.sensor.mq135.warning),
+        critical: asNumber(rawEnv.SENSOR_MQ135_CRITICAL, defaults.alerts.sensor.mq135.critical),
+      },
+      mq137: {
+        warning: asNumber(rawEnv.SENSOR_MQ137_WARNING, defaults.alerts.sensor.mq137.warning),
+        critical: asNumber(rawEnv.SENSOR_MQ137_CRITICAL, defaults.alerts.sensor.mq137.critical),
+      },
+      battery: {
+        lowWarningPct: asNumber(rawEnv.SENSOR_BATTERY_LOW_WARNING_PCT, defaults.alerts.sensor.battery.lowWarningPct),
+        lowCriticalPct: asNumber(rawEnv.SENSOR_BATTERY_LOW_CRITICAL_PCT, defaults.alerts.sensor.battery.lowCriticalPct),
+      },
+      offline: {
+        warningMinutes: asNumber(rawEnv.SENSOR_OFFLINE_WARNING_MINUTES, defaults.alerts.sensor.offline.warningMinutes),
+        criticalMinutes: asNumber(rawEnv.SENSOR_OFFLINE_CRITICAL_MINUTES, defaults.alerts.sensor.offline.criticalMinutes),
+      },
+    },
   },
   automation: {
     criticalComplaintValues: asText(

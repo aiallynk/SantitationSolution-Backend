@@ -8,6 +8,8 @@ node_modules/
 
 # Runtime uploads/temp
 uploads/
+backups/
+tmp/backfills/
 
 # Firebase admin credentials (never commit)
 *-firebase-adminsdk-*.json
