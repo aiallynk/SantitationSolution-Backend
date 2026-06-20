@@ -45,6 +45,8 @@ const parseArgs = (argv = process.argv.slice(2)) => {
     outputDir: DEFAULT_OUTPUT_DIR,
     limit: null,
     allowStatusFallback: false,
+    includeSuspicious: false,
+    includeDrafts: false,
     backupDir: null,
     confirmApply: null,
   };
@@ -60,6 +62,8 @@ const parseArgs = (argv = process.argv.slice(2)) => {
     else if (arg === '--output-dir') args.outputDir = argv[++i];
     else if (arg === '--limit') args.limit = Number(argv[++i]);
     else if (arg === '--allow-status-fallback') args.allowStatusFallback = true;
+    else if (arg === '--include-suspicious') args.includeSuspicious = true;
+    else if (arg === '--include-drafts') args.includeDrafts = true;
     else if (arg === '--backup-dir') args.backupDir = argv[++i];
     else if (arg === '--confirm-apply') args.confirmApply = argv[++i];
     else if (arg === '--help' || arg === '-h') args.help = true;
@@ -262,10 +266,21 @@ const isSuspiciousOrFailed = (inspection) => {
   return [status, processing, pipeline].some((value) => value.includes('failed'));
 };
 
-const classifyInspection = ({ inspection, mediaRows = [], allowStatusFallback = false }) => {
+const classifyInspection = ({
+  inspection,
+  mediaRows = [],
+  allowStatusFallback = false,
+  includeSuspicious = false,
+  includeDrafts = false,
+}) => {
+  // Never overwrite an existing snapshot (protects the 13 real ones + any prior batch).
   if (isPresentSnapshot(inspection.sensor_snapshot)) return { eligible: false, reason: 'already_has_sensor_snapshot' };
-  if (isSuspiciousOrFailed(inspection)) return { eligible: false, reason: 'suspicious_or_failed' };
-  if (isDraftOrIncomplete(inspection)) return { eligible: false, reason: 'draft_or_incomplete' };
+  // Suspicious/failed and draft/incomplete are skipped by default. They can be
+  // opted in explicitly (e.g. demo/pilot data where every completed inspection
+  // should carry synthetic sensor evidence). Even when opted in, a row without a
+  // usable score is still skipped as missing_score below.
+  if (!includeSuspicious && isSuspiciousOrFailed(inspection)) return { eligible: false, reason: 'suspicious_or_failed' };
+  if (!includeDrafts && isDraftOrIncomplete(inspection)) return { eligible: false, reason: 'draft_or_incomplete' };
   const selected = chooseInspectionScore({ inspection, mediaRows, allowStatusFallback });
   if (!selected) return { eligible: false, reason: 'missing_score' };
   return { eligible: true, reason: 'eligible', selected };
@@ -374,6 +389,8 @@ const buildBackfillPlan = ({
       inspection,
       mediaRows,
       allowStatusFallback: args.allowStatusFallback,
+      includeSuspicious: args.includeSuspicious,
+      includeDrafts: args.includeDrafts,
     });
     if (!classification.eligible) {
       increment(skippedCounts, classification.reason);
@@ -434,6 +451,12 @@ const buildBackfillPlan = ({
   }
   if (args.allTenants) {
     warnings.push('All-tenant scope was explicitly selected.');
+  }
+  if (args.includeSuspicious) {
+    warnings.push('Suspicious/failed inspections were explicitly INCLUDED (synthetic snapshots attached to flagged rows).');
+  }
+  if (args.includeDrafts) {
+    warnings.push('Draft/incomplete inspections were explicitly INCLUDED.');
   }
 
   return {

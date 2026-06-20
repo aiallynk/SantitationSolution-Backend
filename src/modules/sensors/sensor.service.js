@@ -1719,6 +1719,121 @@ const getToiletSensorAnalysis = async (req) => {
   };
 };
 
+// Metrics that can be charted from an inspection sensor_snapshot. Unlike the
+// live-telemetry ANALYTICS_METRICS, this set also exposes the overall sensor
+// `score` (field1 / sensorToiletScore). All values are read-only and derived
+// from inspections.sensor_snapshot — never from sensor_readings/sensor_devices.
+const SNAPSHOT_METRICS = Object.freeze({
+  score: { key: 'score', label: 'Sensor score', unit: '', precision: 1 },
+  temperature: ANALYTICS_METRICS.temperature,
+  humidity: ANALYTICS_METRICS.humidity,
+  mq135: { key: 'mq135', label: 'MQ135 raw', unit: 'raw', precision: 2 },
+  mq137: { key: 'mq137', label: 'MQ137 raw', unit: 'raw', precision: 2 },
+  battery: ANALYTICS_METRICS.battery,
+  rssi: ANALYTICS_METRICS.rssi,
+});
+
+const normalizeSnapshotMetricKey = (value) => {
+  const key = String(value || '').trim().toLowerCase();
+  return SNAPSHOT_METRICS[key] ? key : 'temperature';
+};
+
+/*
+ * Read-only dashboard trend series sourced ONLY from inspections.sensor_snapshot.
+ * This is intentionally SEPARATE from live sensor_readings analytics: it never
+ * reads/writes sensor_readings or sensor_devices, and must not feed live
+ * online/offline counts, device last-seen, device health, or alerts. Backfilled
+ * synthetic rows are surfaced with explicit provenance so the UI can mark them.
+ */
+const getInspectionSnapshotTrends = async (req) => {
+  const metricKey = normalizeSnapshotMetricKey(req.query.metric);
+  const metricConfig = SNAPSHOT_METRICS[metricKey];
+  const range = resolveDateRange(req.query, { maxDays: 366, defaultRange: req.query.range || 'last90' });
+
+  let where = scopedWhere(req, { sensor_snapshot: { [Op.ne]: null } }, 'sensor');
+  where = applyDateRangeToWhere(where, 'captured_at', range);
+  if (req.query.toiletUnitId || req.query.toiletId) {
+    const toiletUnitId = req.query.toiletUnitId || req.query.toiletId;
+    await resolveToiletInScope(req, toiletUnitId);
+    where.toilet_unit_id = toiletUnitId;
+  }
+  if (req.query.facilityId && isUuid(req.query.facilityId)) {
+    where.facility_id = req.query.facilityId;
+  }
+
+  // Optional provenance filter: 'synthetic' (backfilled only) | 'real' (live-linked only) | 'all'.
+  const sourceFilter = String(req.query.snapshotSource || 'all').trim().toLowerCase();
+
+  // Cap the scan, then aggregate into one point PER DAY so the chart payload and
+  // render stay light (≈ number of days, not number of inspections). The badge
+  // counts come from the aggregated totals, so they stay accurate.
+  const limit = Math.min(Number(req.query.limit || 2000), 5000);
+  const inspections = await Inspection.findAll({
+    where,
+    attributes: ['captured_at', 'sensor_snapshot'],
+    order: [['captured_at', 'ASC']],
+    limit,
+    raw: true,
+  });
+
+  const buckets = new Map(); // dayKey -> { sum, count, min, max, synthetic }
+  let totalCount = 0;
+  let syntheticTotal = 0;
+  for (const inspection of inspections) {
+    const snapshot = inspection.sensor_snapshot || {};
+    const isSynthetic = snapshot.isSynthetic === true || snapshot.isBackfilled === true;
+    if (sourceFilter === 'synthetic' && !isSynthetic) continue;
+    if (sourceFilter === 'real' && isSynthetic) continue;
+
+    const metrics = toSensorMetrics(snapshot);
+    const rawValue = metricKey === 'score' ? metrics.score : metrics[metricKey];
+    if (rawValue === null || rawValue === undefined || !Number.isFinite(Number(rawValue))) continue;
+
+    const value = Number(rawValue);
+    const day = (toIso(inspection.captured_at) || '').slice(0, 10); // YYYY-MM-DD
+    if (!day) continue;
+    let bucket = buckets.get(day);
+    if (!bucket) {
+      bucket = { sum: 0, count: 0, min: value, max: value, synthetic: 0 };
+      buckets.set(day, bucket);
+    }
+    bucket.sum += value;
+    bucket.count += 1;
+    bucket.min = Math.min(bucket.min, value);
+    bucket.max = Math.max(bucket.max, value);
+    if (isSynthetic) bucket.synthetic += 1;
+    totalCount += 1;
+    if (isSynthetic) syntheticTotal += 1;
+  }
+
+  const round = (n) => Number(Number(n).toFixed(metricConfig.precision));
+  const points = [...buckets.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([day, bucket]) => ({
+      timestamp: `${day}T00:00:00.000Z`,
+      day,
+      avg: round(bucket.sum / bucket.count),
+      min: round(bucket.min),
+      max: round(bucket.max),
+      count: bucket.count,
+      syntheticCount: bucket.synthetic,
+      isSynthetic: bucket.synthetic > 0,
+    }));
+
+  return {
+    sourceType: 'inspection_sensor_snapshots',
+    sourceLabel: 'Inspection snapshots',
+    metric: metricConfig,
+    granularity: 'daily',
+    range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
+    count: totalCount,
+    syntheticCount: syntheticTotal,
+    realCount: totalCount - syntheticTotal,
+    availableMetrics: Object.values(SNAPSHOT_METRICS).map((m) => ({ key: m.key, label: m.label, unit: m.unit })),
+    points,
+  };
+};
+
 module.exports = {
   ingestSensorReading,
   registerSensor,
@@ -1736,6 +1851,7 @@ module.exports = {
   getSensorTimeSeries,
   getSensorComparison,
   getImageLinkedSensorEvidence,
+  getInspectionSnapshotTrends,
   getToiletSensorAnalysis,
   checkSensorOfflineAlerts,
 };

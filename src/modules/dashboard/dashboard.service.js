@@ -494,21 +494,6 @@ const getWorkforce = async (req) => {
     ],
   };
 
-  const scopedTaskRows = await InspectionTask.findAll({
-    where: scopedTaskWhere,
-    attributes: [
-      'assigned_to_user_id',
-      'facility_id',
-      'toilet_unit_id',
-      'status',
-      'scheduled_at',
-      'started_at',
-      'completed_at',
-      'created_at',
-    ],
-    raw: true,
-  });
-
   const assignmentScopeWhere = applyScopeToQuery(
     scopedTenantWhere(req, { status: 'active' }),
     buildAccessContextFromUser(req?.user || {}),
@@ -519,11 +504,30 @@ const getWorkforce = async (req) => {
       facilityKey: 'facility_id',
     },
   );
-  const scopedAssignmentRows = await WorkerAssignment.findAll({
-    where: assignmentScopeWhere,
-    attributes: ['user_id', 'supervisor_user_id', 'geography_id', 'facility_id', 'toilet_unit_id'],
-    raw: true,
-  });
+
+  // These two scans are independent — run them together to save a round-trip to
+  // the (remote) database instead of awaiting them one after another.
+  const [scopedTaskRows, scopedAssignmentRows] = await Promise.all([
+    InspectionTask.findAll({
+      where: scopedTaskWhere,
+      attributes: [
+        'assigned_to_user_id',
+        'facility_id',
+        'toilet_unit_id',
+        'status',
+        'scheduled_at',
+        'started_at',
+        'completed_at',
+        'created_at',
+      ],
+      raw: true,
+    }),
+    WorkerAssignment.findAll({
+      where: assignmentScopeWhere,
+      attributes: ['user_id', 'supervisor_user_id', 'geography_id', 'facility_id', 'toilet_unit_id'],
+      raw: true,
+    }),
+  ]);
 
   const taskWorkerIds = uniqueIds(scopedTaskRows.map((row) => row.assigned_to_user_id));
   const assignmentWorkerIds = uniqueIds(scopedAssignmentRows.map((row) => row.user_id));
