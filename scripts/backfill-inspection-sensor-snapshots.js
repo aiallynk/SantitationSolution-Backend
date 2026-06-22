@@ -6,6 +6,8 @@ const path = require('path');
 const { Op } = require('sequelize');
 const {
   generateSyntheticSensorSnapshot,
+  isUtcMidnight,
+  resolveInspectionTime,
   toNumberOrNull,
 } = require('../src/modules/sensors/syntheticSensorBackfill.generator');
 const { verifyBackupDirectory } = require('./backup-database');
@@ -248,6 +250,32 @@ const chooseInspectionScore = ({ inspection, mediaRows = [], allowStatusFallback
   return null;
 };
 
+const asDateOrNull = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const pickMediaCapturedAt = (mediaRows = []) => {
+  const candidates = mediaRows
+    .map((row) => asDateOrNull(row.captured_at))
+    .filter(Boolean)
+    .sort((left, right) => left.getTime() - right.getTime());
+  return candidates.find((date) => !isUtcMidnight(date)) || candidates[0] || null;
+};
+
+const inspectionTimeSource = ({ inspection, mediaCapturedAt, resolvedAt }) => {
+  const resolved = asDateOrNull(resolvedAt);
+  if (!resolved) return null;
+  const captured = asDateOrNull(inspection.captured_at);
+  if (captured && captured.getTime() === resolved.getTime()) return 'inspections.captured_at';
+  const media = asDateOrNull(mediaCapturedAt);
+  if (media && media.getTime() === resolved.getTime()) return 'inspection_media.captured_at';
+  const submitted = asDateOrNull(inspection.submitted_at);
+  if (submitted && submitted.getTime() === resolved.getTime()) return 'inspections.submitted_at';
+  return null;
+};
+
 const isDraftOrIncomplete = (inspection) => {
   const status = String(inspection.status || '').trim().toLowerCase();
   const processing = String(inspection.processing_status || '').trim().toLowerCase();
@@ -329,12 +357,12 @@ const loadCandidateData = async ({ dateRange, tenantId = null }) => {
   const mediaByInspection = new Map();
   if (inspectionIds.length > 0) {
     const mediaRows = await InspectionMedia.findAll({
-      attributes: ['inspection_id', 'capture_stage', 'overall_score'],
+      attributes: ['inspection_id', 'capture_stage', 'captured_at', 'overall_score'],
       where: {
         inspection_id: { [Op.in]: inspectionIds },
-        overall_score: { [Op.not]: null },
         scoring_rejected: { [Op.not]: true },
       },
+      order: [['captured_at', 'ASC NULLS LAST']],
       raw: true,
     });
     for (const media of mediaRows) {
@@ -385,6 +413,17 @@ const buildBackfillPlan = ({
 
   for (const inspection of inspections) {
     const mediaRows = mediaByInspection.get(inspection.id) || [];
+    const mediaCapturedAt = pickMediaCapturedAt(mediaRows);
+    const resolvedInspectionTime = resolveInspectionTime({
+      capturedAt: inspection.captured_at,
+      submittedAt: inspection.submitted_at,
+      mediaCapturedAt,
+    });
+    const resolvedInspectionTimeSource = inspectionTimeSource({
+      inspection,
+      mediaCapturedAt,
+      resolvedAt: resolvedInspectionTime,
+    });
     const classification = classifyInspection({
       inspection,
       mediaRows,
@@ -400,6 +439,8 @@ const buildBackfillPlan = ({
         facilityId: inspection.facility_id,
         toiletUnitId: inspection.toilet_unit_id,
         capturedAt: inspection.captured_at,
+        inspectionTime: resolvedInspectionTime,
+        inspectionTimeSource: resolvedInspectionTimeSource,
         reason: classification.reason,
       });
       continue;
@@ -414,6 +455,7 @@ const buildBackfillPlan = ({
       toiletUnitId: inspection.toilet_unit_id,
       capturedAt: inspection.captured_at,
       submittedAt: inspection.submitted_at,
+      mediaCapturedAt,
       selectedScore: selected.score,
       scoreSourceField: selected.sourceField,
       batchId: args.batchId,
@@ -428,6 +470,8 @@ const buildBackfillPlan = ({
       toiletUnitId: inspection.toilet_unit_id,
       capturedAt: inspection.captured_at,
       submittedAt: inspection.submitted_at,
+      inspectionTime: resolvedInspectionTime,
+      inspectionTimeSource: resolvedInspectionTimeSource,
       status: inspection.status,
       processingStatus: inspection.processing_status,
       avgBeforeScore: toNumberOrNull(inspection.avg_before_score),
@@ -497,6 +541,8 @@ const proposedCsvRows = (rows) => rows.map((row) => ({
   facilityId: row.facilityId,
   toiletUnitId: row.toiletUnitId,
   capturedAt: row.capturedAt,
+  inspectionTime: row.inspectionTime,
+  inspectionTimeSource: row.inspectionTimeSource,
   scoreSourceField: row.scoreSourceField,
   scoreUsed: row.scoreUsed,
   scoreBand: row.scoreBand,
@@ -520,6 +566,8 @@ const writeDryRunArtifacts = ({ outDir, plan }) => {
     'facilityId',
     'toiletUnitId',
     'capturedAt',
+    'inspectionTime',
+    'inspectionTimeSource',
     'scoreSourceField',
     'scoreUsed',
     'scoreBand',
@@ -537,6 +585,8 @@ const writeDryRunArtifacts = ({ outDir, plan }) => {
     'facilityId',
     'toiletUnitId',
     'capturedAt',
+    'inspectionTime',
+    'inspectionTimeSource',
     'reason',
   ]);
   fs.writeFileSync(
@@ -616,6 +666,8 @@ const exportPreApplyBackup = ({ outDir, proposedRows, batchId }) => {
       toiletUnitId: row.toiletUnitId,
       capturedAt: row.capturedAt,
       submittedAt: row.submittedAt,
+      inspectionTime: row.inspectionTime,
+      inspectionTimeSource: row.inspectionTimeSource,
       status: row.status,
       processingStatus: row.processingStatus,
       avgBeforeScore: row.avgBeforeScore,
@@ -970,6 +1022,7 @@ module.exports = {
   isSuspiciousOrFailed,
   loadCandidateData,
   outputDirectory,
+  pickMediaCapturedAt,
   parseArgs,
   readDryRunArtifacts,
   resolveIstDateRange,

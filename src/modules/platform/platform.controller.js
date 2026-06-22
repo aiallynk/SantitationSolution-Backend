@@ -214,6 +214,33 @@ const postToiletUnit = async (req, res, next) => {
   }
 };
 
+const patchToiletUnitDeactivate = async (req, res, next) => {
+  try {
+    const row = await platformService.deactivateToiletUnit(req);
+    return sendSuccess(res, { message: 'Toilet deactivated successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const patchToiletUnitReactivate = async (req, res, next) => {
+  try {
+    const row = await platformService.reactivateToiletUnit(req);
+    return sendSuccess(res, { message: 'Toilet reactivated successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deleteToiletUnit = async (req, res, next) => {
+  try {
+    const row = await platformService.softDeleteToiletUnit(req);
+    return sendSuccess(res, { message: 'Toilet removed from tenant frontend successfully', data: row });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postToiletUnitsBulk = async (req, res, next) => {
   try {
     const data = await platformService.createUnitsBulk(req);
@@ -303,6 +330,9 @@ module.exports = {
   getToiletUnitByQr,
   postToiletUnitByQr,
   postToiletUnit,
+  patchToiletUnitDeactivate,
+  patchToiletUnitReactivate,
+  deleteToiletUnit,
   postToiletUnitsBulk,
   getToiletInspections,
   getToiletDetails,

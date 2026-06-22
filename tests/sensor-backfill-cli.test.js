@@ -166,6 +166,49 @@ test('classification skips protected rows before generating snapshots', () => {
   );
 });
 
+test('backfill plan uses media capture time when inspection captured_at is date-only', () => {
+  const dateRange = resolveIstDateRange({ fromIst: '2026-05-01', toIst: '2026-06-20' });
+  const plan = buildBackfillPlan({
+    inspections: [
+      {
+        ...baseInspection,
+        captured_at: '2026-05-10T00:00:00.000Z',
+        submitted_at: '2026-05-10T12:30:00.000Z',
+        avg_after_score: '82.00',
+      },
+    ],
+    mediaByInspection: new Map([
+      [
+        baseInspection.id,
+        [
+          {
+            inspection_id: baseInspection.id,
+            capture_stage: 'after',
+            captured_at: '2026-05-10T09:42:00.000Z',
+            overall_score: '82',
+          },
+        ],
+      ],
+    ]),
+    args: {
+      batchId: 'sensor-history-20260501-20260620-v1',
+      allTenants: true,
+      tenantId: null,
+      apply: false,
+      allowStatusFallback: false,
+      includeSuspicious: false,
+      includeDrafts: false,
+      limit: null,
+    },
+    dateRange,
+    generatedAt: '2026-06-20T08:22:38.734Z',
+  });
+
+  assert.equal(plan.proposed[0].inspectionTime.toISOString(), '2026-05-10T09:42:00.000Z');
+  assert.equal(plan.proposed[0].inspectionTimeSource, 'inspection_media.captured_at');
+  assert.equal(plan.proposed[0].generatedSensorSnapshot.readingTime, '2026-05-10T09:42:00.000Z');
+});
+
 test('rollback guard only accepts matching synthetic snapshots from the same batch', () => {
   const snapshot = {
     isSynthetic: true,

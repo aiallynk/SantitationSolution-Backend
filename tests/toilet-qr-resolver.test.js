@@ -9,7 +9,11 @@ const {
   resolveToiletFromQr,
   buildAutoToiletId,
 } = require('../src/modules/platform/platform.service');
-const { ToiletUnit, sequelize } = require('../src/models');
+const { ToiletUnit, WorkerAssignment, sequelize } = require('../src/models');
+
+test.after(async () => {
+  await sequelize.close().catch(() => null);
+});
 
 test('extractQrCandidates handles malformed payload safely', () => {
   const malformed = '{"qrCode":"FAC-1"';
@@ -91,6 +95,26 @@ test('classifyResolvedToilet returns inactive reason', () => {
   assert.equal(result, QR_RESOLVE_REASON_CODES.TOILET_INACTIVE);
 });
 
+test('classifyResolvedToilet returns deleted reason before inactive checks', () => {
+  const req = {
+    user: {
+      isSuperAdmin: false,
+      scopeLevel: 'facility',
+      scopeFacilityIds: ['facility-1'],
+    },
+  };
+  const row = {
+    id: 'unit-1',
+    status: 'out_of_service',
+    deleted_at: new Date('2026-06-22T08:00:00.000Z'),
+    facility_id: 'facility-1',
+    Facility: { id: 'facility-1', status: 'active' },
+  };
+
+  const result = classifyResolvedToilet({ row, req });
+  assert.equal(result, QR_RESOLVE_REASON_CODES.TOILET_DELETED);
+});
+
 test('classifyResolvedToilet returns out-of-scope reason', () => {
   const req = {
     user: {
@@ -119,6 +143,7 @@ test('reason codes include unmapped and resolved outcomes', () => {
     QR_RESOLVE_REASON_CODES.QR_RESOLVED_SUCCESSFULLY,
     'QR_RESOLVED_SUCCESSFULLY',
   );
+  assert.equal(QR_RESOLVE_REASON_CODES.TOILET_DELETED, 'TOILET_DELETED');
 });
 
 test('resolveToiletFromQr resolves mapped toilet QR', async (t) => {
@@ -152,9 +177,10 @@ test('resolveToiletFromQr resolves mapped toilet QR', async (t) => {
   const req = {
     requestId: 'req-1',
     user: {
-      id: 'worker-1',
+      id: '11111111-1111-4111-8111-111111111111',
       tenantId: 'tenant-1',
       isSuperAdmin: false,
+      roleCodes: ['supervisor'],
       scopeLevel: 'facility',
       scopeFacilityIds: ['facility-1'],
     },
@@ -202,8 +228,9 @@ test('resolveToiletFromQr returns QR_NOT_MAPPED when no lookup match exists', as
   assert.equal(result.reasonCode, QR_RESOLVE_REASON_CODES.QR_NOT_MAPPED);
 });
 
-test('resolveToiletFromQr returns TOILET_NOT_IN_USER_SCOPE for real but unauthorized toilet', async (t) => {
+test('resolveToiletFromQr returns TENANT_MISMATCH for another tenant toilet', async (t) => {
   const originalFindAll = ToiletUnit.findAll;
+  const originalAssignmentFindAll = WorkerAssignment.findAll;
   ToiletUnit.findAll = async () => [
     {
       id: 'unit-2',
@@ -215,21 +242,23 @@ test('resolveToiletFromQr returns TOILET_NOT_IN_USER_SCOPE for real but unauthor
       status: 'moderate',
       Facility: {
         id: 'facility-2',
-        tenant_id: 'tenant-1',
+        tenant_id: 'tenant-2',
         code: 'FAC-009',
         name: 'Cross Zone',
         status: 'active',
       },
     },
   ];
+  WorkerAssignment.findAll = async () => [];
   t.after(() => {
     ToiletUnit.findAll = originalFindAll;
+    WorkerAssignment.findAll = originalAssignmentFindAll;
   });
 
   const req = {
     requestId: 'req-3',
     user: {
-      id: 'worker-3',
+      id: '33333333-3333-4333-8333-333333333333',
       tenantId: 'tenant-1',
       isSuperAdmin: false,
       scopeLevel: 'facility',
@@ -244,10 +273,7 @@ test('resolveToiletFromQr returns TOILET_NOT_IN_USER_SCOPE for real but unauthor
   });
 
   assert.equal(result.resolved, false);
-  assert.equal(
-    result.reasonCode,
-    QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE
-  );
+  assert.equal(result.reasonCode, QR_RESOLVE_REASON_CODES.TENANT_MISMATCH);
 });
 
 test('resolveToiletFromQr returns INVALID_QR_FORMAT for empty payload', async () => {

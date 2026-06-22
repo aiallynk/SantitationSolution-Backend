@@ -53,6 +53,40 @@ const scopedFacilityEntityWhere = (req, where = {}) => {
   });
 };
 
+const loadDeletedToiletIdsForScope = async (req) => {
+  const rows = await ToiletUnit.findAll({
+    where: { deleted_at: { [Op.not]: null } },
+    attributes: ['id'],
+    include: [
+      {
+        model: Facility,
+        attributes: [],
+        required: true,
+        where: scopedFacilityEntityWhere(req),
+      },
+    ],
+    raw: true,
+  });
+  return uniqueIds(rows.map((row) => row.id));
+};
+
+const excludeDeletedToiletsFromInspectionWhere = (where = {}, deletedToiletIds = []) => {
+  if (!deletedToiletIds.length) return where;
+  const existingAnd = Array.isArray(where[Op.and]) ? where[Op.and] : [];
+  return {
+    ...where,
+    [Op.and]: [
+      ...existingAnd,
+      {
+        [Op.or]: [
+          { toilet_unit_id: { [Op.is]: null } },
+          { toilet_unit_id: { [Op.notIn]: deletedToiletIds } },
+        ],
+      },
+    ],
+  };
+};
+
 const buildTimestampFilter = ({ start = null, end = null } = {}) => {
   const filter = {};
   if (start) filter[Op.gte] = start;
@@ -81,6 +115,21 @@ const toTimestamp = (value) => {
 const toIsoOrNull = (value) => {
   const time = toTimestamp(value);
   return time == null ? null : new Date(time).toISOString();
+};
+
+const toIstDateKey = (value) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
 };
 
 const pickEarlierIso = (left, right) => {
@@ -135,15 +184,21 @@ const getOverview = async (req) => {
     'geography',
     { tenantKey: 'tenant_id', geographyKey: 'geography_id' },
   );
+  const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
 
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const inspectionActivityFilter = dateRange.provided
+  const fallbackTodayRange = resolveDateRange({ range: 'today' }, { maxDays: 1 });
+  const inspectionActivityFilter = excludeDeletedToiletsFromInspectionWhere(
+    dateRange.provided
     ? applyDateRangeToWhere(inspectionTenantFilter, 'captured_at', dateRange)
-    : { ...inspectionTenantFilter, created_at: { [Op.gte]: todayStart } };
-  const analysisInspectionFilter = dateRange.provided
+    : { ...inspectionTenantFilter, created_at: { [Op.gte]: fallbackTodayRange.start } },
+    deletedToiletIds,
+  );
+  const analysisInspectionFilter = excludeDeletedToiletsFromInspectionWhere(
+    dateRange.provided
     ? applyDateRangeToWhere(inspectionTenantFilter, 'captured_at', dateRange)
-    : inspectionTenantFilter;
+    : inspectionTenantFilter,
+    deletedToiletIds,
+  );
   const alertActivityFilter = dateRange.provided
     ? applyDateRangeToWhere(alertTenantFilter, 'created_at', dateRange)
     : alertTenantFilter;
@@ -223,8 +278,9 @@ const getMap = async (req) => {
   const latestAnalysisByFacility = {};
 
   if (facilityIds.length > 0) {
+    const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
     const inspections = await Inspection.findAll({
-      where: { facility_id: { [Op.in]: facilityIds } },
+      where: excludeDeletedToiletsFromInspectionWhere({ facility_id: { [Op.in]: facilityIds } }, deletedToiletIds),
       include: [{ model: AiAnalysisResult }],
       order: [['captured_at', 'DESC']],
     });
@@ -255,11 +311,12 @@ const getMap = async (req) => {
 
 const getHeatmap = async (req) => {
   const dateRange = resolveDateRange(req.query, { maxDays: 90 });
+  const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
   const north = toNumber(req.query.north, null);
   const south = toNumber(req.query.south, null);
   const east = toNumber(req.query.east, null);
   const west = toNumber(req.query.west, null);
-  const where = applyDateRangeToWhere(
+  const where = excludeDeletedToiletsFromInspectionWhere(applyDateRangeToWhere(
     {
       ...scopedFacilityWhere(req),
       latitude: Number.isFinite(south) && Number.isFinite(north)
@@ -271,7 +328,7 @@ const getHeatmap = async (req) => {
     },
     'captured_at',
     dateRange,
-  );
+  ), deletedToiletIds);
 
   const inspections = await Inspection.findAll({
     where,
@@ -306,10 +363,11 @@ const getFacilityDashboard = async (req) => {
   if (!facility) return null;
   if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) return null;
   if (!isFacilityInScope(req, facility.id)) return null;
+  const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
 
   const [inspections, alerts, tasks, complaints] = await Promise.all([
     Inspection.findAll({
-      where: scopedFacilityWhere(req, { facility_id: facilityId }),
+      where: excludeDeletedToiletsFromInspectionWhere(scopedFacilityWhere(req, { facility_id: facilityId }), deletedToiletIds),
       include: [{ model: AiAnalysisResult }, { model: InspectionMedia }],
       order: [['captured_at', 'DESC']],
       limit: 20,
@@ -386,7 +444,6 @@ const getTrends = async (req) => {
   const dateRange = resolveDateRange(req.query, { defaultDays: 14, maxDays: 90 });
   const days = dateRange.days || 14;
   const start = dateRange.start || new Date();
-  start.setHours(0, 0, 0, 0);
 
   const replacements = {
     start,
@@ -412,16 +469,18 @@ const getTrends = async (req) => {
   const rows = await sequelize.query(
     `
       SELECT
-        DATE(i.captured_at) AS label,
+        DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata') AS label,
         COUNT(i.id)::int AS "inspectionCount",
         COALESCE(AVG(a.cleanliness_score), 0)::numeric AS "avgCleanliness"
       FROM inspections i
       LEFT JOIN ai_analysis_results a ON a.inspection_id = i.id
+      LEFT JOIN toilet_units tu ON tu.id = i.toilet_unit_id
       WHERE i.captured_at >= :start
+        AND (i.toilet_unit_id IS NULL OR tu.deleted_at IS NULL)
         ${tenantClause}
         ${facilityClause}
-      GROUP BY DATE(i.captured_at)
-      ORDER BY DATE(i.captured_at) ASC
+      GROUP BY DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata')
+      ORDER BY DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata') ASC
     `,
     {
       replacements,
@@ -429,12 +488,11 @@ const getTrends = async (req) => {
     }
   );
 
-  const map = new Map(rows.map((row) => [String(row.label), row]));
+  const map = new Map(rows.map((row) => [toIstDateKey(row.label) || String(row.label).slice(0, 10), row]));
   const points = [];
   for (let i = 0; i < days; i += 1) {
-    const current = new Date(start);
-    current.setDate(start.getDate() + i);
-    const label = current.toISOString().slice(0, 10);
+    const current = new Date(start.getTime() + i * 86_400_000);
+    const label = toIstDateKey(current);
     const row = map.get(label);
     points.push({
       label,
@@ -446,8 +504,7 @@ const getTrends = async (req) => {
 };
 
 const getWorkforce = async (req) => {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
+  const todayStart = resolveDateRange({ range: 'today' }, { maxDays: 1 }).start || new Date();
 
   const lookbackRaw = Number(req.query.activityDays || 7);
   const activityLookbackDays = Number.isFinite(lookbackRaw)

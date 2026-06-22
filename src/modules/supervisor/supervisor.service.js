@@ -164,20 +164,13 @@ const haversineMeters = (left, right) => {
 
 const resolveDateWindow = (query = {}, { defaultDays = 1, maxDays = 90 } = {}) => {
   if (query.date) {
-    const start = new Date(query.date);
-    if (!Number.isNaN(start.getTime())) {
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
-      end.setHours(23, 59, 59, 999);
-      return {
-        provided: true,
-        range: 'date',
-        label: start.toISOString().slice(0, 10),
-        days: 1,
-        start,
-        end,
-      };
-    }
+    const range = resolveDateRange({ from: query.date, to: query.date }, { maxDays });
+    return {
+      ...range,
+      range: 'date',
+      label: String(query.date).slice(0, 10),
+      days: 1,
+    };
   }
   return resolveDateRange(query, { defaultDays, maxDays });
 };
@@ -198,6 +191,47 @@ const withDateField = (where, field, range) => {
       ...(range.end ? { [Op.lte]: range.end } : {}),
     },
   };
+};
+
+const excludeDeletedToiletsFromWhere = (where = {}, deletedToiletIds = []) => {
+  if (!deletedToiletIds.length) return where;
+  const existingAnd = Array.isArray(where[Op.and]) ? where[Op.and] : [];
+  return {
+    ...where,
+    [Op.and]: [
+      ...existingAnd,
+      {
+        [Op.or]: [
+          { toilet_unit_id: { [Op.is]: null } },
+          { toilet_unit_id: { [Op.notIn]: deletedToiletIds } },
+        ],
+      },
+    ],
+  };
+};
+
+const loadDeletedToiletIdsForSupervisorScope = async (req, scope = {}) => {
+  const facilityIds = uniqueIds(scope.facilityIds || []);
+  const where = { deleted_at: { [Op.not]: null } };
+  if (facilityIds.length > 0) where.facility_id = { [Op.in]: facilityIds };
+
+  const rows = await ToiletUnit.findAll({
+    where,
+    attributes: ['id'],
+    include:
+      facilityIds.length > 0
+        ? []
+        : [
+            {
+              model: Facility,
+              attributes: [],
+              required: true,
+              where: tenantWhere(req),
+            },
+          ],
+    raw: true,
+  });
+  return uniqueIds(rows.map((row) => row.id));
 };
 
 const normalizePlain = (row) =>
@@ -659,6 +693,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
       alerts: [],
     };
   }
+  const deletedToiletIds = await loadDeletedToiletIdsForSupervisorScope(req, scope);
 
   const workerRows = await PlatformUser.findAll({
     where: {
@@ -687,7 +722,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
         });
   const facilityById = new Map(facilityRows.map((facility) => [String(facility.id), facility]));
 
-  const taskWhere = withDateField(
+  let taskWhere = withDateField(
     tenantWhere(req, { assigned_to_user_id: { [Op.in]: activeWorkerIds } }),
     'scheduled_at',
     range
@@ -695,6 +730,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
   if (scope.facilityIds.length > 0) {
     taskWhere.facility_id = { [Op.in]: scope.facilityIds };
   }
+  taskWhere = excludeDeletedToiletsFromWhere(taskWhere, deletedToiletIds);
 
   const taskRows = await InspectionTask.findAll({
     where: taskWhere,
@@ -767,7 +803,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
     worker.lastSeenAt = pickLaterIso(worker.lastSeenAt, mappedTask.completionTime || mappedTask.startTime || mappedTask.scheduledAt);
   }
 
-  const inspectionWhere = withDateField(
+  let inspectionWhere = withDateField(
     tenantWhere(req, { inspector_user_id: { [Op.in]: activeWorkerIds } }),
     'captured_at',
     range
@@ -775,6 +811,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
   if (scope.facilityIds.length > 0) {
     inspectionWhere.facility_id = { [Op.in]: scope.facilityIds };
   }
+  inspectionWhere = excludeDeletedToiletsFromWhere(inspectionWhere, deletedToiletIds);
 
   const inspectionRows = await Inspection.findAll({
     where: inspectionWhere,
@@ -1110,10 +1147,35 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
     order: [['created_at', 'DESC']],
     limit: 500,
   });
+  const deletedInspectionIds =
+    deletedToiletIds.length > 0 && alertRows.length > 0
+      ? new Set(
+          (
+            await Inspection.findAll({
+              where: {
+                id: {
+                  [Op.in]: uniqueIds(
+                    alertRows
+                      .map((alert) => normalizePlain(alert))
+                      .filter((alert) => alert.source_type === 'ai_analysis')
+                      .map((alert) => alert.source_id)
+                  ),
+                },
+                toilet_unit_id: { [Op.in]: deletedToiletIds },
+              },
+              attributes: ['id'],
+              raw: true,
+            })
+          ).map((row) => String(row.id))
+        )
+      : new Set();
 
   const actualAlerts = [];
   for (const alertModel of alertRows) {
     const alert = normalizePlain(alertModel);
+    if (alert.source_type === 'ai_analysis' && deletedInspectionIds.has(String(alert.source_id || ''))) {
+      continue;
+    }
     const worker =
       workersById.get(String(alert.assigned_to_user_id || '')) ||
       [...workersById.values()].find((candidate) => candidate.facilityIds.has(String(alert.facility_id || ''))) ||
@@ -1372,14 +1434,17 @@ const latestHeartbeatByWorker = async ({ tenantId, workerIds }) => {
   return latest;
 };
 
-const activeTaskCountByWorker = async ({ tenantId, workerIds }) => {
+const activeTaskCountByWorker = async ({ tenantId, workerIds, deletedToiletIds = [] }) => {
   if (workerIds.length === 0) return new Map();
   const rows = await InspectionTask.findAll({
-    where: {
-      tenant_id: tenantId,
-      assigned_to_user_id: { [Op.in]: workerIds },
-      status: { [Op.in]: ACTIVE_TASK_STATUSES },
-    },
+    where: excludeDeletedToiletsFromWhere(
+      {
+        tenant_id: tenantId,
+        assigned_to_user_id: { [Op.in]: workerIds },
+        status: { [Op.in]: ACTIVE_TASK_STATUSES },
+      },
+      deletedToiletIds,
+    ),
     attributes: ['assigned_to_user_id'],
     raw: true,
   });
@@ -1533,18 +1598,22 @@ const getLiveMap = async (req) => {
   if (scopedFacilityIds.length === 0 && !req.user?.isSuperAdmin) {
     return emptyPayload;
   }
+  const deletedToiletIds = await loadDeletedToiletIdsForSupervisorScope(req, scope);
 
   const facilityFilter =
     scopedFacilityIds.length > 0 ? { facility_id: { [Op.in]: scopedFacilityIds } } : {};
   const taskRows = await InspectionTask.findAll({
-    where: tenantWhere(req, {
-      ...facilityFilter,
-      status: { [Op.in]: ACTIVE_TASK_STATUSES },
-      [Op.or]: [
-        { task_type: CRITICAL_COMPLAINT_TASK_TYPE },
-        { priority: 'critical' },
-      ],
-    }),
+    where: excludeDeletedToiletsFromWhere(
+      tenantWhere(req, {
+        ...facilityFilter,
+        status: { [Op.in]: ACTIVE_TASK_STATUSES },
+        [Op.or]: [
+          { task_type: CRITICAL_COMPLAINT_TASK_TYPE },
+          { priority: 'critical' },
+        ],
+      }),
+      deletedToiletIds,
+    ),
     include: [
       { model: Facility, attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude'], required: false },
       { model: ToiletUnit, attributes: ['id', 'code', 'location_label', 'latitude', 'longitude'], required: false },
@@ -1568,7 +1637,7 @@ const getLiveMap = async (req) => {
     status: { [Op.in]: ['open', 'assigned'] },
   });
   const complaintRows = await Complaint.findAll({
-    where: complaintWhere,
+    where: excludeDeletedToiletsFromWhere(complaintWhere, deletedToiletIds),
     include: [
       { model: Facility, attributes: ['id', 'name', 'code', 'address_line', 'latitude', 'longitude'], required: false },
       { model: ToiletUnit, attributes: ['id', 'code', 'location_label', 'latitude', 'longitude'], required: false },
@@ -1600,7 +1669,7 @@ const getLiveMap = async (req) => {
         })
       : [],
     latestHeartbeatByWorker({ tenantId, workerIds: activeWorkerIds }),
-    activeTaskCountByWorker({ tenantId, workerIds: activeWorkerIds }),
+    activeTaskCountByWorker({ tenantId, workerIds: activeWorkerIds, deletedToiletIds }),
     tasksPlain.length > 0
       ? TaskAssignmentLog.findAll({
           where: {

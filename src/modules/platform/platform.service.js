@@ -42,6 +42,15 @@ const tenantScope = (req, requestedTenantId) => {
   return req.user.tenantId;
 };
 
+const activeToiletWhere = (where = {}) => ({
+  ...where,
+  deleted_at: { [Op.is]: null },
+});
+
+const shouldIncludeDeletedToilets = (req) =>
+  req?.user?.isSuperAdmin &&
+  String(req?.query?.includeDeleted || '').trim().toLowerCase() === 'true';
+
 const withTenantScope = (req, where = {}, tenantKey = 'tenant_id') => {
   return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
     tenantKey,
@@ -965,6 +974,8 @@ const QR_RESOLVE_REASON_CODES = Object.freeze({
   QR_NOT_MAPPED: 'QR_NOT_MAPPED',
   TOILET_NOT_FOUND: 'TOILET_NOT_FOUND',
   TOILET_INACTIVE: 'TOILET_INACTIVE',
+  TOILET_DELETED: 'TOILET_DELETED',
+  TOILET_UNAVAILABLE: 'TOILET_UNAVAILABLE',
   TOILET_NOT_IN_USER_SCOPE: 'TOILET_NOT_IN_USER_SCOPE',
   TENANT_MISMATCH: 'TENANT_MISMATCH',
   ORG_MISMATCH: 'ORG_MISMATCH',
@@ -986,7 +997,11 @@ const QR_RESOLVE_MESSAGES = {
   [QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND]:
     'Toilet not found for this QR.',
   [QR_RESOLVE_REASON_CODES.TOILET_INACTIVE]:
-    'This toilet is inactive. Contact your supervisor.',
+    'This toilet is inactive.',
+  [QR_RESOLVE_REASON_CODES.TOILET_DELETED]:
+    'This toilet is no longer available for inspection.',
+  [QR_RESOLVE_REASON_CODES.TOILET_UNAVAILABLE]:
+    'This toilet is no longer available for inspection.',
   [QR_RESOLVE_REASON_CODES.TOILET_NOT_IN_USER_SCOPE]:
     'QR recognized, but this toilet is not assigned to you.',
   [QR_RESOLVE_REASON_CODES.TENANT_MISMATCH]:
@@ -1059,6 +1074,8 @@ const isToiletInactive = (row) => {
   return unitStatus === 'out_of_service' || unitStatus === 'inactive';
 };
 
+const isToiletDeleted = (row) => Boolean(row?.deleted_at || row?.deletedAt);
+
 const extractLikelyIdentifier = (candidates = []) => {
   if (!Array.isArray(candidates) || candidates.length === 0) {
     return null;
@@ -1118,6 +1135,9 @@ const isPrivilegedRoleForQrResolve = (req) => {
 const classifyResolvedToilet = ({ row, req }) => {
   if (!row) {
     return QR_RESOLVE_REASON_CODES.TOILET_NOT_FOUND;
+  }
+  if (isToiletDeleted(row)) {
+    return QR_RESOLVE_REASON_CODES.TOILET_DELETED;
   }
   if (isToiletInactive(row)) {
     return QR_RESOLVE_REASON_CODES.TOILET_INACTIVE;
@@ -1331,6 +1351,10 @@ const mapUnitRow = (row, options = {}) => {
     publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: row.id }),
     unitType: row.unit_type,
     status: row.status,
+    isActive: !isToiletDeleted(row) && !isToiletInactive(row),
+    deactivatedAt: row.deactivated_at || null,
+    deletedAt: row.deleted_at || null,
+    lifecycleReason: row.lifecycle_reason || null,
     sectorCode:
       row.sector_code ||
       row.Facility?.metadata?.sector ||
@@ -1823,6 +1847,20 @@ const resolveToiletFromQr = async ({
       rawQrValue: rawInput,
       normalizedQrValue: normalizedInput,
       parsed: parsedMeta,
+    });
+  }
+
+  if (isToiletDeleted(selectedToilet)) {
+    return buildQrResolveResult({
+      status: 'failed',
+      reasonCode: QR_RESOLVE_REASON_CODES.TOILET_DELETED,
+      rawQrValue: rawInput,
+      normalizedQrValue: normalizedInput,
+      parsed: parsedMeta,
+      details: {
+        toiletUnitId: selectedToilet.id,
+        unitStatus: selectedToilet.status,
+      },
     });
   }
 
@@ -2823,7 +2861,7 @@ const getFacilityById = async (req) => {
 
   const [blocks, units] = await Promise.all([
     ToiletBlock.findAll({ where: { facility_id: facility.id }, order: [['name', 'ASC']] }),
-    ToiletUnit.findAll({ where: { facility_id: facility.id }, order: [['code', 'ASC']] }),
+    ToiletUnit.findAll({ where: activeToiletWhere({ facility_id: facility.id }), order: [['code', 'ASC']] }),
   ]);
   await ensureQrImagesForToilets(units).catch(() => null);
 
@@ -2937,6 +2975,9 @@ const createBlock = async (req) => {
 
 const listUnits = async (req) => {
   const where = {};
+  if (!shouldIncludeDeletedToilets(req)) {
+    where.deleted_at = { [Op.is]: null };
+  }
   const facilityInclude = {
     model: Facility,
     attributes: [
@@ -3094,7 +3135,7 @@ const readFacilityFootfall = (facility = {}) => {
 const listToiletMap = async (req) => {
   const bounds = normalizeBounds(req.query || {});
   const andFilters = [];
-  const where = {};
+  const where = activeToiletWhere();
   const facilityInclude = {
     model: Facility,
     attributes: [
@@ -3568,6 +3609,103 @@ const createUnit = async (req) => {
   };
 };
 
+const loadScopedToiletUnitForLifecycle = async (req) => {
+  const toilet = await ToiletUnit.findByPk(req.params.id, {
+    include: [
+      {
+        model: Facility,
+        attributes: ['id', 'tenant_id', 'status'],
+        required: false,
+      },
+    ],
+  });
+  if (!toilet) {
+    throw new AppError('Toilet unit not found', 404, { code: 'TOILET_NOT_FOUND' });
+  }
+  const tenantId = toilet.Facility?.tenant_id || null;
+  if (!req.user.isSuperAdmin && tenantId !== req.user.tenantId) {
+    throw new AppError('Toilet out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, toilet.facility_id)) {
+    throw new AppError('Toilet out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  return { toilet, tenantId };
+};
+
+const lifecycleReason = (req) => sanitizeOptionalText(req.body?.reason || req.body?.lifecycleReason, 500);
+
+const deactivateToiletUnit = async (req) => {
+  const { toilet, tenantId } = await loadScopedToiletUnitForLifecycle(req);
+  if (isToiletDeleted(toilet)) {
+    throw new AppError('This toilet is no longer available for inspection.', 410, {
+      code: 'TOILET_DELETED',
+    });
+  }
+  const now = new Date();
+  await toilet.update({
+    status: 'out_of_service',
+    deactivated_at: toilet.deactivated_at || now,
+    lifecycle_reason: lifecycleReason(req),
+    lifecycle_updated_by: req.user?.id || null,
+    updated_at: now,
+  });
+  await createAuditLog({
+    req,
+    action: 'toilet_unit.deactivate',
+    entityType: 'toilet_unit',
+    entityId: toilet.id,
+    tenantId,
+  });
+  return mapUnitRow(toilet);
+};
+
+const reactivateToiletUnit = async (req) => {
+  const { toilet, tenantId } = await loadScopedToiletUnitForLifecycle(req);
+  if (isToiletDeleted(toilet)) {
+    throw new AppError('Deleted toilets cannot be reactivated from normal tenant screens', 410, {
+      code: 'TOILET_DELETED',
+    });
+  }
+  const now = new Date();
+  await toilet.update({
+    status: req.body?.status || 'moderate',
+    deactivated_at: null,
+    lifecycle_reason: lifecycleReason(req),
+    lifecycle_updated_by: req.user?.id || null,
+    updated_at: now,
+  });
+  await createAuditLog({
+    req,
+    action: 'toilet_unit.reactivate',
+    entityType: 'toilet_unit',
+    entityId: toilet.id,
+    tenantId,
+  });
+  return mapUnitRow(toilet);
+};
+
+const softDeleteToiletUnit = async (req) => {
+  const { toilet, tenantId } = await loadScopedToiletUnitForLifecycle(req);
+  const now = new Date();
+  await toilet.update({
+    status: 'out_of_service',
+    deactivated_at: toilet.deactivated_at || now,
+    deleted_at: toilet.deleted_at || now,
+    lifecycle_reason: lifecycleReason(req),
+    lifecycle_updated_by: req.user?.id || null,
+    updated_at: now,
+  });
+  await createAuditLog({
+    req,
+    action: 'toilet_unit.delete',
+    entityType: 'toilet_unit',
+    entityId: toilet.id,
+    tenantId,
+    details: { mode: 'soft_delete' },
+  });
+  return { id: toilet.id, deleted: true, mode: 'soft_delete' };
+};
+
 const createUnitsBulk = async (req) => {
   const quantity = Number(req.body.quantity);
   if (!Number.isInteger(quantity) || quantity < 2 || quantity > 200) {
@@ -3644,5 +3782,8 @@ module.exports = {
   QR_RESOLVE_REASON_CODES,
   buildAutoToiletId,
   createUnit,
+  deactivateToiletUnit,
+  reactivateToiletUnit,
+  softDeleteToiletUnit,
   createUnitsBulk,
 };

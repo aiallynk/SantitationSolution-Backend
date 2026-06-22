@@ -955,12 +955,26 @@ const classifyAuditAction = ({ action, details = {} }) => {
     };
   }
 
-  if (normalizedAction.startsWith('users.') || normalizedAction.startsWith('auth.')) {
+  // auth.login, auth.refresh, auth.logout, auth.forgot_password are session-management
+  // events, not account changes — suppress them to avoid notification spam.
+  // auth.reset_password: user's password was actually changed — security-relevant.
+  // users.update: an administrator changed your account details — user should know.
+  if (normalizedAction === 'auth.reset_password') {
     return {
       notificationType: NotificationTypes.ACCOUNT,
       priority: NotificationPriorities.MEDIUM,
-      title: 'Account update',
-      body: 'Your account access or profile details were updated.',
+      title: 'Password changed',
+      body: 'Your account password was successfully changed.',
+      iconKey: 'account',
+      severity: 'info',
+    };
+  }
+  if (normalizedAction === 'users.update') {
+    return {
+      notificationType: NotificationTypes.ACCOUNT,
+      priority: NotificationPriorities.MEDIUM,
+      title: 'Account updated',
+      body: 'Your account details were updated by an administrator.',
       iconKey: 'account',
       severity: 'info',
     };

@@ -142,16 +142,26 @@ const asDateOrNull = (value) => {
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
-const resolveReadingTime = ({ capturedAt, submittedAt, seed }) => {
+const isUtcMidnight = (date) =>
+  date instanceof Date &&
+  !Number.isNaN(date.getTime()) &&
+  date.getUTCHours() === 0 &&
+  date.getUTCMinutes() === 0 &&
+  date.getUTCSeconds() === 0 &&
+  date.getUTCMilliseconds() === 0;
+
+const resolveInspectionTime = ({ capturedAt, submittedAt, mediaCapturedAt }) => {
   const captured = asDateOrNull(capturedAt);
   const submitted = asDateOrNull(submittedAt);
-  const base = captured || submitted || new Date(0);
-  const offsetMinutes = Math.floor(unitRandom(seed, 'reading-minute-offset') * 11);
-  let reading = new Date(base.getTime() + offsetMinutes * 60_000);
-  if (captured && submitted && submitted.getTime() >= captured.getTime() && reading.getTime() > submitted.getTime()) {
-    reading = submitted;
-  }
-  return reading.toISOString();
+  const media = asDateOrNull(mediaCapturedAt);
+  if (captured && !isUtcMidnight(captured)) return captured;
+  if (media && !isUtcMidnight(media)) return media;
+  if (submitted && !isUtcMidnight(submitted)) return submitted;
+  return captured || media || submitted || new Date(0);
+};
+
+const resolveReadingTime = ({ capturedAt, submittedAt, mediaCapturedAt }) => {
+  return resolveInspectionTime({ capturedAt, submittedAt, mediaCapturedAt }).toISOString();
 };
 
 const buildSeed = ({ batchId, tenantId, inspectionId, toiletUnitId }) => {
@@ -165,6 +175,7 @@ const generateSyntheticSensorSnapshot = ({
   toiletUnitId = null,
   capturedAt,
   submittedAt = null,
+  mediaCapturedAt = null,
   selectedScore,
   scoreSourceField,
   batchId,
@@ -182,7 +193,7 @@ const generateSyntheticSensorSnapshot = ({
   const band = pickBand(scoreUsed);
   const position = scorePositionInBand(scoreUsed, band);
   const seed = buildSeed({ batchId, tenantId, inspectionId, toiletUnitId });
-  const readingTime = resolveReadingTime({ capturedAt, submittedAt, seed });
+  const readingTime = resolveReadingTime({ capturedAt, submittedAt, mediaCapturedAt, seed });
   const readingDate = new Date(readingTime);
 
   const toiletBaseline = signedRandom(seed, `toilet-baseline:${toiletUnitId || 'none'}`);
@@ -300,7 +311,9 @@ module.exports = {
   SCORE_BANDS,
   buildSeed,
   generateSyntheticSensorSnapshot,
+  isUtcMidnight,
   pickBand,
+  resolveInspectionTime,
   resolveReadingTime,
   toNumberOrNull,
 };

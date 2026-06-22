@@ -1,5 +1,7 @@
 const { Op } = require('sequelize');
 
+const DEFAULT_TIME_ZONE = 'Asia/Kolkata';
+
 const DATE_RANGE_DEFS = {
   today: { days: 1, label: 'Today' },
   last7: { days: 7, label: 'Last 7 days' },
@@ -32,26 +34,89 @@ const DATE_RANGE_ALIASES = {
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
+const getTimeZoneParts = (date, timeZone = DEFAULT_TIME_ZONE) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const read = (type) => Number(parts.find((part) => part.type === type)?.value || 0);
+  return {
+    year: read('year'),
+    month: read('month'),
+    day: read('day'),
+    hour: read('hour') === 24 ? 0 : read('hour'),
+    minute: read('minute'),
+    second: read('second'),
+  };
+};
+
+const getTimeZoneDateParts = (date, timeZone = DEFAULT_TIME_ZONE) => {
+  const parts = getTimeZoneParts(date, timeZone);
+  return {
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+  };
+};
+
+const getTimeZoneOffsetMs = (date, timeZone = DEFAULT_TIME_ZONE) => {
+  const parts = getTimeZoneParts(date, timeZone);
+  const asUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  return asUtc - date.getTime();
+};
+
+const zonedDateTimeToUtcDate = ({
+  year,
+  month,
+  day,
+  hour = 0,
+  minute = 0,
+  second = 0,
+  millisecond = 0,
+  timeZone = DEFAULT_TIME_ZONE,
+}) => {
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millisecond));
+  const offsetMs = getTimeZoneOffsetMs(utcGuess, timeZone);
+  return new Date(utcGuess.getTime() - offsetMs);
+};
+
 const normalizeDateRange = (value) => {
   const raw = String(value || '').trim();
   if (!raw) return null;
   return DATE_RANGE_ALIASES[raw.replace(/[\s-]+/g, '_').toLowerCase()] || null;
 };
 
-const parseDate = (value, { endOfDay = false } = {}) => {
+const parseDate = (value, { endOfDay = false, timeZone = DEFAULT_TIME_ZONE } = {}) => {
   if (!value) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(value).trim())) {
+    const [year, month, day] = String(value).split('-').map(Number);
+    if (endOfDay) {
+      const nextDayStart = zonedDateTimeToUtcDate({ year, month, day: day + 1, timeZone });
+      return new Date(nextDayStart.getTime() - 1);
+    }
+    return zonedDateTimeToUtcDate({ year, month, day, timeZone });
+  }
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(String(value).trim())) {
-    parsed.setHours(endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
-  }
   return parsed;
 };
 
-const startOfToday = (now = new Date()) => {
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  return start;
+const startOfToday = (now = new Date(), timeZone = DEFAULT_TIME_ZONE) => {
+  const parts = getTimeZoneDateParts(now, timeZone);
+  return zonedDateTimeToUtcDate({ ...parts, timeZone });
 };
 
 const calculateDays = (start, end, fallback) => {
@@ -66,9 +131,10 @@ const resolveDateRange = (query = {}, options = {}) => {
   const maxDays = Number.isFinite(Number(options.maxDays)) ? Number(options.maxDays) : 90;
   const defaultRange = normalizeDateRange(options.defaultRange);
   const now = options.now instanceof Date ? options.now : new Date();
+  const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
 
-  const from = parseDate(source.from || source.start || source.startDate || source.dateFrom);
-  const to = parseDate(source.to || source.end || source.endDate || source.dateTo, { endOfDay: true });
+  const from = parseDate(source.from || source.start || source.startDate || source.dateFrom, { timeZone });
+  const to = parseDate(source.to || source.end || source.endDate || source.dateTo, { endOfDay: true, timeZone });
   if (from || to) {
     const start = from || null;
     const end = to || now;
@@ -103,8 +169,12 @@ const resolveDateRange = (query = {}, options = {}) => {
     1,
     maxDays,
   );
-  const start = startOfToday(now);
-  start.setDate(start.getDate() - (days - 1));
+  const todayParts = getTimeZoneDateParts(now, timeZone);
+  const start = zonedDateTimeToUtcDate({
+    ...todayParts,
+    day: todayParts.day - (days - 1),
+    timeZone,
+  });
 
   return {
     provided: Boolean(requestedRange || hasDays || options.defaultRange || options.defaultDays),
@@ -129,6 +199,7 @@ const applyDateRangeToWhere = (where = {}, field, range) => {
 };
 
 module.exports = {
+  DEFAULT_TIME_ZONE,
   DATE_RANGE_DEFS,
   normalizeDateRange,
   resolveDateRange,

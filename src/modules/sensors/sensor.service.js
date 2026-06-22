@@ -23,6 +23,10 @@ const { runtimeConfig } = require('../../config/runtime');
 const { parseSensorPayload } = require('./sensorPayload.parser');
 const { toSensorMetrics } = require('./sensorMetrics');
 const {
+  isUtcMidnight,
+  resolveInspectionTime,
+} = require('./syntheticSensorBackfill.generator');
+const {
   getSensorThresholds,
   evaluateSensorMetrics,
   evaluateOfflineStatus,
@@ -97,6 +101,65 @@ const toIso = (value) => {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const toIstDateKey = (value) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
+};
+
+const filterRowsWithVisibleToilets = async (rows = []) => {
+  const toiletIds = uniqueIds(rows.map((row) => row.toilet_unit_id || row.toiletUnitId));
+  if (toiletIds.length === 0) return rows;
+  const deletedRows = await ToiletUnit.findAll({
+    where: {
+      id: { [Op.in]: toiletIds },
+      deleted_at: { [Op.not]: null },
+    },
+    attributes: ['id'],
+    raw: true,
+  });
+  const deletedIds = new Set(deletedRows.map((row) => String(row.id)));
+  if (deletedIds.size === 0) return rows;
+  return rows.filter((row) => {
+    const toiletId = row.toilet_unit_id || row.toiletUnitId || null;
+    return !toiletId || !deletedIds.has(String(toiletId));
+  });
+};
+
+const asDateOrNull = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const pickInspectionMediaCapturedAt = (mediaRows = []) => {
+  const candidates = mediaRows
+    .map((row) => asDateOrNull(row.capturedAt || row.captured_at))
+    .filter(Boolean)
+    .sort((left, right) => left.getTime() - right.getTime());
+  return candidates.find((date) => !isUtcMidnight(date)) || candidates[0] || null;
+};
+
+const resolveInspectionSensorDisplayTime = ({ inspection, mediaRows = [] }) => {
+  const snapshot = inspection?.sensor_snapshot || inspection?.sensorSnapshot || {};
+  const readingTime = asDateOrNull(snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt);
+  if (readingTime && !isUtcMidnight(readingTime)) return readingTime.toISOString();
+  return resolveInspectionTime({
+    capturedAt: inspection?.captured_at || inspection?.capturedAt,
+    submittedAt: inspection?.submitted_at || inspection?.submittedAt,
+    mediaCapturedAt: pickInspectionMediaCapturedAt(mediaRows),
+  }).toISOString();
 };
 
 const parseCsvIds = (value) => {
@@ -577,6 +640,9 @@ const resolveToiletInScope = async (req, toiletUnitId) => {
   const toilet = await ToiletUnit.findByPk(toiletUnitId);
   if (!toilet) {
     throw new AppError('Toilet unit not found', 404, { code: 'TOILET_NOT_FOUND' });
+  }
+  if (toilet.deleted_at) {
+    throw new AppError('This toilet is no longer available.', 410, { code: 'TOILET_DELETED' });
   }
   const facility = await Facility.findByPk(toilet.facility_id);
   if (!facility) {
@@ -1365,11 +1431,23 @@ const resolveAnalyticsDevices = async (req, { activeOnly = false } = {}) => {
   if (toiletUnitIds.length > 0) {
     where.toilet_unit_id = { [Op.in]: toiletUnitIds };
   }
-  return SensorDevice.findAll({
+  const devices = await SensorDevice.findAll({
     where,
     order: [['last_seen_at', 'DESC NULLS LAST']],
     limit: Math.min(Number(req.query.deviceLimit || 1000), 5000),
   });
+  const attachedToiletIds = uniqueIds(devices.map((device) => device.toilet_unit_id));
+  if (attachedToiletIds.length === 0) return devices;
+  const visibleToilets = await ToiletUnit.findAll({
+    where: {
+      id: { [Op.in]: attachedToiletIds },
+      deleted_at: { [Op.is]: null },
+    },
+    attributes: ['id'],
+    raw: true,
+  });
+  const visibleToiletIds = new Set(visibleToilets.map((row) => String(row.id)));
+  return devices.filter((device) => !device.toilet_unit_id || visibleToiletIds.has(String(device.toilet_unit_id)));
 };
 
 const loadReadingsForDevices = async ({ deviceIds, range, limit = 10000 }) => {
@@ -1569,13 +1647,14 @@ const getImageLinkedSensorEvidence = async (req) => {
     await resolveToiletInScope(req, toiletUnitId);
     where.toilet_unit_id = toiletUnitId;
   }
-  const inspections = await Inspection.findAll({
+  let inspections = await Inspection.findAll({
     where,
     attributes: ['id', 'tenant_id', 'facility_id', 'toilet_unit_id', 'captured_at', 'submitted_at', 'sensor_snapshot'],
     order: [['captured_at', 'DESC']],
     limit: Math.min(Number(req.query.limit || 25), 100),
     raw: true,
   });
+  inspections = await filterRowsWithVisibleToilets(inspections);
   const inspectionIds = inspections.map((row) => row.id);
   const images = inspectionIds.length
     ? await InspectionMedia.findAll({
@@ -1604,6 +1683,7 @@ const getImageLinkedSensorEvidence = async (req) => {
     range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
     items: inspections.map((inspection) => {
       const snapshot = inspection.sensor_snapshot || {};
+      const mediaRows = imagesByInspection.get(String(inspection.id)) || [];
       const metrics = toSensorMetrics(snapshot);
       const threshold = evaluateSensorMetrics(metrics);
       return {
@@ -1611,7 +1691,7 @@ const getImageLinkedSensorEvidence = async (req) => {
         tenantId: inspection.tenant_id,
         facilityId: inspection.facility_id,
         toiletUnitId: inspection.toilet_unit_id,
-        capturedAt: inspection.submitted_at || inspection.captured_at,
+        capturedAt: resolveInspectionSensorDisplayTime({ inspection, mediaRows }),
         status: statusLower(threshold.overallStatus),
         // Read-only provenance so the UI can mark synthetic historical backfill
         // rows distinctly from live BLE telemetry. Sourced from inspections.sensor_snapshot;
@@ -1633,7 +1713,7 @@ const getImageLinkedSensorEvidence = async (req) => {
             };
           })
           .filter(Boolean),
-        images: imagesByInspection.get(String(inspection.id)) || [],
+        images: mediaRows,
       };
     }),
   };
@@ -1729,8 +1809,6 @@ const SNAPSHOT_METRICS = Object.freeze({
   humidity: ANALYTICS_METRICS.humidity,
   mq135: { key: 'mq135', label: 'MQ135 raw', unit: 'raw', precision: 2 },
   mq137: { key: 'mq137', label: 'MQ137 raw', unit: 'raw', precision: 2 },
-  battery: ANALYTICS_METRICS.battery,
-  rssi: ANALYTICS_METRICS.rssi,
 });
 
 const normalizeSnapshotMetricKey = (value) => {
@@ -1761,22 +1839,39 @@ const getInspectionSnapshotTrends = async (req) => {
     where.facility_id = req.query.facilityId;
   }
 
-  // Optional provenance filter: 'synthetic' (backfilled only) | 'real' (live-linked only) | 'all'.
+  // Internal provenance filter for maintenance calls.
   const sourceFilter = String(req.query.snapshotSource || 'all').trim().toLowerCase();
 
   // Cap the scan, then aggregate into one point PER DAY so the chart payload and
   // render stay light (≈ number of days, not number of inspections). The badge
   // counts come from the aggregated totals, so they stay accurate.
   const limit = Math.min(Number(req.query.limit || 2000), 5000);
-  const inspections = await Inspection.findAll({
+  let inspections = await Inspection.findAll({
     where,
-    attributes: ['captured_at', 'sensor_snapshot'],
+    attributes: ['id', 'toilet_unit_id', 'captured_at', 'submitted_at', 'sensor_snapshot'],
     order: [['captured_at', 'ASC']],
     limit,
     raw: true,
   });
+  inspections = await filterRowsWithVisibleToilets(inspections);
+  const inspectionIds = inspections.map((inspection) => inspection.id).filter(Boolean);
+  const mediaRows = inspectionIds.length
+    ? await InspectionMedia.findAll({
+        where: { inspection_id: { [Op.in]: inspectionIds } },
+        attributes: ['inspection_id', 'captured_at'],
+        order: [['captured_at', 'ASC NULLS LAST']],
+        raw: true,
+      })
+    : [];
+  const mediaByInspection = new Map();
+  for (const row of mediaRows) {
+    const key = String(row.inspection_id);
+    const list = mediaByInspection.get(key) || [];
+    list.push(row);
+    mediaByInspection.set(key, list);
+  }
 
-  const buckets = new Map(); // dayKey -> { sum, count, min, max, synthetic }
+  const buckets = new Map(); // dayKey -> { sum, count, min, max, synthetic, displayTimestamp }
   let totalCount = 0;
   let syntheticTotal = 0;
   for (const inspection of inspections) {
@@ -1790,12 +1885,19 @@ const getInspectionSnapshotTrends = async (req) => {
     if (rawValue === null || rawValue === undefined || !Number.isFinite(Number(rawValue))) continue;
 
     const value = Number(rawValue);
-    const day = (toIso(inspection.captured_at) || '').slice(0, 10); // YYYY-MM-DD
+    const day = toIstDateKey(inspection.captured_at);
     if (!day) continue;
+    const displayTimestamp = resolveInspectionSensorDisplayTime({
+      inspection,
+      mediaRows: mediaByInspection.get(String(inspection.id)) || [],
+    });
     let bucket = buckets.get(day);
     if (!bucket) {
-      bucket = { sum: 0, count: 0, min: value, max: value, synthetic: 0 };
+      bucket = { sum: 0, count: 0, min: value, max: value, synthetic: 0, displayTimestamp };
       buckets.set(day, bucket);
+    }
+    if (!bucket.displayTimestamp || isUtcMidnight(asDateOrNull(bucket.displayTimestamp))) {
+      bucket.displayTimestamp = displayTimestamp;
     }
     bucket.sum += value;
     bucket.count += 1;
@@ -1810,7 +1912,9 @@ const getInspectionSnapshotTrends = async (req) => {
   const points = [...buckets.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([day, bucket]) => ({
-      timestamp: `${day}T00:00:00.000Z`,
+      timestamp: bucket.displayTimestamp || `${day}T00:00:00.000Z`,
+      bucketTimestamp: `${day}T00:00:00.000Z`,
+      displayTimestamp: bucket.displayTimestamp || null,
       day,
       avg: round(bucket.sum / bucket.count),
       min: round(bucket.min),
@@ -1821,8 +1925,6 @@ const getInspectionSnapshotTrends = async (req) => {
     }));
 
   return {
-    sourceType: 'inspection_sensor_snapshots',
-    sourceLabel: 'Inspection snapshots',
     metric: metricConfig,
     granularity: 'daily',
     range: { start: toIso(range.start), end: toIso(range.end), label: range.label },

@@ -7,6 +7,7 @@ const {
   HARD_BOUNDS,
   generateSyntheticSensorSnapshot,
   pickBand,
+  resolveInspectionTime,
 } = require('../src/modules/sensors/syntheticSensorBackfill.generator');
 const { resolveIstDateRange } = require('../scripts/backfill-inspection-sensor-snapshots');
 const { toSensorMetrics } = require('../src/modules/sensors/sensorMetrics');
@@ -86,6 +87,24 @@ test('generator is deterministic for the same input and varies by inspection id'
   });
   assert.deepEqual(first, second);
   assert.notEqual(first.rawPayload, third.rawPayload);
+});
+
+test('inspection time prefers actual image capture time over UTC-midnight placeholders', () => {
+  const resolved = resolveInspectionTime({
+    capturedAt: '2026-05-10T00:00:00.000Z',
+    submittedAt: '2026-05-10T12:20:00.000Z',
+    mediaCapturedAt: '2026-05-10T09:42:00.000Z',
+  });
+  assert.equal(resolved.toISOString(), '2026-05-10T09:42:00.000Z');
+
+  const snapshot = generateSyntheticSensorSnapshot({
+    ...baseInput,
+    capturedAt: '2026-05-10T00:00:00.000Z',
+    submittedAt: '2026-05-10T12:20:00.000Z',
+    mediaCapturedAt: '2026-05-10T09:42:00.000Z',
+    selectedScore: 85,
+  });
+  assert.equal(snapshot.readingTime, '2026-05-10T09:42:00.000Z');
 });
 
 test('IST date range conversion uses explicit UTC boundaries', () => {

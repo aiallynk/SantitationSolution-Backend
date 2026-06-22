@@ -215,6 +215,21 @@ const createTask = async (req) => {
     if (!toiletUnit) {
       throw new AppError('Toilet unit not found', 404, { code: 'TOILET_UNIT_NOT_FOUND' });
     }
+    if (String(toiletUnit.facility_id) !== String(facility.id)) {
+      throw new AppError('toiletUnitId does not belong to facilityId', 400, {
+        code: 'TOILET_FACILITY_MISMATCH',
+      });
+    }
+    if (toiletUnit.deleted_at) {
+      throw new AppError('This toilet is no longer available for inspection.', 410, {
+        code: 'TOILET_DELETED',
+      });
+    }
+    if (['out_of_service', 'inactive'].includes(String(toiletUnit.status || '').toLowerCase())) {
+      throw new AppError('This toilet is inactive.', 409, {
+        code: 'TOILET_INACTIVE',
+      });
+    }
   }
 
   const row = await InspectionTask.create({
