@@ -244,11 +244,12 @@ const buildObjectUrl = (objectKey, { bucketName = s3Config.bucket } = {}) => {
   return `https://${bucketName}.s3.${s3Config.region}.amazonaws.com/${encodedKey}`;
 };
 
-<<<<<<< HEAD
-const uploadFileToS3 = async ({ filePath, objectKey, contentType = null }) => {
-=======
-const uploadFileToS3 = async ({ filePath, objectKey, bucketName = s3Config.bucket }) => {
->>>>>>> f1443a0d7c07a959c41a93c9eabf71e92dc6376c
+const uploadFileToS3 = async ({
+  filePath,
+  objectKey,
+  contentType = null,
+  bucketName = s3Config.bucket,
+}) => {
   const client = getS3Client();
   if (!client) {
     throw new Error('S3 is not configured');

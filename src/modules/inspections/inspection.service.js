@@ -464,6 +464,17 @@ const mediaPriority = (row) => {
 
 const mediaStage = (row) => String(row?.capture_stage || 'evidence').trim().toLowerCase();
 
+const isMediaEvidenceRow = (row) => {
+  if (!row) return false;
+  const mediaType = String(row.media_type || 'image').trim().toLowerCase();
+  if (mediaType === 'csv' || mediaType === 'attachment') return false;
+  const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? row.metadata
+    : {};
+  const uploadKind = String(metadata.uploadKind || metadata.attachmentType || '').trim().toLowerCase();
+  return uploadKind !== 'csv' && uploadKind !== 'attachment';
+};
+
 const mediaKey = (row, index = 0) => {
   const stage = mediaStage(row);
   const clientImageId = String(row?.client_image_id || '').trim();

@@ -199,6 +199,7 @@ const runtimeConfig = Object.freeze({
     poolEvict: 1_000,
     poolMaxUses: 5_000,
     queryTimeoutMs: asNumber(rawEnv.DB_QUERY_TIMEOUT_MS, 15_000, { min: 1_000 }),
+    connectionTimeoutMs: asNumber(rawEnv.DB_CONNECTION_TIMEOUT_MS, 10_000, { min: 1_000 }),
     statementTimeoutMs: 15_000,
     idleInTxnTimeoutMs: 15_000,
     retryMax: 2,
