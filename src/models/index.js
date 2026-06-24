@@ -249,6 +249,10 @@ const ToiletUnit = sequelize.define(
     total_inspections: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
     dirty_frequency: { type: DataTypes.DECIMAL(6, 2), allowNull: false, defaultValue: 0 },
     low_performance_frequency: { type: DataTypes.DECIMAL(6, 2), allowNull: false, defaultValue: 0 },
+    deactivated_at: { type: DataTypes.DATE, allowNull: true },
+    deleted_at: { type: DataTypes.DATE, allowNull: true },
+    lifecycle_reason: { type: DataTypes.TEXT, allowNull: true },
+    lifecycle_updated_by: { type: DataTypes.UUID, allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'toilet_units', timestamps: false }

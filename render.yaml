@@ -27,7 +27,7 @@ services:
       - key: REDIS_REQUIRED_IN_PROD
         value: "false"
       - key: CORS_ORIGIN
-        value: https://*.vercel.app
+        value: https://greentoilet-aially.vercel.app,https://*.vercel.app
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET

@@ -1,9 +1,13 @@
 const {
+  Op,
+} = require('sequelize');
+const {
   Inspection,
   AiAnalysisResult,
   Alert,
   Facility,
   Complaint,
+  ToiletUnit,
 } = require('../../models');
 const {
   buildAccessContextFromUser,
@@ -28,9 +32,70 @@ const scopedWhere = (req) => {
   return where;
 };
 
+const scopedFacilityEntityWhere = (req) => {
+  const where = applyScopeToQuery(
+    {},
+    buildAccessContextFromUser(req?.user || {}),
+    'facility',
+    { tenantKey: 'tenant_id', facilityKey: 'id' },
+  );
+  if (req.query.facilityId) {
+    if (!isFacilityInScope(req, req.query.facilityId)) {
+      where.id = '00000000-0000-0000-0000-000000000000';
+    } else {
+      where.id = req.query.facilityId;
+    }
+  }
+  return where;
+};
+
+const uniqueIds = (values = []) =>
+  [
+    ...new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => (value === null || value === undefined ? '' : String(value).trim()))
+        .filter(Boolean)
+    ),
+  ];
+
+const loadDeletedToiletIdsForScope = async (req) => {
+  const rows = await ToiletUnit.findAll({
+    where: { deleted_at: { [Op.not]: null } },
+    attributes: ['id'],
+    include: [
+      {
+        model: Facility,
+        attributes: [],
+        required: true,
+        where: scopedFacilityEntityWhere(req),
+      },
+    ],
+    raw: true,
+  });
+  return uniqueIds(rows.map((row) => row.id));
+};
+
+const excludeDeletedToiletsFromInspectionWhere = (where = {}, deletedToiletIds = []) => {
+  if (!deletedToiletIds.length) return where;
+  const existingAnd = Array.isArray(where[Op.and]) ? where[Op.and] : [];
+  return {
+    ...where,
+    [Op.and]: [
+      ...existingAnd,
+      {
+        [Op.or]: [
+          { toilet_unit_id: { [Op.is]: null } },
+          { toilet_unit_id: { [Op.notIn]: deletedToiletIds } },
+        ],
+      },
+    ],
+  };
+};
+
 const getInspectionReport = async (req) => {
+  const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
   const rows = await Inspection.findAll({
-    where: scopedWhere(req),
+    where: excludeDeletedToiletsFromInspectionWhere(scopedWhere(req), deletedToiletIds),
     include: [{ model: AiAnalysisResult }],
     order: [['captured_at', 'DESC']],
     limit: Number(req.query.limit || 1000),
@@ -67,12 +132,15 @@ const getAlertReport = async (req) => {
 };
 
 const getFacilityPerformanceReport = async (req) => {
-  const facilities = await Facility.findAll({ where: scopedWhere(req) });
+  const facilities = await Facility.findAll({ where: scopedFacilityEntityWhere(req) });
+  const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
   const inspections = await Inspection.findAll({
-    where: scopedWhere(req),
+    where: excludeDeletedToiletsFromInspectionWhere(scopedWhere(req), deletedToiletIds),
     include: [{ model: AiAnalysisResult }],
   });
-  const complaints = await Complaint.findAll({ where: scopedWhere(req) });
+  const complaints = await Complaint.findAll({
+    where: excludeDeletedToiletsFromInspectionWhere(scopedWhere(req), deletedToiletIds),
+  });
 
   return facilities.map((facility) => {
     const inspectionRows = inspections.filter((item) => item.facility_id === facility.id);

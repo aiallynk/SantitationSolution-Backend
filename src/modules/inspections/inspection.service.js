@@ -168,6 +168,29 @@ const INSPECTION_STATUSES = new Set([
   'COMPLETED',
 ]);
 
+const isToiletDeletedForInspection = (unit) => Boolean(unit?.deleted_at || unit?.deletedAt);
+
+const isToiletInactiveForInspection = (unit, facility = null) => {
+  const unitStatus = String(unit?.status || '').trim().toLowerCase();
+  const facilityStatus = String(facility?.status || '').trim().toLowerCase();
+  if (facilityStatus && facilityStatus !== 'active') return true;
+  return unitStatus === 'out_of_service' || unitStatus === 'inactive';
+};
+
+const assertToiletAvailableForInspection = (unit, facility = null) => {
+  if (!unit) return;
+  if (isToiletDeletedForInspection(unit)) {
+    throw new AppError('This toilet is no longer available for inspection.', 410, {
+      code: 'TOILET_DELETED',
+    });
+  }
+  if (isToiletInactiveForInspection(unit, facility)) {
+    throw new AppError('This toilet is inactive.', 409, {
+      code: 'TOILET_INACTIVE',
+    });
+  }
+};
+
 const normalizeInspectionType = (value) => {
   const raw = String(value || '').trim().toLowerCase();
   if (!raw) {
@@ -1292,6 +1315,7 @@ const createInspection = async (req) => {
     if (!unit || unit.facility_id !== facility.id) {
       throw new AppError('Invalid toiletUnitId for facility', 400, { code: 'UNIT_INVALID' });
     }
+    assertToiletAvailableForInspection(unit, facility);
   }
   if (req.body.taskId) {
     const task = await InspectionTask.findByPk(req.body.taskId);
@@ -1368,6 +1392,18 @@ const uploadInspectionMedia = async (req) => {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   assertInspectionScope(req, inspection);
+  if (inspection.toilet_unit_id) {
+    try {
+      const unit = await ToiletUnit.findByPk(inspection.toilet_unit_id);
+      const facility = await Facility.findByPk(inspection.facility_id);
+      assertToiletAvailableForInspection(unit, facility);
+    } catch (error) {
+      if (req.file?.path) {
+        await removeTempFile(req.file.path).catch(() => null);
+      }
+      throw error;
+    }
+  }
   if (!req.file?.path) {
     throw new AppError('file is required', 400, { code: 'FILE_REQUIRED' });
   }
@@ -1730,10 +1766,11 @@ const submitInspection = async (req) => {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   assertInspectionScope(req, inspection);
-  const escalationTarget = normalizeEscalationTarget(
-    req.body.submittedTo || req.body.submitTo || req.body.submittedToRole
-  );
-  const alertSeverity = normalizeAlertSeverity(req.body.severity);
+  if (inspection.toilet_unit_id) {
+    const unit = await ToiletUnit.findByPk(inspection.toilet_unit_id);
+    const facility = await Facility.findByPk(inspection.facility_id);
+    assertToiletAvailableForInspection(unit, facility);
+  }
 
   const beforeCsvFiles = normalizeCsvAttachmentCollection(req.body.beforeCsvFiles, {
     captureStage: 'before',

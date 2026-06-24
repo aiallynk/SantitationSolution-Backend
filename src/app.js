@@ -32,15 +32,27 @@ const normalizeOriginValue = (value) => {
 const normalizeOriginToken = (value) =>
   normalizeOriginValue(String(value || '').replace(/^['"]|['"]$/g, ''));
 
+// Always-trusted production frontend origins. These are merged with whatever
+// CORS_ORIGIN provides so the hosted web app keeps working even if the deploy
+// environment's CORS_ORIGIN is missing or out of date (e.g. a Render service
+// whose dashboard env var was never updated to match render.yaml). Wildcard
+// (`*`) entries are supported and also cover Vercel preview deployments.
+const DEFAULT_TRUSTED_ORIGINS = [
+  'https://greentoilet-aially.vercel.app',
+  'https://*.vercel.app',
+];
+
 const resolveAllowedOrigins = () => {
   const raw = String(runtimeConfig.app.corsOrigin || '').trim();
-  if (!raw) {
-    return null;
-  }
-  return raw
-    .split(/[\n,;]/)
-    .map((entry) => normalizeOriginToken(entry))
-    .filter(Boolean);
+  const fromEnv = raw
+    ? raw
+        .split(/[\n,;]/)
+        .map((entry) => normalizeOriginToken(entry))
+        .filter(Boolean)
+    : [];
+  const fromDefaults = DEFAULT_TRUSTED_ORIGINS.map((entry) => normalizeOriginToken(entry)).filter(Boolean);
+  const merged = [...new Set([...fromDefaults, ...fromEnv])];
+  return merged.length > 0 ? merged : null;
 };
 
 const allowedOrigins = resolveAllowedOrigins();

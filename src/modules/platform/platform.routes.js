@@ -263,6 +263,33 @@ router.post(
   validate(validateUnitCreate),
   platformController.postToiletUnit
 );
+router.patch(
+  '/toilet-units/:id/deactivate',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  platformController.patchToiletUnitDeactivate
+);
+router.patch(
+  '/toilet-units/:id/reactivate',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  platformController.patchToiletUnitReactivate
+);
+router.delete(
+  '/toilet-units/:id',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  platformController.deleteToiletUnit
+);
 router.get(
   '/toilets/:toiletId/inspections',
   requireSurface(...OPS_AND_MOBILE_SURFACES),

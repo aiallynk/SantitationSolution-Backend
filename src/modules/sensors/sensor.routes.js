@@ -142,6 +142,16 @@ router.get(
   requireAnyPermissions('sensor.read', 'dashboard.read'),
   sensorController.getSensorImageEvidence
 );
+// Read-only historical trend series sourced from inspections.sensor_snapshot
+// (includes synthetic backfilled rows, clearly marked). Separate from live
+// sensor_readings analytics; never feeds device health/online counts/alerts.
+router.get(
+  '/sensors/analytics/inspection-snapshot-trends',
+  requireSurface(SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE),
+  requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
+  requireAnyPermissions('sensor.read', 'dashboard.read'),
+  sensorController.getInspectionSnapshotTrends
+);
 
 router.get(
   '/sensors',

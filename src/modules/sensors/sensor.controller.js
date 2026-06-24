@@ -211,6 +211,18 @@ const getToiletSensorAnalysis = async (req, res, next) => {
   }
 };
 
+const getInspectionSnapshotTrends = async (req, res, next) => {
+  try {
+    const data = await sensorService.getInspectionSnapshotTrends(req);
+    return sendSuccess(res, {
+      message: 'Inspection sensor snapshot trends fetched successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const postOfflineAlertCheck = async (req, res, next) => {
   try {
     const data = await sensorService.checkSensorOfflineAlerts(req);
@@ -241,5 +253,6 @@ module.exports = {
   getSensorComparison,
   getSensorImageEvidence,
   getToiletSensorAnalysis,
+  getInspectionSnapshotTrends,
   postOfflineAlertCheck,
 };

@@ -1,12 +1,18 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const {
   HARD_BOUNDS,
   generateSyntheticSensorSnapshot,
   pickBand,
+  resolveInspectionTime,
 } = require('../src/modules/sensors/syntheticSensorBackfill.generator');
 const { resolveIstDateRange } = require('../scripts/backfill-inspection-sensor-snapshots');
+const { toSensorMetrics } = require('../src/modules/sensors/sensorMetrics');
+
+const GENERATOR_PATH = path.join(__dirname, '..', 'src', 'modules', 'sensors', 'syntheticSensorBackfill.generator.js');
 
 const baseInput = {
   inspectionId: '11111111-1111-4111-8111-111111111111',
@@ -83,8 +89,104 @@ test('generator is deterministic for the same input and varies by inspection id'
   assert.notEqual(first.rawPayload, third.rawPayload);
 });
 
+test('inspection time prefers actual image capture time over UTC-midnight placeholders', () => {
+  const resolved = resolveInspectionTime({
+    capturedAt: '2026-05-10T00:00:00.000Z',
+    submittedAt: '2026-05-10T12:20:00.000Z',
+    mediaCapturedAt: '2026-05-10T09:42:00.000Z',
+  });
+  assert.equal(resolved.toISOString(), '2026-05-10T09:42:00.000Z');
+
+  const snapshot = generateSyntheticSensorSnapshot({
+    ...baseInput,
+    capturedAt: '2026-05-10T00:00:00.000Z',
+    submittedAt: '2026-05-10T12:20:00.000Z',
+    mediaCapturedAt: '2026-05-10T09:42:00.000Z',
+    selectedScore: 85,
+  });
+  assert.equal(snapshot.readingTime, '2026-05-10T09:42:00.000Z');
+});
+
 test('IST date range conversion uses explicit UTC boundaries', () => {
   const range = resolveIstDateRange({ fromIst: '2026-05-01', toIst: '2026-06-20' });
   assert.equal(range.startUtcIso, '2026-04-30T18:30:00.000Z');
   assert.equal(range.endExclusiveUtcIso, '2026-06-20T18:30:00.000Z');
+});
+
+test('generator is fully local: no AI/API/network/key usage', () => {
+  const src = fs.readFileSync(GENERATOR_PATH, 'utf8');
+  // Only Node built-in crypto may be required.
+  const requires = [...src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
+  assert.deepEqual(requires, ['crypto'], `unexpected requires: ${requires.join(', ')}`);
+  // No AI provider / network / secret usage of any kind.
+  const forbidden = [
+    /openai/i,
+    /anthropic/i,
+    /\bclaude\b/i,
+    /\bgpt\b/i,
+    /\bllm\b/i,
+    /api[_-]?key/i,
+    /apiKey/,
+    /axios/i,
+    /node-fetch/i,
+    /\bfetch\s*\(/,
+    /require\(\s*['"]https?['"]\s*\)/,
+    /cloudinary/i,
+    /aws-sdk|s3/i,
+  ];
+  for (const pattern of forbidden) {
+    assert.equal(pattern.test(src), false, `generator must not reference ${pattern}`);
+  }
+});
+
+test('synthetic snapshot (sensorReadingId: null) still yields chartable metrics with markers', () => {
+  // This is exactly what the dashboard inspection-snapshot-trend endpoint extracts
+  // from inspections.sensor_snapshot via toSensorMetrics — it must work even though
+  // synthetic backfill rows have no durable telemetry id.
+  const snapshot = generateSyntheticSensorSnapshot({
+    inspectionId: '55555555-5555-4555-8555-555555555555',
+    tenantId: '66666666-6666-4666-8666-666666666666',
+    toiletUnitId: '77777777-7777-4777-8777-777777777777',
+    capturedAt: '2026-06-01T05:00:00.000Z',
+    submittedAt: '2026-06-01T05:05:00.000Z',
+    scoreSourceField: 'avg_after_score',
+    batchId: 'sensor-history-20260501-20260620-v1',
+    generatedAt: '2026-06-20T07:00:00.000Z',
+    selectedScore: 72,
+  });
+
+  // Backfill provenance + no durable telemetry id.
+  assert.equal(snapshot.sensorReadingId, null);
+  assert.equal(snapshot.isSynthetic, true);
+  assert.equal(snapshot.isBackfilled, true);
+  assert.equal(snapshot.sensorDataSource, 'synthetic_historical_backfill');
+  assert.equal(snapshot.backfillBatchId, 'sensor-history-20260501-20260620-v1');
+
+  // The dashboard endpoint reads metrics through toSensorMetrics — all chartable
+  // values must be finite numbers despite sensorReadingId being null.
+  const metrics = toSensorMetrics(snapshot);
+  for (const key of ['score', 'temperature', 'humidity', 'mq135', 'mq137']) {
+    assert.ok(Number.isFinite(Number(metrics[key])), `${key} should be a finite number, got ${metrics[key]}`);
+  }
+});
+
+test('generated values are score-correlated: cleaner scores -> lower gases/humidity', () => {
+  const base = {
+    inspectionId: '99999999-9999-4999-8999-999999999999',
+    tenantId: '88888888-8888-4888-8888-888888888888',
+    toiletUnitId: '77777777-7777-4777-8777-777777777777',
+    capturedAt: '2026-05-10T04:30:00.000Z',
+    submittedAt: '2026-05-10T04:36:00.000Z',
+    scoreSourceField: 'avg_after_score',
+    batchId: 'sensor-history-20260501-20260620-v1',
+    generatedAt: '2026-06-20T07:00:00.000Z',
+  };
+  const clean = generateSyntheticSensorSnapshot({ ...base, selectedScore: 95 });
+  const dirty = generateSyntheticSensorSnapshot({ ...base, selectedScore: 10 });
+  assert.ok(clean.mq135 < dirty.mq135, 'clean MQ135 should be lower than dirty');
+  assert.ok(clean.mq137 < dirty.mq137, 'clean MQ137 should be lower than dirty');
+  assert.ok(clean.humidity < dirty.humidity, 'clean humidity should be lower than dirty');
+  assert.ok(clean.score > dirty.score, 'clean sensor score should be higher than dirty');
+  // Raw analog ranges (not ppm): bounded by HARD_BOUNDS.
+  assert.ok(dirty.mq135 <= HARD_BOUNDS.mq135[1] && clean.mq135 >= HARD_BOUNDS.mq135[0]);
 });
