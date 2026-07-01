@@ -30,6 +30,7 @@ const {
   normalizeContentType,
 } = require('../media/uploadPolicy');
 const { runtimeConfig } = require('../../config/runtime');
+const { resolveCaptureTimestamp, resolveDisplayTimezone } = require('../../utils/timezone');
 
 const ALLOWED_CAPTURE_STAGE = new Set(['before', 'after', 'evidence']);
 const MAX_CONTENT_LENGTH_BYTES = Number(MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024);
@@ -297,6 +298,14 @@ const createUploadSessions = async (req) => {
         lock: transaction.LOCK.UPDATE,
       });
 
+      const display = await resolveDisplayTimezone({
+        tenantId: inspection.tenant_id,
+        facilityId: inspection.facility_id,
+        toiletId: inspection.toilet_unit_id,
+        user: req.user,
+        explicitTimezone: image.displayTimezone,
+      });
+      const capture = resolveCaptureTimestamp(image, display.timezone);
       const mediaUpdatePayload = {
         toilet_unit_id: inspection.toilet_unit_id || null,
         worker_id: inspection.inspector_user_id || req.user?.id || null,
@@ -320,7 +329,11 @@ const createUploadSessions = async (req) => {
         storage_key: candidateObjectKey,
         sha256: expectedSha256,
         ordinal: Number.isFinite(Number(image.ordinal)) ? Number(image.ordinal) : null,
-        captured_at: image.capturedAt ? new Date(image.capturedAt) : null,
+        captured_at: capture.capturedAtUtc,
+        captured_at_utc: capture.capturedAtUtc,
+        capture_timezone: capture.captureTimezone,
+        capture_offset_minutes: capture.captureOffsetMinutes,
+        capture_time_source: capture.captureTimeSource,
         gps_lat: image.gpsLat ?? image.gps_lat ?? null,
         gps_lng: image.gpsLng ?? image.gps_lng ?? null,
         device_id: image.deviceId || image.device_id || null,
@@ -424,7 +437,11 @@ const createUploadSessions = async (req) => {
             ordinal: Number.isFinite(Number(image.ordinal))
               ? Number(image.ordinal)
               : media.ordinal,
-            captured_at: image.capturedAt ? new Date(image.capturedAt) : media.captured_at,
+            captured_at: capture.capturedAtUtc || media.captured_at,
+            captured_at_utc: capture.capturedAtUtc || media.captured_at_utc,
+            capture_timezone: capture.captureTimezone || media.capture_timezone,
+            capture_offset_minutes: capture.captureOffsetMinutes ?? media.capture_offset_minutes,
+            capture_time_source: capture.captureTimeSource || media.capture_time_source,
             gps_lat:
               image.gpsLat !== undefined || image.gps_lat !== undefined
                 ? image.gpsLat ?? image.gps_lat ?? null

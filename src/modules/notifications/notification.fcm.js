@@ -3,7 +3,7 @@ const {
   getFirebaseMessaging,
 } = require('../../config/firebase-admin');
 
-const ANDROID_CHANNEL_ID = 'green_toilet_alerts';
+const ANDROID_CHANNEL_ID = 'sanitation_alerts';
 
 const ensureFirebaseAdmin = () => {
   const state = initializeFirebaseAdmin();
@@ -95,6 +95,7 @@ const sendPushBatch = async ({ tokens = [], title = '', body = '', data = {}, im
         payload: {
           aps: {
             sound: 'default',
+            'content-available': 1,
             ...(normalizedImageUrl ? { 'mutable-content': 1 } : {}),
           },
         },

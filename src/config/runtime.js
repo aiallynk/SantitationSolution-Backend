@@ -298,6 +298,29 @@ const runtimeConfig = Object.freeze({
     ttlMs: defaults.idempotency.ttlMs,
     responseMaxBytes: defaults.idempotency.responseMaxBytes,
   },
+  publicApi: {
+    defaultNearbyRadiusMeters: asNumber(rawEnv.PUBLIC_API_DEFAULT_RADIUS_METERS, 2000, {
+      min: 50,
+      max: 50000,
+    }),
+    maxNearbyRadiusMeters: asNumber(rawEnv.PUBLIC_API_MAX_RADIUS_METERS, 10000, {
+      min: 100,
+      max: 100000,
+    }),
+    defaultNearbyLimit: asNumber(rawEnv.PUBLIC_API_DEFAULT_LIMIT, 20, {
+      min: 1,
+      max: 1000,
+    }),
+    maxNearbyLimit: asNumber(rawEnv.PUBLIC_API_MAX_LIMIT, 100, {
+      min: 1,
+      max: 1000,
+    }),
+    cleanlinessStaleHours: asNumber(rawEnv.PUBLIC_API_CLEANLINESS_STALE_HOURS, 72, {
+      min: 1,
+      max: 2160,
+    }),
+    apiKeyHashSecret: asText(rawEnv.PUBLIC_API_KEY_HASH_SECRET, ''),
+  },
   live: {
     sseHeartbeatMs: defaults.live.sseHeartbeatMs,
     wsHeartbeatMs: defaults.live.wsHeartbeatMs,

@@ -36,6 +36,12 @@ const {
   applyDateRangeToWhere,
 } = require('../../utils/dateRange');
 const {
+  buildTimestampMetadata,
+  getDefaultTimezone,
+  resolveCaptureTimestamp,
+  resolveDisplayTimezone,
+} = require('../../utils/timezone');
+const {
   recomputeInspectionAggregates,
   listInspectionImages,
   listInspectionImageJobs,
@@ -144,13 +150,6 @@ const normalizeClientImageId = (value) => {
     .replace(/[^a-zA-Z0-9._-]/g, '-')
     .slice(0, 120);
   return normalized || null;
-};
-
-const parseOptionalDate = (value) => {
-  if (!value) return null;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed;
 };
 
 const parseOptionalNumber = (value) => {
@@ -552,7 +551,7 @@ const loadLatestReviewByInspectionIds = async (inspectionIds) => {
   return map;
 };
 
-const mapInspectionMediaItem = (item) => {
+const mapInspectionMediaItem = (item, { displayTimezone = getDefaultTimezone() } = {}) => {
   const aiScoring =
     item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
       ? item.metadata.ai_scoring || null
@@ -569,6 +568,10 @@ const mapInspectionMediaItem = (item) => {
       : score !== null
         ? Number((score / 20).toFixed(1))
         : null;
+  const capturedMeta = buildTimestampMetadata(item.captured_at_utc || item.captured_at, {
+    captureTimezone: item.capture_timezone || displayTimezone,
+    displayTimezone,
+  });
   return {
     id: item.id,
     clientImageId: item.client_image_id || null,
@@ -580,6 +583,11 @@ const mapInspectionMediaItem = (item) => {
     uploadedAt: item.uploaded_at,
     confirmedAt: item.confirmed_at || null,
     capturedAt: item.captured_at || null,
+    capturedAtUtc: capturedMeta.utc,
+    captureTimezone: item.capture_timezone || capturedMeta.captureTimezone,
+    displayTimezone: capturedMeta.displayTimezone,
+    captureOffsetMinutes: item.capture_offset_minutes ?? capturedMeta.captureOffsetMinutes,
+    capturedAtLabel: capturedMeta.label,
     contentLength: Number(item.content_length || 0) || null,
     etag: item.etag || null,
     aiStatus: item.ai_status || null,
@@ -679,7 +687,7 @@ const mapInspectionMediaItem = (item) => {
 
 const mapInspection = (
   inspection,
-  { withAnalysis = true, reviewByInspectionId = new Map() } = {}
+  { withAnalysis = true, reviewByInspectionId = new Map(), displayTimezone = getDefaultTimezone(), timezoneSource = 'deployment_default' } = {}
 ) => {
   const media = dedupeInspectionMedia(inspection.InspectionMedia || []);
   const beforeMedia = media.filter((item) => item.capture_stage === 'before');
@@ -760,6 +768,10 @@ const mapInspection = (
     suspiciousFlag: Boolean(inspection.suspicious_flag),
   });
 
+  const capturedMeta = buildTimestampMetadata(inspection.captured_at_utc || inspection.captured_at, {
+    captureTimezone: inspection.capture_timezone || displayTimezone,
+    displayTimezone,
+  });
   return {
     id: inspection.id,
     inspectionCode: shortId ? `INS-${shortId}` : null,
@@ -778,7 +790,17 @@ const mapInspection = (
     latitude: inspection.latitude,
     longitude: inspection.longitude,
     capturedAt: inspection.captured_at,
+    capturedAtUtc: capturedMeta.utc,
+    captureTimezone: inspection.capture_timezone || capturedMeta.captureTimezone,
+    displayTimezone: capturedMeta.displayTimezone,
+    displayTimezoneSource: timezoneSource,
+    captureOffsetMinutes: inspection.capture_offset_minutes ?? capturedMeta.captureOffsetMinutes,
+    capturedAtLabel: capturedMeta.label,
     submittedAt: inspection.submitted_at,
+    submittedAtUtc: buildTimestampMetadata(inspection.submitted_at, {
+      captureTimezone: inspection.capture_timezone || displayTimezone,
+      displayTimezone,
+    }).utc,
     processingStatus: inspection.processing_status,
     pipelineStatus: inspection.pipeline_status || inspection.processing_status,
     pipelineCounters:
@@ -868,9 +890,9 @@ const mapInspection = (
           employeeCode: inspection.inspector.employee_code,
         }
       : null,
-    beforeMedia: beforeMedia.map(mapInspectionMediaItem),
-    afterMedia: afterMedia.map(mapInspectionMediaItem),
-    media: media.map(mapInspectionMediaItem),
+    beforeMedia: beforeMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
+    afterMedia: afterMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
+    media: media.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
     timeline,
     analysisResult: result
       ? {
@@ -1097,9 +1119,21 @@ const createInspection = async (req) => {
     facilityId: facility.id,
     toiletUnitId: req.body.toiletUnitId || null,
   });
+  const display = await resolveDisplayTimezone({
+    tenantId: facility.tenant_id,
+    facilityId: facility.id,
+    toiletId: req.body.toiletUnitId || null,
+    user: req.user,
+    explicitTimezone: req.body.displayTimezone,
+  });
   if (resumableInspection) {
-    return mapInspection(resumableInspection, { withAnalysis: false });
+    return mapInspection(resumableInspection, {
+      withAnalysis: false,
+      displayTimezone: display.timezone,
+      timezoneSource: display.source,
+    });
   }
+  const capture = resolveCaptureTimestamp(req.body, display.timezone);
 
   const inspection = await Inspection.create({
     tenant_id: facility.tenant_id,
@@ -1112,7 +1146,11 @@ const createInspection = async (req) => {
     notes: req.body.notes ? sanitizeText(req.body.notes, 1000) : null,
     latitude: fallbackLatitude,
     longitude: fallbackLongitude,
-    captured_at: req.body.capturedAt ? new Date(req.body.capturedAt) : new Date(),
+    captured_at: capture.capturedAtUtc,
+    captured_at_utc: capture.capturedAtUtc,
+    capture_timezone: capture.captureTimezone,
+    capture_offset_minutes: capture.captureOffsetMinutes,
+    capture_time_source: capture.captureTimeSource,
     processing_status: 'draft',
     pipeline_status: 'draft_local',
     status: 'DRAFT',
@@ -1145,7 +1183,11 @@ const createInspection = async (req) => {
     },
   });
 
-  return mapInspection(inspection, { withAnalysis: false });
+  return mapInspection(inspection, {
+    withAnalysis: false,
+    displayTimezone: display.timezone,
+    timezoneSource: display.source,
+  });
 };
 
 const uploadInspectionMedia = async (req) => {
@@ -1174,7 +1216,14 @@ const uploadInspectionMedia = async (req) => {
   }
   const captureStage = normalizeCaptureStage(req.body.captureStage);
   const clientImageId = normalizeClientImageId(req.body.clientImageId);
-  const capturedAt = parseOptionalDate(req.body.capturedAt);
+  const display = await resolveDisplayTimezone({
+    tenantId: inspection.tenant_id,
+    facilityId: inspection.facility_id,
+    toiletId: inspection.toilet_unit_id,
+    user: req.user,
+    explicitTimezone: req.body.displayTimezone,
+  });
+  const capture = resolveCaptureTimestamp(req.body, display.timezone);
   const ordinal = parseOptionalNumber(req.body.ordinal);
   const gpsLat = parseOptionalNumber(req.body.gpsLat ?? req.body.gps_lat);
   const gpsLng = parseOptionalNumber(req.body.gpsLng ?? req.body.gps_lng);
@@ -1218,7 +1267,11 @@ const uploadInspectionMedia = async (req) => {
     gps_lng: gpsLng,
     device_id: req.body.deviceId || req.body.device_id || null,
     watermark_meta: watermarkMeta,
-    captured_at: capturedAt,
+    captured_at: capture.capturedAtUtc,
+    captured_at_utc: capture.capturedAtUtc,
+    capture_timezone: capture.captureTimezone,
+    capture_offset_minutes: capture.captureOffsetMinutes,
+    capture_time_source: capture.captureTimeSource,
     confirmed_at: now,
     ordinal,
     file_url: uploaded.fileUrl,
@@ -1391,6 +1444,10 @@ const uploadInspectionMedia = async (req) => {
     inspectionId: inspection.id,
     captureStage: media.capture_stage,
     fileUrl: mediaFileUrl || normalizeMediaUrl(media.file_url),
+    capturedAtUtc: capture.capturedAtUtc.toISOString(),
+    captureTimezone: capture.captureTimezone,
+    displayTimezone: display.timezone,
+    captureOffsetMinutes: capture.captureOffsetMinutes,
     uploadedAt: media.uploaded_at,
     aiStatus: media.ai_status,
     analysisQueue,
@@ -1637,9 +1694,18 @@ const reviewInspection = async (req) => {
     include: includeInspectionRelations({ includeEvents: true }),
   });
   await hydrateInspectionMediaForDisplay(refreshed);
+  const display = await resolveDisplayTimezone({
+    tenantId: inspection.tenant_id,
+    facilityId: inspection.facility_id,
+    toiletId: inspection.toilet_unit_id,
+    user: req.user,
+    explicitTimezone: req.query.displayTimezone,
+  });
   return mapInspection(refreshed, {
     withAnalysis: true,
     reviewByInspectionId: reviewMap,
+    displayTimezone: display.timezone,
+    timezoneSource: display.source,
   });
 };
 
@@ -1893,10 +1959,20 @@ const listInspections = async (req, myOnly = false) => {
   );
 
   const reviewMap = await loadLatestReviewByInspectionIds(rows.map((row) => row.id));
+  const display = await resolveDisplayTimezone({
+    tenantId: req.user?.tenantId || null,
+    user: req.user,
+    explicitTimezone: req.query.displayTimezone,
+  });
 
   return {
     items: rows.map((inspection) =>
-      mapInspection(inspection, { withAnalysis: true, reviewByInspectionId: reviewMap })
+      mapInspection(inspection, {
+        withAnalysis: true,
+        reviewByInspectionId: reviewMap,
+        displayTimezone: display.timezone,
+        timezoneSource: display.source,
+      })
     ),
     meta: {
       page,
@@ -1920,7 +1996,19 @@ const getInspectionById = async (req) => {
   assertInspectionScope(req, inspection);
   await hydrateInspectionMediaForDisplay(inspection);
   const reviewMap = await loadLatestReviewByInspectionIds([inspection.id]);
-  return mapInspection(inspection, { withAnalysis: true, reviewByInspectionId: reviewMap });
+  const display = await resolveDisplayTimezone({
+    tenantId: inspection.tenant_id,
+    facilityId: inspection.facility_id,
+    toiletId: inspection.toilet_unit_id,
+    user: req.user,
+    explicitTimezone: req.query.displayTimezone,
+  });
+  return mapInspection(inspection, {
+    withAnalysis: true,
+    reviewByInspectionId: reviewMap,
+    displayTimezone: display.timezone,
+    timezoneSource: display.source,
+  });
 };
 
 /* -------------------------------------------------------------------------- */

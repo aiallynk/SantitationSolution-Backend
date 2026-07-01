@@ -150,6 +150,7 @@ const Tenant = sequelize.define(
     zone_name: { type: DataTypes.STRING(120), allowNull: true },
     address_line: { type: DataTypes.STRING(300), allowNull: true },
     root_geography_id: { type: DataTypes.UUID, allowNull: true },
+    timezone: { type: DataTypes.STRING(64), allowNull: false, defaultValue: 'Asia/Kolkata' },
     metadata: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
   },
@@ -199,6 +200,7 @@ const Facility = sequelize.define(
     address_line: { type: DataTypes.STRING(300), allowNull: true },
     latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    timezone: { type: DataTypes.STRING(64), allowNull: true },
     status: {
       type: DataTypes.ENUM('active', 'inactive', 'maintenance'),
       allowNull: false,
@@ -234,6 +236,7 @@ const ToiletUnit = sequelize.define(
     qr_code: { type: DataTypes.STRING(180), allowNull: false },
     unit_type: { type: DataTypes.STRING(40), allowNull: false },
     status: { type: DataTypes.ENUM('clean', 'moderate', 'poor', 'critical', 'out_of_service'), allowNull: false, defaultValue: 'moderate' },
+    is_public_visible: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     sector_code: { type: DataTypes.STRING(40), allowNull: true },
     location_label: { type: DataTypes.STRING(300), allowNull: true },
     latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
@@ -253,6 +256,7 @@ const ToiletUnit = sequelize.define(
     deleted_at: { type: DataTypes.DATE, allowNull: true },
     lifecycle_reason: { type: DataTypes.TEXT, allowNull: true },
     lifecycle_updated_by: { type: DataTypes.UUID, allowNull: true },
+    timezone: { type: DataTypes.STRING(64), allowNull: true },
     ...commonTimestamps,
   },
   { tableName: 'toilet_units', timestamps: false }
@@ -403,6 +407,10 @@ const Inspection = sequelize.define(
     latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     captured_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    captured_at_utc: { type: DataTypes.DATE, allowNull: true },
+    capture_timezone: { type: DataTypes.STRING(64), allowNull: true },
+    capture_offset_minutes: { type: DataTypes.INTEGER, allowNull: true },
+    capture_time_source: { type: DataTypes.STRING(40), allowNull: true },
     submitted_at: { type: DataTypes.DATE, allowNull: true },
     processing_status: {
       type: DataTypes.ENUM('draft', 'queued', 'processing', 'completed', 'failed'),
@@ -483,6 +491,10 @@ const InspectionMedia = sequelize.define(
     device_id: { type: DataTypes.STRING(160), allowNull: true },
     watermark_meta: { type: DataTypes.JSONB, allowNull: true },
     captured_at: { type: DataTypes.DATE, allowNull: true },
+    captured_at_utc: { type: DataTypes.DATE, allowNull: true },
+    capture_timezone: { type: DataTypes.STRING(64), allowNull: true },
+    capture_offset_minutes: { type: DataTypes.INTEGER, allowNull: true },
+    capture_time_source: { type: DataTypes.STRING(40), allowNull: true },
     confirmed_at: { type: DataTypes.DATE, allowNull: true },
     ordinal: { type: DataTypes.INTEGER, allowNull: true },
     upload_duration_ms: { type: DataTypes.INTEGER, allowNull: true },
@@ -703,6 +715,9 @@ const SensorReading = sequelize.define(
     device_id: { type: DataTypes.UUID, allowNull: false },
     client_reading_id: { type: DataTypes.STRING(120), allowNull: true },
     timestamp: { type: DataTypes.DATE, allowNull: false },
+    recorded_at_utc: { type: DataTypes.DATE, allowNull: true },
+    source_timezone: { type: DataTypes.STRING(64), allowNull: true },
+    source_offset_minutes: { type: DataTypes.INTEGER, allowNull: true },
     odor_ppm: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
     ammonia_ppm: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
     h2s_ppm: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
@@ -985,6 +1000,230 @@ const AiUsageLog = sequelize.define(
     ...commonTimestamps,
   },
   { tableName: 'ai_usage_logs', timestamps: false }
+);
+
+const TenantLimit = sequelize.define(
+  'TenantLimit',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false, unique: true },
+    limits_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Storage
+    storage_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    storage_limit_bytes: { type: DataTypes.BIGINT, allowNull: true },
+    storage_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // AI tokens
+    ai_token_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    ai_token_limit: { type: DataTypes.BIGINT, allowNull: true },
+    ai_token_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // AI requests
+    ai_request_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    ai_request_limit: { type: DataTypes.INTEGER, allowNull: true },
+    ai_request_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Users
+    user_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    user_limit: { type: DataTypes.INTEGER, allowNull: true },
+    user_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Toilets
+    toilet_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    toilet_limit: { type: DataTypes.INTEGER, allowNull: true },
+    toilet_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Facilities
+    facility_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    facility_limit: { type: DataTypes.INTEGER, allowNull: true },
+    facility_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Devices
+    device_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    device_limit: { type: DataTypes.INTEGER, allowNull: true },
+    device_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Inspections
+    inspection_limit_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    inspection_limit: { type: DataTypes.INTEGER, allowNull: true },
+    inspection_hard_block: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    // Notification flags
+    quota_warning_75_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    quota_warning_90_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    quota_exhausted_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    notify_tenant_admin: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    notify_super_admin: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    created_by: { type: DataTypes.UUID, allowNull: true },
+    updated_by: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'tenant_limits', timestamps: false }
+);
+
+const TenantUsageSnapshot = sequelize.define(
+  'TenantUsageSnapshot',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    calculated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    storage_used_bytes: { type: DataTypes.BIGINT, allowNull: true },
+    storage_object_count: { type: DataTypes.BIGINT, allowNull: true },
+    image_count: { type: DataTypes.INTEGER, allowNull: true },
+    average_image_size_bytes: { type: DataTypes.BIGINT, allowNull: true },
+    largest_file_bytes: { type: DataTypes.BIGINT, allowNull: true },
+    latest_upload_at: { type: DataTypes.DATE, allowNull: true },
+    ai_requests_30d: { type: DataTypes.INTEGER, allowNull: true },
+    ai_tokens_30d: { type: DataTypes.BIGINT, allowNull: true },
+    ai_cost_usd_30d: { type: DataTypes.DECIMAL(12, 6), allowNull: true },
+    ai_failed_30d: { type: DataTypes.INTEGER, allowNull: true },
+    users_count: { type: DataTypes.INTEGER, allowNull: true },
+    active_users_count: { type: DataTypes.INTEGER, allowNull: true },
+    workers_count: { type: DataTypes.INTEGER, allowNull: true },
+    toilets_count: { type: DataTypes.INTEGER, allowNull: true },
+    facilities_count: { type: DataTypes.INTEGER, allowNull: true },
+    devices_count: { type: DataTypes.INTEGER, allowNull: true },
+    inspections_count: { type: DataTypes.INTEGER, allowNull: true },
+    inspections_30d: { type: DataTypes.INTEGER, allowNull: true },
+    open_alerts_count: { type: DataTypes.INTEGER, allowNull: true },
+    failed_uploads_count: { type: DataTypes.INTEGER, allowNull: true },
+    source: {
+      type: DataTypes.ENUM('db_metadata', 's3_scan', 'mixed'),
+      allowNull: false,
+      defaultValue: 'db_metadata',
+    },
+    status: {
+      type: DataTypes.ENUM('fresh', 'stale', 'failed'),
+      allowNull: false,
+      defaultValue: 'fresh',
+    },
+    error_message: { type: DataTypes.TEXT, allowNull: true },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'tenant_usage_snapshots', timestamps: false }
+);
+
+const TenantQuotaNotification = sequelize.define(
+  'TenantQuotaNotification',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    resource: { type: DataTypes.STRING(60), allowNull: false },
+    threshold: { type: DataTypes.INTEGER, allowNull: false },
+    usage_percentage: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
+    limit_value: { type: DataTypes.BIGINT, allowNull: true },
+    used_value: { type: DataTypes.BIGINT, allowNull: true },
+    notification_sent_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+    recipients: { type: DataTypes.JSONB, allowNull: true },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'sent' },
+    reset_at: { type: DataTypes.DATE, allowNull: true },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'tenant_quota_notifications', timestamps: false }
+);
+
+const ApiProject = sequelize.define(
+  'ApiProject',
+  {
+    id: defineUuidId(),
+    project_name: { type: DataTypes.STRING(220), allowNull: false },
+    description: { type: DataTypes.TEXT, allowNull: true },
+    client_name: { type: DataTypes.STRING(220), allowNull: true },
+    usage_by: { type: DataTypes.STRING(220), allowNull: true },
+    project_owner_name: { type: DataTypes.STRING(180), allowNull: true },
+    project_owner_email: { type: DataTypes.STRING(180), allowNull: true },
+    project_owner_mobile: { type: DataTypes.STRING(32), allowNull: true },
+    environment: { type: DataTypes.ENUM('sandbox', 'production'), allowNull: false, defaultValue: 'sandbox' },
+    status: { type: DataTypes.ENUM('active', 'inactive', 'suspended'), allowNull: false, defaultValue: 'active' },
+    allowed_tenant_ids: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    created_by_super_admin_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'api_projects', timestamps: false }
+);
+
+const ApiKey = sequelize.define(
+  'ApiKey',
+  {
+    id: defineUuidId(),
+    api_project_id: { type: DataTypes.UUID, allowNull: false },
+    key_name: { type: DataTypes.STRING(180), allowNull: false },
+    key_prefix: { type: DataTypes.STRING(32), allowNull: false, unique: true },
+    api_key_hash: { type: DataTypes.STRING(128), allowNull: false, unique: true },
+    environment: { type: DataTypes.ENUM('sandbox', 'production'), allowNull: false, defaultValue: 'sandbox' },
+    status: {
+      type: DataTypes.ENUM('active', 'inactive', 'revoked', 'expired'),
+      allowNull: false,
+      defaultValue: 'active',
+    },
+    permissions: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    allowed_endpoints: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    allowed_tenant_ids: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    allowed_origins: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    allowed_ips: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    rate_limit_per_minute: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 60 },
+    rate_limit_per_day: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 1000 },
+    monthly_quota: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 30000 },
+    expires_at: { type: DataTypes.DATE, allowNull: true },
+    last_used_at: { type: DataTypes.DATE, allowNull: true },
+    created_by: { type: DataTypes.UUID, allowNull: true },
+    revoked_at: { type: DataTypes.DATE, allowNull: true },
+    revoked_by: { type: DataTypes.UUID, allowNull: true },
+    revoke_reason: { type: DataTypes.TEXT, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'api_keys', timestamps: false }
+);
+
+const ApiUsageLog = sequelize.define(
+  'ApiUsageLog',
+  {
+    id: defineUuidId(),
+    api_project_id: { type: DataTypes.UUID, allowNull: true },
+    api_key_id: { type: DataTypes.UUID, allowNull: true },
+    endpoint: { type: DataTypes.STRING(240), allowNull: false },
+    method: { type: DataTypes.STRING(12), allowNull: false, defaultValue: 'GET' },
+    request_ip: { type: DataTypes.STRING(80), allowNull: true },
+    user_agent: { type: DataTypes.STRING(500), allowNull: true },
+    lat_rounded: { type: DataTypes.DECIMAL(10, 3), allowNull: true },
+    lng_rounded: { type: DataTypes.DECIMAL(10, 3), allowNull: true },
+    radius: { type: DataTypes.INTEGER, allowNull: true },
+    response_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    status_code: { type: DataTypes.INTEGER, allowNull: false },
+    error_code: { type: DataTypes.STRING(120), allowNull: true },
+    error_message: { type: DataTypes.STRING(1000), allowNull: true },
+    response_time_ms: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'api_usage_logs', timestamps: false }
+);
+
+const ApiUsageDailySummary = sequelize.define(
+  'ApiUsageDailySummary',
+  {
+    id: defineUuidId(),
+    api_project_id: { type: DataTypes.UUID, allowNull: false },
+    api_key_id: { type: DataTypes.UUID, allowNull: false },
+    date: { type: DataTypes.DATEONLY, allowNull: false },
+    total_requests: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    successful_requests: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    failed_requests: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    rate_limited_requests: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    avg_response_time_ms: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    p95_response_time_ms: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    total_toilets_returned: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    unique_ips_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    ...commonTimestamps,
+  },
+  { tableName: 'api_usage_daily_summary', timestamps: false }
+);
+
+const ApiKeyEvent = sequelize.define(
+  'ApiKeyEvent',
+  {
+    id: defineUuidId(),
+    api_project_id: { type: DataTypes.UUID, allowNull: true },
+    api_key_id: { type: DataTypes.UUID, allowNull: true },
+    event_type: { type: DataTypes.STRING(120), allowNull: false },
+    actor_user_id: { type: DataTypes.UUID, allowNull: true },
+    request_ip: { type: DataTypes.STRING(80), allowNull: true },
+    user_agent: { type: DataTypes.STRING(500), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+  },
+  { tableName: 'api_key_events', timestamps: false }
 );
 
 const SuperAdminProject = sequelize.define(
@@ -1466,6 +1705,35 @@ AiUsageLog.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
 AiUsageLog.belongsTo(Inspection, { foreignKey: 'inspection_id', as: 'inspection' });
 AiUsageLog.belongsTo(ToiletUnit, { foreignKey: 'toilet_id', as: 'toilet' });
 
+TenantLimit.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasOne(TenantLimit, { foreignKey: 'tenant_id', as: 'limits' });
+
+TenantUsageSnapshot.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(TenantUsageSnapshot, { foreignKey: 'tenant_id', as: 'usageSnapshots' });
+
+TenantQuotaNotification.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(TenantQuotaNotification, { foreignKey: 'tenant_id', as: 'quotaNotifications' });
+
+ApiProject.belongsTo(PlatformUser, { foreignKey: 'created_by_super_admin_id', as: 'createdBySuperAdmin' });
+PlatformUser.hasMany(ApiProject, { foreignKey: 'created_by_super_admin_id', as: 'createdApiProjects' });
+ApiProject.hasMany(ApiKey, { foreignKey: 'api_project_id', as: 'apiKeys' });
+ApiKey.belongsTo(ApiProject, { foreignKey: 'api_project_id', as: 'project' });
+ApiKey.belongsTo(PlatformUser, { foreignKey: 'created_by', as: 'createdBy' });
+ApiKey.belongsTo(PlatformUser, { foreignKey: 'revoked_by', as: 'revokedBy' });
+ApiProject.hasMany(ApiUsageLog, { foreignKey: 'api_project_id', as: 'usageLogs' });
+ApiKey.hasMany(ApiUsageLog, { foreignKey: 'api_key_id', as: 'usageLogs' });
+ApiUsageLog.belongsTo(ApiProject, { foreignKey: 'api_project_id', as: 'project' });
+ApiUsageLog.belongsTo(ApiKey, { foreignKey: 'api_key_id', as: 'apiKey' });
+ApiProject.hasMany(ApiUsageDailySummary, { foreignKey: 'api_project_id', as: 'dailySummaries' });
+ApiKey.hasMany(ApiUsageDailySummary, { foreignKey: 'api_key_id', as: 'dailySummaries' });
+ApiUsageDailySummary.belongsTo(ApiProject, { foreignKey: 'api_project_id', as: 'project' });
+ApiUsageDailySummary.belongsTo(ApiKey, { foreignKey: 'api_key_id', as: 'apiKey' });
+ApiProject.hasMany(ApiKeyEvent, { foreignKey: 'api_project_id', as: 'keyEvents' });
+ApiKey.hasMany(ApiKeyEvent, { foreignKey: 'api_key_id', as: 'events' });
+ApiKeyEvent.belongsTo(ApiProject, { foreignKey: 'api_project_id', as: 'project' });
+ApiKeyEvent.belongsTo(ApiKey, { foreignKey: 'api_key_id', as: 'apiKey' });
+ApiKeyEvent.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
+
 module.exports = {
   sequelize,
   PlatformUser,
@@ -1520,4 +1788,12 @@ module.exports = {
   SuperAdminTenantHealth,
   PasswordResetToken,
   AiUsageLog,
+  TenantLimit,
+  TenantUsageSnapshot,
+  TenantQuotaNotification,
+  ApiProject,
+  ApiKey,
+  ApiUsageLog,
+  ApiUsageDailySummary,
+  ApiKeyEvent,
 };

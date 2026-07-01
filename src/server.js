@@ -9,6 +9,14 @@ const {
 
 installGlobalConsoleBridge();
 
+const earlyConfigValidation = validateRuntimeConfig({
+  requireAnalysis: runtimeConfig.analysis.provider === 'openai' && runtimeConfig.analysis.triggerOnUpload,
+});
+if (!earlyConfigValidation.ok) {
+  earlyConfigValidation.errors.forEach((message) => logger.error(message));
+  process.exit(1);
+}
+
 const app = require('./app');
 const { sequelize, ToiletUnit } = require('./models');
 const { registerAnalysisWorker } = require('./modules/analysis/analysis.queue');

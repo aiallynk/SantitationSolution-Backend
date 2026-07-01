@@ -31,6 +31,7 @@ const {
   resolveDateRange,
   applyDateRangeToWhere,
 } = require('../../utils/dateRange');
+const { getDefaultTimezone, toTimezoneDateKey } = require('../../utils/timezone');
 
 const scopedTenantWhere = (req, where = {}, key = 'tenant_id') => {
   return applyScopeToQuery(where, buildAccessContextFromUser(req?.user || {}), 'tenant', {
@@ -117,20 +118,7 @@ const toIsoOrNull = (value) => {
   return time == null ? null : new Date(time).toISOString();
 };
 
-const toIstDateKey = (value) => {
-  const date = value instanceof Date ? value : new Date(value);
-  if (!Number.isFinite(date.getTime())) return null;
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(date);
-  const year = parts.find((part) => part.type === 'year')?.value;
-  const month = parts.find((part) => part.type === 'month')?.value;
-  const day = parts.find((part) => part.type === 'day')?.value;
-  return year && month && day ? `${year}-${month}-${day}` : null;
-};
+const toIstDateKey = (value) => toTimezoneDateKey(value, getDefaultTimezone());
 
 const pickEarlierIso = (left, right) => {
   if (!left) return right || null;
@@ -447,6 +435,7 @@ const getTrends = async (req) => {
 
   const replacements = {
     start,
+    displayTimezone: getDefaultTimezone(),
   };
   let tenantClause = '';
   let facilityClause = '';
@@ -469,7 +458,7 @@ const getTrends = async (req) => {
   const rows = await sequelize.query(
     `
       SELECT
-        DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata') AS label,
+        DATE(i.captured_at AT TIME ZONE :displayTimezone) AS label,
         COUNT(i.id)::int AS "inspectionCount",
         COALESCE(AVG(a.cleanliness_score), 0)::numeric AS "avgCleanliness"
       FROM inspections i
@@ -479,8 +468,8 @@ const getTrends = async (req) => {
         AND (i.toilet_unit_id IS NULL OR tu.deleted_at IS NULL)
         ${tenantClause}
         ${facilityClause}
-      GROUP BY DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata')
-      ORDER BY DATE(i.captured_at AT TIME ZONE 'Asia/Kolkata') ASC
+      GROUP BY DATE(i.captured_at AT TIME ZONE :displayTimezone)
+      ORDER BY DATE(i.captured_at AT TIME ZONE :displayTimezone) ASC
     `,
     {
       replacements,

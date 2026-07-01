@@ -15,6 +15,7 @@ const { logger } = require('./core/logging/logger');
 const { getReadinessState } = require('./core/runtime/readiness');
 const apiV1Router = require('./api/v1');
 const compatRouter = require('./api/compat');
+const publicApiRouter = require('./modules/publicApi/publicApi.routes');
 
 const app = express();
 const isProduction = runtimeConfig.isProduction;
@@ -110,6 +111,19 @@ app.use(
   })
 );
 app.use(
+  '/api/public/v1',
+  cors({
+    origin: true,
+    credentials: false,
+    methods: ['GET', 'HEAD', 'OPTIONS'],
+    allowedHeaders: ['x-api-key', 'X-Api-Key', 'Content-Type', 'X-Request-Id'],
+    exposedHeaders: ['X-Request-Id'],
+    optionsSuccessStatus: 204,
+    maxAge: 86400,
+  }),
+  publicApiRouter
+);
+app.use(
   cors({
     origin(origin, callback) {
       if (!origin) {
@@ -130,6 +144,8 @@ app.use(
       'X-Request-Id',
       'X-Tenant-Id',
       'x-tenant-id',
+      'X-Api-Key',
+      'x-api-key',
     ],
     exposedHeaders: ['X-Request-Id'],
     optionsSuccessStatus: 204,
