@@ -95,6 +95,64 @@ const normalizeKeyStatus = (value, fallback = 'active') => {
   return normalized;
 };
 
+const parseDateBound = (value, { endOfDay = false } = {}) => {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    ? new Date(`${raw}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}+05:30`)
+    : new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError('Date filters must be valid dates', 400, { code: 'INVALID_DATE_RANGE' });
+  }
+  return parsed;
+};
+
+const getRequestedDateRange = (query = {}) => {
+  const from = parseDateBound(query.from || query.dateFrom || query.startDate);
+  const to = parseDateBound(query.to || query.dateTo || query.endDate, { endOfDay: true });
+  if (from && to && from.getTime() > to.getTime()) {
+    throw new AppError('from must be before to', 400, { code: 'INVALID_DATE_RANGE' });
+  }
+  return {
+    from,
+    to,
+    fromDateKey: from ? toTimezoneDateKey(from, DEFAULT_API_TIMEZONE) : null,
+    toDateKey: to ? toTimezoneDateKey(to, DEFAULT_API_TIMEZONE) : null,
+  };
+};
+
+const applyCreatedAtRange = (where, range) => {
+  const createdAt = {};
+  if (range.from) createdAt[Op.gte] = range.from;
+  if (range.to) createdAt[Op.lte] = range.to;
+  if (Object.keys(createdAt).length > 0) where.created_at = createdAt;
+};
+
+const applySummaryDateRange = (where, range) => {
+  const date = {};
+  if (range.fromDateKey) date[Op.gte] = range.fromDateKey;
+  if (range.toDateKey) date[Op.lte] = range.toDateKey;
+  if (Object.keys(date).length > 0) where.date = date;
+};
+
+const normalizeOptionalNumber = (value, fieldName) => {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new AppError(`${fieldName} must be a number`, 400, { code: 'INVALID_FILTER' });
+  }
+  return parsed;
+};
+
+const eventSeverity = (eventType) => {
+  const type = String(eventType || '').toUpperCase();
+  if (['REVOKED_KEY_USED', 'EXPIRED_KEY_USED', 'INVALID_KEY_ATTEMPTS_DETECTED'].includes(type)) return 'critical';
+  if (['HIGH_USAGE_DETECTED', 'ORIGIN_NOT_ALLOWED', 'IP_NOT_ALLOWED', 'ENDPOINT_SCOPE_DENIED', 'TENANT_SCOPE_DENIED'].includes(type)) return 'high';
+  if (['RATE_LIMIT_EXCEEDED', 'KEY_REVOKED', 'KEY_EXPIRED', 'KEY_REGENERATED'].includes(type)) return 'medium';
+  return 'low';
+};
+
 const mapProject = (row, keyCount = undefined) => ({
   id: row.id,
   projectName: row.project_name,
@@ -116,6 +174,8 @@ const mapProject = (row, keyCount = undefined) => ({
 const mapKey = (row, { rawApiKey = null, usage = null } = {}) => ({
   id: row.id,
   apiProjectId: row.api_project_id,
+  projectName: row.project?.project_name || null,
+  usageBy: row.project?.usage_by || null,
   keyName: row.key_name,
   keyPrefix: row.key_prefix,
   environment: row.environment,
@@ -138,6 +198,46 @@ const mapKey = (row, { rawApiKey = null, usage = null } = {}) => ({
   revokeReason: row.revoke_reason,
   usage,
   ...(rawApiKey ? { apiKey: rawApiKey, rawApiKey } : {}),
+});
+
+const mapLog = (row) => ({
+  id: row.id,
+  apiProjectId: row.api_project_id,
+  apiKeyId: row.api_key_id,
+  projectName: row.project?.project_name || null,
+  usageBy: row.project?.usage_by || null,
+  keyName: row.apiKey?.key_name || null,
+  keyPrefix: row.apiKey?.key_prefix || null,
+  endpoint: row.endpoint,
+  method: row.method,
+  requestIp: row.request_ip,
+  userAgent: row.user_agent,
+  latRounded: row.lat_rounded,
+  lngRounded: row.lng_rounded,
+  radius: row.radius,
+  responseCount: row.response_count,
+  statusCode: row.status_code,
+  errorCode: row.error_code,
+  errorMessage: row.error_message,
+  responseTimeMs: row.response_time_ms,
+  createdAt: row.created_at,
+});
+
+const mapEvent = (row) => ({
+  id: row.id,
+  apiProjectId: row.api_project_id,
+  apiKeyId: row.api_key_id,
+  projectName: row.project?.project_name || null,
+  usageBy: row.project?.usage_by || null,
+  keyName: row.apiKey?.key_name || null,
+  keyPrefix: row.apiKey?.key_prefix || null,
+  eventType: row.event_type,
+  severity: eventSeverity(row.event_type),
+  actorUserId: row.actor_user_id,
+  requestIp: row.request_ip,
+  userAgent: row.user_agent,
+  metadata: row.metadata || {},
+  createdAt: row.created_at,
 });
 
 const loadProject = async (projectId) => {
@@ -320,11 +420,19 @@ const createKey = async (req) => {
 
 const listKeys = async (req) => {
   ensureSuperAdmin(req);
-  const project = await loadProject(req.params.projectId);
-  const keys = await ApiKey.findAll({
-    where: { api_project_id: project.id },
+  const project = req.params.projectId ? await loadProject(req.params.projectId) : null;
+  const where = {};
+  if (project?.id) where.api_project_id = project.id;
+  if (req.query.projectId) where.api_project_id = req.query.projectId;
+  if (req.query.status) where.status = normalizeKeyStatus(req.query.status);
+  if (req.query.environment) where.environment = normalizeKeyEnvironment(req.query.environment);
+  const keyQuery = {
+    where,
+    include: [{ model: ApiProject, as: 'project', attributes: ['id', 'project_name', 'usage_by'], required: false }],
     order: [['created_at', 'DESC']],
-  });
+  };
+  if (!req.params.projectId) keyQuery.limit = 250;
+  const keys = await ApiKey.findAll(keyQuery);
   const today = getDayWindow(new Date());
   const month = getMonthWindow(new Date());
   const usageRows = await Promise.all(
@@ -492,6 +600,7 @@ const getOverview = async (req) => {
     avgResponseRows,
     endpointRows,
     projectRows,
+    activeAlerts,
   ] = await Promise.all([
     ApiProject.count(),
     ApiKey.count({ where: { status: 'active' } }),
@@ -530,6 +639,20 @@ const getOverview = async (req) => {
       limit: 1,
       raw: true,
     }),
+    ApiKeyEvent.count({
+      where: {
+        event_type: {
+          [Op.in]: [
+            EVENT_TYPES.RATE_LIMIT_EXCEEDED,
+            EVENT_TYPES.HIGH_USAGE_DETECTED,
+            EVENT_TYPES.INVALID_KEY_ATTEMPTS_DETECTED,
+            EVENT_TYPES.REVOKED_KEY_USED,
+            EVENT_TYPES.EXPIRED_KEY_USED,
+          ],
+        },
+        created_at: { [Op.gte]: day.start, [Op.lt]: day.end },
+      },
+    }),
   ]);
   const mostActiveProject = projectRows[0]?.api_project_id
     ? await ApiProject.findByPk(projectRows[0].api_project_id)
@@ -542,6 +665,7 @@ const getOverview = async (req) => {
     failedCalls,
     rateLimitedCalls,
     averageResponseTimeMs: Math.round(Number(avgResponseRows[0]?.avg || 0)),
+    activeAlerts,
     mostUsedEndpoint: endpointRows[0]?.endpoint || null,
     mostActiveProject: mostActiveProject ? mapProject(mostActiveProject) : null,
   };
@@ -550,35 +674,32 @@ const getOverview = async (req) => {
 const listLogs = async (req) => {
   ensureSuperAdmin(req);
   const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 50, maxLimit: 500 });
+  const range = getRequestedDateRange(req.query);
   const where = {};
   if (req.params.projectId) where.api_project_id = req.params.projectId;
+  if (req.query.projectId) where.api_project_id = req.query.projectId;
   if (req.query.keyId) where.api_key_id = req.query.keyId;
   if (req.query.statusCode) where.status_code = Number(req.query.statusCode);
+  if (req.query.endpoint) where.endpoint = { [Op.iLike]: `%${String(req.query.endpoint).trim()}%` };
+  if (req.query.method) where.method = String(req.query.method).trim().toUpperCase();
+  if (req.query.errorOnly === 'true') where.status_code = { [Op.gte]: 400 };
+  if (req.query.rateLimitedOnly === 'true') where.status_code = 429;
+  if (req.query.ip) where.request_ip = { [Op.iLike]: `%${String(req.query.ip).trim()}%` };
+  const minResponseTime = normalizeOptionalNumber(req.query.minResponseTimeMs || req.query.responseTimeGt, 'minResponseTimeMs');
+  if (minResponseTime !== null) where.response_time_ms = { [Op.gte]: minResponseTime };
+  applyCreatedAtRange(where, range);
   const { rows, count } = await ApiUsageLog.findAndCountAll({
     where,
+    include: [
+      { model: ApiProject, as: 'project', attributes: ['id', 'project_name', 'usage_by'], required: false },
+      { model: ApiKey, as: 'apiKey', attributes: ['id', 'key_name', 'key_prefix'], required: false },
+    ],
     order: [['created_at', 'DESC']],
     limit,
     offset,
   });
   return {
-    items: rows.map((row) => ({
-      id: row.id,
-      apiProjectId: row.api_project_id,
-      apiKeyId: row.api_key_id,
-      endpoint: row.endpoint,
-      method: row.method,
-      requestIp: row.request_ip,
-      userAgent: row.user_agent,
-      latRounded: row.lat_rounded,
-      lngRounded: row.lng_rounded,
-      radius: row.radius,
-      responseCount: row.response_count,
-      statusCode: row.status_code,
-      errorCode: row.error_code,
-      errorMessage: row.error_message,
-      responseTimeMs: row.response_time_ms,
-      createdAt: row.created_at,
-    })),
+    items: rows.map(mapLog),
     meta: { page, limit, total: count, totalPages: Math.ceil(count / limit) },
   };
 };
@@ -586,46 +707,51 @@ const listLogs = async (req) => {
 const listEvents = async (req) => {
   ensureSuperAdmin(req);
   const { page, limit, offset } = normalizePagination(req.query, { page: 1, limit: 50, maxLimit: 500 });
+  const range = getRequestedDateRange(req.query);
   const where = {};
   if (req.params.projectId) where.api_project_id = req.params.projectId;
+  if (req.query.projectId) where.api_project_id = req.query.projectId;
   if (req.query.keyId) where.api_key_id = req.query.keyId;
   if (req.query.eventType) where.event_type = String(req.query.eventType).trim();
+  if (req.query.ip) where.request_ip = { [Op.iLike]: `%${String(req.query.ip).trim()}%` };
+  if (req.query.actorUserId) where.actor_user_id = String(req.query.actorUserId).trim();
+  applyCreatedAtRange(where, range);
   const { rows, count } = await ApiKeyEvent.findAndCountAll({
     where,
+    include: [
+      { model: ApiProject, as: 'project', attributes: ['id', 'project_name', 'usage_by'], required: false },
+      { model: ApiKey, as: 'apiKey', attributes: ['id', 'key_name', 'key_prefix'], required: false },
+    ],
     order: [['created_at', 'DESC']],
     limit,
     offset,
   });
+  const severityFilter = String(req.query.severity || '').trim().toLowerCase();
+  const mappedRows = rows.map(mapEvent).filter((row) => !severityFilter || row.severity === severityFilter);
   return {
-    items: rows.map((row) => ({
-      id: row.id,
-      apiProjectId: row.api_project_id,
-      apiKeyId: row.api_key_id,
-      eventType: row.event_type,
-      actorUserId: row.actor_user_id,
-      requestIp: row.request_ip,
-      userAgent: row.user_agent,
-      metadata: row.metadata || {},
-      createdAt: row.created_at,
-    })),
+    items: mappedRows,
     meta: { page, limit, total: count, totalPages: Math.ceil(count / limit) },
   };
 };
 
 const getAnalytics = async (req) => {
   ensureSuperAdmin(req);
+  const range = getRequestedDateRange(req.query);
   const where = {};
   if (req.params.projectId) where.api_project_id = req.params.projectId;
+  if (req.query.projectId) where.api_project_id = req.query.projectId;
   if (req.query.keyId) where.api_key_id = req.query.keyId;
+  applySummaryDateRange(where, range);
   const summaries = await ApiUsageDailySummary.findAll({
     where,
     order: [['date', 'DESC']],
-    limit: 45,
+    limit: range.from || range.to ? 366 : 45,
   });
   const month = getMonthWindow(new Date(), DEFAULT_API_TIMEZONE);
   const monthStartKey = toTimezoneDateKey(month.start, DEFAULT_API_TIMEZONE);
   const monthlyWhere = {
-    ...where,
+    ...(req.params.projectId || req.query.projectId ? { api_project_id: req.params.projectId || req.query.projectId } : {}),
+    ...(req.query.keyId ? { api_key_id: req.query.keyId } : {}),
     ...(monthStartKey ? { date: { [Op.gte]: monthStartKey } } : {}),
   };
   const monthlySummaries = await ApiUsageDailySummary.findAll({
@@ -641,14 +767,167 @@ const getAnalytics = async (req) => {
     ],
     raw: true,
   });
-  const project = req.params.projectId ? await ApiProject.findByPk(req.params.projectId) : null;
-  const keys = req.params.projectId
-    ? await ApiKey.findAll({ where: { api_project_id: req.params.projectId }, order: [['created_at', 'DESC']] })
-    : [];
+  const projectId = req.params.projectId || req.query.projectId || null;
+  const project = projectId ? await ApiProject.findByPk(projectId) : null;
+  const keys = projectId
+    ? await ApiKey.findAll({ where: { api_project_id: projectId }, order: [['created_at', 'DESC']] })
+    : await ApiKey.findAll({ order: [['last_used_at', 'DESC']], limit: 100 });
+  const logWhere = {};
+  if (projectId) logWhere.api_project_id = projectId;
+  if (req.query.keyId) logWhere.api_key_id = req.query.keyId;
+  if (range.from || range.to) {
+    applyCreatedAtRange(logWhere, range);
+  } else {
+    logWhere.created_at = { [Op.gte]: month.start, [Op.lt]: month.end };
+  }
+  if (req.query.endpoint) logWhere.endpoint = { [Op.iLike]: `%${String(req.query.endpoint).trim()}%` };
+  if (req.query.statusCode) logWhere.status_code = Number(req.query.statusCode);
+
+  const [
+    endpointRows,
+    statusRows,
+    projectRows,
+    keyRows,
+    locationRows,
+    recentLogs,
+    recentEvents,
+  ] = await Promise.all([
+    ApiUsageLog.findAll({
+      where: logWhere,
+      attributes: [
+        'endpoint',
+        [fn('COUNT', col('id')), 'count'],
+        [fn('SUM', col('response_count')), 'responseCount'],
+      ],
+      group: ['endpoint'],
+      order: [[fn('COUNT', col('id')), 'DESC']],
+      limit: 10,
+      raw: true,
+    }),
+    ApiUsageLog.findAll({
+      where: logWhere,
+      attributes: ['status_code', [fn('COUNT', col('id')), 'count']],
+      group: ['status_code'],
+      order: [[fn('COUNT', col('id')), 'DESC']],
+      limit: 12,
+      raw: true,
+    }),
+    ApiUsageLog.findAll({
+      where: logWhere,
+      attributes: ['api_project_id', [fn('COUNT', col('id')), 'count']],
+      group: ['api_project_id'],
+      order: [[fn('COUNT', col('id')), 'DESC']],
+      limit: 10,
+      raw: true,
+    }),
+    ApiUsageLog.findAll({
+      where: logWhere,
+      attributes: ['api_key_id', [fn('COUNT', col('id')), 'count']],
+      group: ['api_key_id'],
+      order: [[fn('COUNT', col('id')), 'DESC']],
+      limit: 10,
+      raw: true,
+    }),
+    ApiUsageLog.findAll({
+      where: {
+        ...logWhere,
+        lat_rounded: { [Op.ne]: null },
+        lng_rounded: { [Op.ne]: null },
+      },
+      attributes: [
+        'lat_rounded',
+        'lng_rounded',
+        [fn('COUNT', col('id')), 'count'],
+      ],
+      group: ['lat_rounded', 'lng_rounded'],
+      order: [[fn('COUNT', col('id')), 'DESC']],
+      limit: 10,
+      raw: true,
+    }),
+    ApiUsageLog.findAll({
+      where: logWhere,
+      include: [
+        { model: ApiProject, as: 'project', attributes: ['id', 'project_name', 'usage_by'], required: false },
+        { model: ApiKey, as: 'apiKey', attributes: ['id', 'key_name', 'key_prefix'], required: false },
+      ],
+      order: [['created_at', 'DESC']],
+      limit: 8,
+    }),
+    ApiKeyEvent.findAll({
+      where: projectId ? { api_project_id: projectId } : {},
+      include: [
+        { model: ApiProject, as: 'project', attributes: ['id', 'project_name', 'usage_by'], required: false },
+        { model: ApiKey, as: 'apiKey', attributes: ['id', 'key_name', 'key_prefix'], required: false },
+      ],
+      order: [['created_at', 'DESC']],
+      limit: 8,
+    }),
+  ]);
+
+  const projectIds = projectRows.map((row) => row.api_project_id).filter(Boolean);
+  const keyIds = keyRows.map((row) => row.api_key_id).filter(Boolean);
+  const [projectRowsForNames, keyRowsForNames] = await Promise.all([
+    projectIds.length > 0
+      ? ApiProject.findAll({ where: { id: { [Op.in]: projectIds } }, attributes: ['id', 'project_name', 'usage_by'] })
+      : [],
+    keyIds.length > 0
+      ? ApiKey.findAll({ where: { id: { [Op.in]: keyIds } }, attributes: ['id', 'key_name', 'key_prefix', 'api_project_id'] })
+      : [],
+  ]);
+  const projectNameMap = new Map(projectRowsForNames.map((row) => [row.id, row]));
+  const keyNameMap = new Map(keyRowsForNames.map((row) => [row.id, row]));
+
   const monthly = monthlySummaries[0] || {};
+  const summaryItems = summaries.map((row) => ({
+    id: row.id,
+    apiProjectId: row.api_project_id,
+    apiKeyId: row.api_key_id,
+    date: row.date,
+    totalRequests: row.total_requests,
+    successfulRequests: row.successful_requests,
+    failedRequests: row.failed_requests,
+    rateLimitedRequests: row.rate_limited_requests,
+    avgResponseTimeMs: row.avg_response_time_ms,
+    p95ResponseTimeMs: row.p95_response_time_ms,
+    totalToiletsReturned: row.total_toilets_returned,
+    uniqueIpsCount: row.unique_ips_count,
+  }));
+  const timeSeriesMap = new Map();
+  summaryItems.forEach((summary) => {
+    const current = timeSeriesMap.get(summary.date) || {
+      date: summary.date,
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rateLimitedRequests: 0,
+      totalToiletsReturned: 0,
+      uniqueIpsCount: 0,
+      avgResponseTimeMs: 0,
+      p95ResponseTimeMs: 0,
+      samples: 0,
+    };
+    current.totalRequests += Number(summary.totalRequests || 0);
+    current.successfulRequests += Number(summary.successfulRequests || 0);
+    current.failedRequests += Number(summary.failedRequests || 0);
+    current.rateLimitedRequests += Number(summary.rateLimitedRequests || 0);
+    current.totalToiletsReturned += Number(summary.totalToiletsReturned || 0);
+    current.uniqueIpsCount += Number(summary.uniqueIpsCount || 0);
+    current.avgResponseTimeMs += Number(summary.avgResponseTimeMs || 0);
+    current.p95ResponseTimeMs = Math.max(current.p95ResponseTimeMs, Number(summary.p95ResponseTimeMs || 0));
+    current.samples += 1;
+    timeSeriesMap.set(summary.date, current);
+  });
+  const timeSeries = [...timeSeriesMap.values()]
+    .map((point) => ({
+      ...point,
+      avgResponseTimeMs: point.samples > 0 ? Math.round(point.avgResponseTimeMs / point.samples) : 0,
+      errorRate: point.totalRequests > 0 ? Number(((point.failedRequests / point.totalRequests) * 100).toFixed(2)) : 0,
+    }))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
   return {
     projectUsage: {
-      apiProjectId: req.params.projectId || null,
+      apiProjectId: projectId,
       projectName: project?.project_name || null,
       usageBy: project?.usage_by || null,
       monthStartDate: monthStartKey,
@@ -660,22 +939,47 @@ const getAnalytics = async (req) => {
       avgResponseTimeMs: Math.round(Number(monthly.avgResponseTimeMs || 0)),
       uniqueIpsCount: Number(monthly.uniqueIpsCount || 0),
     },
-    summaries: summaries.map((row) => ({
-      id: row.id,
-      apiProjectId: row.api_project_id,
-      apiKeyId: row.api_key_id,
-      date: row.date,
-      totalRequests: row.total_requests,
-      successfulRequests: row.successful_requests,
-      failedRequests: row.failed_requests,
-      rateLimitedRequests: row.rate_limited_requests,
-      avgResponseTimeMs: row.avg_response_time_ms,
-      p95ResponseTimeMs: row.p95_response_time_ms,
-      totalToiletsReturned: row.total_toilets_returned,
-      uniqueIpsCount: row.unique_ips_count,
+    timeSeries,
+    endpointBreakdown: endpointRows.map((row) => ({
+      endpoint: row.endpoint || 'Unknown',
+      count: Number(row.count || 0),
+      responseCount: Number(row.responseCount || 0),
     })),
+    statusBreakdown: statusRows.map((row) => ({
+      statusCode: row.status_code,
+      count: Number(row.count || 0),
+      category: Number(row.status_code) >= 400 ? 'failed' : 'successful',
+    })),
+    projectBreakdown: projectRows.map((row) => {
+      const projectRow = projectNameMap.get(row.api_project_id);
+      return {
+        apiProjectId: row.api_project_id,
+        projectName: projectRow?.project_name || row.api_project_id || 'Unknown project',
+        usageBy: projectRow?.usage_by || null,
+        count: Number(row.count || 0),
+      };
+    }),
+    keyBreakdown: keyRows.map((row) => {
+      const keyRow = keyNameMap.get(row.api_key_id);
+      return {
+        apiKeyId: row.api_key_id,
+        apiProjectId: keyRow?.api_project_id || null,
+        keyName: keyRow?.key_name || 'Unknown key',
+        keyPrefix: keyRow?.key_prefix || null,
+        count: Number(row.count || 0),
+      };
+    }),
+    locationBreakdown: locationRows.map((row) => ({
+      latRounded: row.lat_rounded,
+      lngRounded: row.lng_rounded,
+      count: Number(row.count || 0),
+    })),
+    recentLogs: recentLogs.map(mapLog),
+    recentEvents: recentEvents.map(mapEvent),
+    summaries: summaryItems,
     quotaUsage: keys.map((key) => ({
       apiKeyId: key.id,
+      apiProjectId: key.api_project_id,
       keyName: key.key_name,
       keyPrefix: key.key_prefix,
       lastUsedAt: key.last_used_at,

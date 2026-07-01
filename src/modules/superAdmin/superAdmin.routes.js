@@ -95,6 +95,10 @@ router.get('/tenant-health', validate(validateListQuery), superAdminController.g
 
 router.get('/api-access/overview', apiAccessController.getOverview);
 router.get('/api-access/tenants', apiAccessController.listTenantsForScope);
+router.get('/api-access/analytics', apiAccessController.getAnalytics);
+router.get('/api-access/logs', apiAccessController.listLogs);
+router.get('/api-access/events', apiAccessController.listEvents);
+router.get('/api-access/keys', apiAccessController.listKeys);
 router.get('/api-access/projects', apiAccessController.listProjects);
 router.post('/api-access/projects', apiAccessController.createProject);
 router.get('/api-access/projects/:projectId', apiAccessController.getProjectById);
