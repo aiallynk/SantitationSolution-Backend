@@ -60,6 +60,7 @@ const BROADCAST_ALLOWED_ROLE_CODES = new Set([
   ROLE_CODES.FACILITY_MANAGER,
   ROLE_CODES.SUPERVISOR,
 ]);
+const PUSH_DELIVERY_CONCURRENCY = 10;
 
 const toShortId = (value) => String(value || '').trim().slice(0, 8).toUpperCase();
 const maskToken = (value) => {
@@ -475,6 +476,57 @@ const getChannelSettingsForUser = async ({ userId, notificationType }) => {
   };
 };
 
+const mapChannelSettings = (notificationType, row = null) => {
+  const normalizedType = normalizeNotificationType(notificationType);
+  const resolved = mapPreferenceRow(normalizedType, row);
+  const pushMobileEnabled = Boolean(resolved.pushMobileEnabled);
+  const pushWebEnabled = Boolean(resolved.pushWebEnabled);
+  return {
+    normalizedType,
+    inAppEnabled: resolved.inAppWebEnabled || resolved.inAppMobileEnabled,
+    pushMobileEnabled,
+    pushWebEnabled,
+    pushEnabled: pushMobileEnabled || pushWebEnabled,
+    preference: resolved,
+  };
+};
+
+const getChannelSettingsForUsers = async ({ userIds = [], notificationType }) => {
+  const ids = uniqueIds(userIds);
+  const normalizedType = normalizeNotificationType(notificationType);
+  if (ids.length === 0) return new Map();
+
+  const rows = await NotificationPreference.findAll({
+    where: {
+      user_id: { [Op.in]: ids },
+      notification_type: normalizedType,
+    },
+  });
+  const rowByUserId = new Map(rows.map((row) => [String(row.user_id), row]));
+  return new Map(
+    ids.map((userId) => [
+      String(userId),
+      mapChannelSettings(normalizedType, rowByUserId.get(String(userId)) || null),
+    ])
+  );
+};
+
+const runWithConcurrency = async (items = [], concurrency = 1, worker) => {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, items.length));
+  let cursor = 0;
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (cursor < items.length) {
+        const currentIndex = cursor;
+        cursor += 1;
+        await worker(items[currentIndex], currentIndex);
+      }
+    })
+  );
+};
+
 const emitNotificationLive = (notificationRow) => {
   eventBus.emit(EVENTS.NOTIFICATION_CREATED, {
     id: notificationRow.id,
@@ -754,18 +806,19 @@ const createNotificationRows = async ({
   const normalizedPriority = normalizePriority(priority);
   const now = new Date();
   const rowsToCreate = [];
-  const channelSettingsByUser = new Map();
+  const channelSettingsByUser = await getChannelSettingsForUsers({
+    userIds: activeUserIds,
+    notificationType: normalizedType,
+  });
 
   for (const userId of activeUserIds) {
     if (dedupedUserIds.has(String(userId))) {
       continue;
     }
 
-    const channelSettings = await getChannelSettingsForUser({
-      userId,
-      notificationType: normalizedType,
-    });
-    channelSettingsByUser.set(String(userId), channelSettings);
+    const channelSettings =
+      channelSettingsByUser.get(String(userId)) ||
+      mapChannelSettings(normalizedType, null);
 
     if (!channelSettings.inAppEnabled && !channelSettings.pushEnabled) {
       continue;
@@ -833,15 +886,18 @@ const createNotificationRows = async ({
     returning: true,
   });
 
-  for (const row of createdRows) {
+  createdRows.forEach((row) => {
     emitNotificationLive(row);
+  });
+
+  await runWithConcurrency(createdRows, PUSH_DELIVERY_CONCURRENCY, async (row) => {
     const channelSettings = channelSettingsByUser.get(String(row.user_id));
     await maybeDeliverPushForNotification({
       notification: row,
       pushMobileEnabled: Boolean(channelSettings?.pushMobileEnabled),
       pushWebEnabled: Boolean(channelSettings?.pushWebEnabled),
     });
-  }
+  });
 
   return createdRows;
 };
