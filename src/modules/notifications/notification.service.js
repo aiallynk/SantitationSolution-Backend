@@ -538,6 +538,63 @@ const disableInvalidTokens = async (tokenIds = []) => {
   );
 };
 
+const summarizePushDeliveryLogs = async (notificationIds = []) => {
+  const ids = uniqueIds(notificationIds);
+  if (ids.length === 0) {
+    return {
+      attemptedCount: 0,
+      sentCount: 0,
+      failedCount: 0,
+      noActiveTokenCount: 0,
+      invalidTokenCount: 0,
+      errorBreakdown: {},
+    };
+  }
+
+  const rows = await NotificationDeliveryLog.findAll({
+    where: {
+      notification_id: { [Op.in]: ids },
+      channel: PUSH_CHANNEL,
+    },
+    attributes: ['status', 'error_code'],
+  });
+
+  const summary = {
+    attemptedCount: rows.length,
+    sentCount: 0,
+    failedCount: 0,
+    noActiveTokenCount: 0,
+    invalidTokenCount: 0,
+    errorBreakdown: {},
+  };
+
+  for (const row of rows) {
+    const status = String(row.status || '').toUpperCase();
+    const code = String(row.error_code || '').trim();
+    if (status === 'SENT') {
+      summary.sentCount += 1;
+    } else if (status === 'FAILED') {
+      summary.failedCount += 1;
+    }
+    if (code === 'NO_ACTIVE_DEVICE_TOKEN') {
+      summary.noActiveTokenCount += 1;
+    }
+    const normalizedCode = code.toLowerCase();
+    if (
+      INVALID_FCM_TOKEN_CODES.some((item) =>
+        normalizedCode.includes(String(item).toLowerCase())
+      )
+    ) {
+      summary.invalidTokenCount += 1;
+    }
+    if (code) {
+      summary.errorBreakdown[code] = (summary.errorBreakdown[code] || 0) + 1;
+    }
+  }
+
+  return summary;
+};
+
 const maybeDeliverPushForNotification = async ({
   notification,
   pushMobileEnabled,
@@ -1748,6 +1805,9 @@ const sendBroadcast = async (req) => {
     metadata,
     payload,
   });
+  const allNotificationIds = createdRows.map((row) => row.id);
+  const notificationIds = allNotificationIds.slice(0, 50);
+  const pushDelivery = await summarizePushDeliveryLogs(allNotificationIds);
 
   return {
     dryRun: false,
@@ -1757,7 +1817,8 @@ const sendBroadcast = async (req) => {
     imageUrl: imageUrl || null,
     recipientCount,
     createdCount: createdRows.length,
-    notificationIds: createdRows.slice(0, 50).map((row) => row.id),
+    notificationIds,
+    pushDelivery,
   };
 };
 

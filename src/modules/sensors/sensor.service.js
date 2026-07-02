@@ -11,6 +11,7 @@ const {
 } = require('../../models');
 const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { resolveDateRange, applyDateRangeToWhere } = require('../../utils/dateRange');
+const { getDefaultTimezone, resolveCaptureTimestamp, toTimezoneDateKey } = require('../../utils/timezone');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { createAuditLog } = require('../audit/audit.service');
 const {
@@ -103,20 +104,7 @@ const toIso = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 };
 
-const toIstDateKey = (value) => {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return null;
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(date);
-  const year = parts.find((part) => part.type === 'year')?.value;
-  const month = parts.find((part) => part.type === 'month')?.value;
-  const day = parts.find((part) => part.type === 'day')?.value;
-  return year && month && day ? `${year}-${month}-${day}` : null;
-};
+const toIstDateKey = (value) => toTimezoneDateKey(value, getDefaultTimezone());
 
 const filterRowsWithVisibleToilets = async (rows = []) => {
   const toiletIds = uniqueIds(rows.map((row) => row.toilet_unit_id || row.toiletUnitId));
@@ -713,7 +701,18 @@ const ingestSensorReading = async (req) => {
   const humidity = parseNumeric(req.body.humidity) ?? parsed?.parsed?.humidity ?? null;
   const signalStrength = parseNumeric(req.body.rssi) ?? parseNumeric(req.body.signalStrength);
 
-  const timestamp = req.body.timestamp ? new Date(req.body.timestamp) : new Date();
+  const captured = resolveCaptureTimestamp(
+    {
+      ...req.body,
+      capturedAt: req.body.timestamp,
+      capturedAtUtc: req.body.recordedAtUtc || req.body.recorded_at_utc || req.body.timestampUtc,
+      capturedAtLocal: req.body.recordedAtLocal || req.body.recorded_at_local,
+      captureTimezone: req.body.sourceTimezone || req.body.source_timezone || req.body.captureTimezone,
+      captureOffsetMinutes: req.body.sourceOffsetMinutes || req.body.source_offset_minutes,
+    },
+    getDefaultTimezone()
+  );
+  const timestamp = captured.capturedAtUtc;
 
   // Preserve legacy raw_payload behaviour for non-BLE callers; structure BLE payloads.
   const rawPayload = parsed
@@ -742,6 +741,9 @@ const ingestSensorReading = async (req) => {
       device_id: device.id,
       client_reading_id: clientReadingId,
       timestamp,
+      recorded_at_utc: timestamp,
+      source_timezone: captured.captureTimezone,
+      source_offset_minutes: captured.captureOffsetMinutes,
       odor_ppm: parseNumeric(req.body.odorPpm),
       ammonia_ppm: parseNumeric(req.body.ammoniaPpm),
       h2s_ppm: parseNumeric(req.body.h2sPpm),

@@ -1,5 +1,7 @@
 const { sendSuccess } = require('../../core/http/response');
 const superAdminService = require('./superAdmin.service');
+const tenantLimitsService = require('./tenantLimits.service');
+const { buildQuotaStatus } = require('./tenantQuota.service');
 
 const wrap = (serviceFn, message) => async (req, res, next) => {
   try {
@@ -66,4 +68,33 @@ module.exports = {
   getReliability: wrap(superAdminService.getReliability, 'Reliability metrics fetched successfully'),
   getSettings: wrap(superAdminService.getSettings, 'Settings fetched successfully'),
   patchSettings: wrap(superAdminService.patchSettings, 'Settings updated successfully'),
+
+  getTenantLimits: async (req, res, next) => {
+    try {
+      const limits = await tenantLimitsService.getTenantLimits(req.params.id);
+      return sendSuccess(res, { message: 'Tenant limits fetched successfully', data: limits });
+    } catch (err) { return next(err); }
+  },
+
+  upsertTenantLimits: async (req, res, next) => {
+    try {
+      const limits = await tenantLimitsService.upsertTenantLimits(req.params.id, req.body, req.user?.id);
+      return sendSuccess(res, { message: 'Tenant limits saved successfully', data: limits });
+    } catch (err) { return next(err); }
+  },
+
+  getTenantUsage: async (req, res, next) => {
+    try {
+      const { limits, usage } = await tenantLimitsService.getTenantUsageWithLimits(req.params.id);
+      const quota = buildQuotaStatus(limits, usage);
+      return sendSuccess(res, { message: 'Tenant usage fetched successfully', data: { limits, usage, quota } });
+    } catch (err) { return next(err); }
+  },
+
+  recalculateTenantUsage: async (req, res, next) => {
+    try {
+      const usage = await tenantLimitsService.recalculateTenantUsage(req.params.id);
+      return sendSuccess(res, { message: 'Tenant usage recalculated successfully', data: usage });
+    } catch (err) { return next(err); }
+  },
 };

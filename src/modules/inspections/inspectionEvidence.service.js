@@ -31,6 +31,14 @@ const {
   evaluatePairwiseComparison,
   starRatingFromScore,
 } = require('../analysis/sanitationPostProcessing.helper');
+const {
+  buildTimestampMetadata,
+  getDefaultTimezone,
+  getTimezoneOffsetMinutes,
+  resolveDisplayTimezone,
+  toTimezoneDateKey,
+  toUtcDate,
+} = require('../../utils/timezone');
 
 const REVIEW_CONFIDENCE_THRESHOLD = runtimeConfig.analysis.confidenceThreshold;
 const IMPROVEMENT_THRESHOLD = runtimeConfig.analysis.improvementThreshold;
@@ -101,6 +109,235 @@ const canViewAdminDiagnostics = (req) => {
     roleCodes.has('facility_manager') ||
     roleCodes.has('platform_ops')
   );
+};
+
+const LEGACY_LOCAL_AS_UTC_TOLERANCE_MINUTES = 10;
+const SUBMISSION_CAPTURE_WARNING_MINUTES = 10;
+
+const getRowValue = (row, key) => {
+  if (!row) return null;
+  if (typeof row.get === 'function') return row.get(key);
+  return row[key];
+};
+
+const toValidDate = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const toIsoOrNull = (value) => {
+  const date = toValidDate(value);
+  return date ? date.toISOString() : null;
+};
+
+const minutesBetween = (left, right) => {
+  const leftDate = toValidDate(left);
+  const rightDate = toValidDate(right);
+  if (!leftDate || !rightDate) return null;
+  return (leftDate.getTime() - rightDate.getTime()) / 60000;
+};
+
+const reinterpretUtcClockAsLocalTime = (value, timezone) => {
+  const date = toValidDate(value);
+  if (!date) return null;
+  const localClock = date.toISOString().replace(/Z$/, '');
+  return toUtcDate(localClock, timezone);
+};
+
+const resolveCaptureInstantFromRow = (
+  row,
+  {
+    displayTimezone = getDefaultTimezone(),
+    defaultDisplaySource = 'capture',
+    referenceTimestamps = [],
+  } = {}
+) => {
+  const rawValue = getRowValue(row, 'captured_at_utc') || getRowValue(row, 'captured_at');
+  const rawDate = toValidDate(rawValue);
+  const captureTimezone = getRowValue(row, 'capture_timezone') || displayTimezone;
+  const captureTimeSource = getRowValue(row, 'capture_time_source') || null;
+  const references = [
+    ...referenceTimestamps,
+    getRowValue(row, 'uploaded_at'),
+    getRowValue(row, 'created_at'),
+  ].filter(Boolean);
+
+  let resolvedDate = rawDate;
+  let warning = null;
+  let correctedLegacyLocalAsUtc = false;
+  const offsetMinutes = rawDate ? getTimezoneOffsetMinutes(rawDate, captureTimezone) : null;
+  const sourceLooksLegacy =
+    !captureTimeSource || String(captureTimeSource).toLowerCase() === 'legacy_captured_at';
+
+  if (rawDate && sourceLooksLegacy && Number.isFinite(offsetMinutes)) {
+    const hasOffsetGap = references.some((reference) => {
+      const diff = minutesBetween(rawDate, reference);
+      return (
+        Number.isFinite(diff) &&
+        Math.abs(diff - offsetMinutes) <= LEGACY_LOCAL_AS_UTC_TOLERANCE_MINUTES
+      );
+    });
+    if (hasOffsetGap) {
+      const corrected = reinterpretUtcClockAsLocalTime(rawDate, captureTimezone);
+      if (corrected) {
+        resolvedDate = corrected;
+        correctedLegacyLocalAsUtc = true;
+        warning = `Legacy capture timestamp looked like ${captureTimezone} local time stored as UTC; corrected for display.`;
+      }
+    }
+  }
+
+  const meta = buildTimestampMetadata(resolvedDate, {
+    captureTimezone,
+    displayTimezone,
+  });
+
+  return {
+    rawUtc: toIsoOrNull(rawDate),
+    utc: meta.utc,
+    date: toValidDate(meta.utc),
+    captureTimezone: meta.captureTimezone,
+    displayTimezone: meta.displayTimezone,
+    captureOffsetMinutes:
+      getRowValue(row, 'capture_offset_minutes') ?? meta.captureOffsetMinutes,
+    label: meta.label,
+    displaySource: defaultDisplaySource,
+    captureTimeSource,
+    correctedLegacyLocalAsUtc,
+    warning,
+  };
+};
+
+const sortCaptureCandidatesAsc = (left, right) => {
+  const leftTime = toValidDate(left?.utc)?.getTime() ?? Number.POSITIVE_INFINITY;
+  const rightTime = toValidDate(right?.utc)?.getTime() ?? Number.POSITIVE_INFINITY;
+  return leftTime - rightTime;
+};
+
+const resolveInspectionStageDisplayTime = (
+  inspection,
+  stage,
+  { mediaRows = null, displayTimezone = getDefaultTimezone(), latest = false } = {}
+) => {
+  const normalizedStage = String(stage || '').toLowerCase();
+  const rows = Array.isArray(mediaRows)
+    ? mediaRows
+    : Array.isArray(getRowValue(inspection, 'InspectionMedia'))
+      ? getRowValue(inspection, 'InspectionMedia')
+      : [];
+  const submittedAt = getRowValue(inspection, 'submitted_at');
+  const createdAt = getRowValue(inspection, 'created_at');
+  const candidates = rows
+    .filter((row) => stageOf(row) === normalizedStage)
+    .map((row) =>
+      resolveCaptureInstantFromRow(row, {
+        displayTimezone,
+        defaultDisplaySource: `${normalizedStage}_image_capture`,
+        referenceTimestamps: [submittedAt, createdAt],
+      })
+    )
+    .filter((item) => item.utc)
+    .sort(sortCaptureCandidatesAsc);
+  if (candidates.length === 0) return null;
+  return latest ? candidates[candidates.length - 1] : candidates[0];
+};
+
+const resolveInspectionDisplayTime = (
+  inspection,
+  { mediaRows = null, displayTimezone = getDefaultTimezone() } = {}
+) => {
+  const rows = Array.isArray(mediaRows)
+    ? mediaRows
+    : Array.isArray(getRowValue(inspection, 'InspectionMedia'))
+      ? getRowValue(inspection, 'InspectionMedia')
+      : [];
+  const submittedAt = getRowValue(inspection, 'submitted_at');
+  const createdAt = getRowValue(inspection, 'created_at');
+  const completedAt =
+    getRowValue(inspection, 'completed_at') ||
+    getRowValue(inspection, 'inspection_completed_at') ||
+    null;
+
+  const imageCandidates = rows
+    .map((row) =>
+      resolveCaptureInstantFromRow(row, {
+        displayTimezone,
+        defaultDisplaySource: `${stageOf(row)}_image_capture`,
+        referenceTimestamps: [submittedAt, createdAt],
+      })
+    )
+    .filter((item) => item.utc)
+    .sort(sortCaptureCandidatesAsc);
+
+  const inspectionCapture = resolveCaptureInstantFromRow(inspection, {
+    displayTimezone,
+    defaultDisplaySource: 'inspection_capture',
+    referenceTimestamps: [submittedAt, createdAt],
+  });
+
+  const fallbackRows = [
+    {
+      utc: toIsoOrNull(completedAt),
+      displaySource: 'inspection_completed',
+      isFallbackUsed: true,
+    },
+    {
+      utc: toIsoOrNull(submittedAt),
+      displaySource: 'submitted_or_uploaded',
+      isFallbackUsed: true,
+    },
+    {
+      utc: toIsoOrNull(createdAt),
+      displaySource: 'created_fallback',
+      isFallbackUsed: true,
+    },
+  ].filter((item) => item.utc);
+
+  const chosen =
+    imageCandidates[0] ||
+    (inspectionCapture.utc ? inspectionCapture : null) ||
+    fallbackRows[0] ||
+    null;
+
+  if (!chosen) {
+    return {
+      capturedAtUtc: null,
+      captureTimezone: displayTimezone,
+      displayTimezone,
+      displaySource: 'missing',
+      submittedAtUtc: toIsoOrNull(submittedAt),
+      createdAtUtc: toIsoOrNull(createdAt),
+      isFallbackUsed: true,
+      warning: 'No inspection timestamp was available.',
+    };
+  }
+
+  const meta = buildTimestampMetadata(chosen.utc, {
+    captureTimezone: chosen.captureTimezone || displayTimezone,
+    displayTimezone,
+  });
+  const submissionGap = minutesBetween(submittedAt, meta.utc);
+  const timingWarning =
+    Number.isFinite(submissionGap) && Math.abs(submissionGap) > SUBMISSION_CAPTURE_WARNING_MINUTES
+      ? `Capture and submitted timestamps differ by ${Math.round(Math.abs(submissionGap))} minutes.`
+      : null;
+
+  return {
+    capturedAtUtc: meta.utc,
+    captureTimezone: chosen.captureTimezone || meta.captureTimezone,
+    displayTimezone: meta.displayTimezone,
+    displaySource: chosen.displaySource || 'capture',
+    submittedAtUtc: toIsoOrNull(submittedAt),
+    createdAtUtc: toIsoOrNull(createdAt),
+    captureOffsetMinutes: chosen.captureOffsetMinutes ?? meta.captureOffsetMinutes,
+    capturedAtLabel: meta.label,
+    rawCapturedAtUtc: chosen.rawUtc || null,
+    captureTimeSource: chosen.captureTimeSource || null,
+    correctedLegacyLocalAsUtc: Boolean(chosen.correctedLegacyLocalAsUtc),
+    isFallbackUsed: Boolean(chosen.isFallbackUsed || !imageCandidates[0]),
+    warning: [chosen.warning, timingWarning].filter(Boolean).join(' ') || null,
+  };
 };
 
 const workerSafeStatusMessage = ({ processingState, validationStatus, validationReason }) => {
@@ -344,6 +581,7 @@ const dedupeInspectionMediaRows = (rows = []) => {
 const mapMediaEvidence = async (row, options = {}) => {
   const mediaUrlCache = options.mediaUrlCache || null;
   const includeAdminDiagnostics = Boolean(options.includeAdminDiagnostics);
+  const displayTimezone = options.displayTimezone || getDefaultTimezone();
   const aiScoring = getAiScoringMetadata(row);
   const overallScore =
     toNumber(row.overall_score, null) ?? toNumber(aiScoring?.score_0_100, null);
@@ -395,6 +633,10 @@ const mapMediaEvidence = async (row, options = {}) => {
     { cache: mediaUrlCache }
   );
 
+  const capturedMeta = resolveCaptureInstantFromRow(row, {
+    displayTimezone,
+    defaultDisplaySource: `${stageOf(row)}_image_capture`,
+  });
   return {
     id: row.id,
     clientImageId: row.client_image_id || null,
@@ -407,6 +649,16 @@ const mapMediaEvidence = async (row, options = {}) => {
     thumbnailUrl:
       urls.thumbnailUrl || normalizeMediaUrl(row.thumbnail_url || row.file_url),
     capturedAt: row.captured_at || null,
+    capturedAtUtc: capturedMeta.utc,
+    rawCapturedAtUtc: includeAdminDiagnostics ? capturedMeta.rawUtc : null,
+    captureTimezone: capturedMeta.captureTimezone,
+    displayTimezone: capturedMeta.displayTimezone,
+    captureOffsetMinutes: row.capture_offset_minutes ?? capturedMeta.captureOffsetMinutes,
+    capturedAtLabel: capturedMeta.label,
+    captureTimeSource: row.capture_time_source || capturedMeta.captureTimeSource,
+    displaySource: capturedMeta.displaySource,
+    correctedLegacyLocalAsUtc: capturedMeta.correctedLegacyLocalAsUtc,
+    timestampWarning: includeAdminDiagnostics ? capturedMeta.warning : null,
     uploadedAt: row.uploaded_at || null,
     confirmedAt: row.confirmed_at || null,
     ordinal: row.ordinal || null,
@@ -510,7 +762,7 @@ const assertToiletScope = async (toiletId, req) => {
   const unit = await ToiletUnit.findByPk(toiletId, {
     include: [{
       model: Facility,
-      attributes: ['id', 'tenant_id', 'name', 'code', 'metadata', 'address_line', 'latitude', 'longitude'],
+      attributes: ['id', 'tenant_id', 'name', 'code', 'metadata', 'address_line', 'latitude', 'longitude', 'timezone'],
     }],
   });
   if (!unit) {
@@ -971,6 +1223,7 @@ const recomputeToiletAggregates = async (toiletId, { transaction = null } = {}) 
     attributes: [
       'id',
       'captured_at',
+      'captured_at_utc',
       'submitted_at',
       'avg_before_score',
       'avg_after_score',
@@ -994,6 +1247,7 @@ const recomputeToiletAggregates = async (toiletId, { transaction = null } = {}) 
     .filter((item) => item !== null);
 
   const latest = inspections[0] || null;
+  const latestCleaned = inspections.find((item) => toNumber(item.avg_after_score, null) !== null) || null;
   const latestBefore = latest ? toNumber(latest.avg_before_score, null) : null;
   const latestAfter = latest ? toNumber(latest.avg_after_score, null) : null;
   const latestScore = latestAfter ?? latestBefore;
@@ -1031,11 +1285,8 @@ const recomputeToiletAggregates = async (toiletId, { transaction = null } = {}) 
       avg_before_score: round2(mean(beforeScores)),
       avg_after_score: round2(mean(afterScores)),
       avg_improvement_score: round2(mean(improvements)),
-      last_inspection_at: latest?.submitted_at || latest?.captured_at || null,
-      last_cleaned_at:
-        inspections.find((item) => toNumber(item.avg_after_score, null) !== null)?.submitted_at ||
-        inspections.find((item) => toNumber(item.avg_after_score, null) !== null)?.captured_at ||
-        null,
+      last_inspection_at: latest?.captured_at_utc || latest?.captured_at || latest?.submitted_at || null,
+      last_cleaned_at: latestCleaned?.captured_at_utc || latestCleaned?.captured_at || null,
       total_inspections: totalInspections,
       dirty_frequency: dirtyFrequency || 0,
       low_performance_frequency: lowPerformanceFrequency || 0,
@@ -1644,6 +1895,13 @@ const triggerInspectionImageAi = async (imageId, req) => {
 
 const listToiletInspections = async (toiletId, req, { page = 1, limit = 20 } = {}) => {
   const unit = await assertToiletScope(toiletId, req);
+  const display = await resolveDisplayTimezone({
+    tenantId: unit.Facility?.tenant_id || req.user?.tenantId || null,
+    facilityId: unit.facility_id,
+    toiletId,
+    user: req.user,
+    explicitTimezone: req.query?.displayTimezone,
+  });
   const safePage = Math.max(Number(page) || 1, 1);
   const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const offset = (safePage - 1) * safeLimit;
@@ -1696,11 +1954,30 @@ const listToiletInspections = async (toiletId, req, { page = 1, limit = 20 } = {
         mediaRows: mediaByInspection.get(String(row.id)) || [],
         aiResult: aiByInspection.get(String(row.id)) || null,
       });
+      const mediaRows = mediaByInspection.get(String(row.id)) || [];
+      const displayTime = resolveInspectionDisplayTime(row, {
+        mediaRows,
+        displayTimezone: display.timezone,
+      });
 
       return {
         id: row.id,
         submittedAt: row.submitted_at,
+        submittedAtUtc: displayTime.submittedAtUtc,
+        createdAtUtc: displayTime.createdAtUtc,
         capturedAt: row.captured_at,
+        capturedAtUtc: displayTime.capturedAtUtc,
+        rawCapturedAtUtc: displayTime.rawCapturedAtUtc,
+        captureTimezone: displayTime.captureTimezone,
+        displayTimezone: display.timezone,
+        displayTimezoneSource: display.source,
+        displaySource: displayTime.displaySource,
+        captureOffsetMinutes: displayTime.captureOffsetMinutes,
+        capturedAtLabel: displayTime.capturedAtLabel,
+        correctedLegacyLocalAsUtc: displayTime.correctedLegacyLocalAsUtc,
+        isFallbackUsed: displayTime.isFallbackUsed,
+        timestampWarning: displayTime.warning,
+        displayTime,
         worker: row.inspector
           ? {
               id: row.inspector.id,
@@ -1921,7 +2198,14 @@ const getInspectionComparison = async (inspectionId, req) => {
 };
 
 const getToiletLatestInspection = async (toiletId, req) => {
-  await assertToiletScope(toiletId, req);
+  const unit = await assertToiletScope(toiletId, req);
+  const display = await resolveDisplayTimezone({
+    tenantId: unit.Facility?.tenant_id || req.user?.tenantId || null,
+    facilityId: unit.facility_id,
+    toiletId,
+    user: req.user,
+    explicitTimezone: req.query?.displayTimezone,
+  });
   const includeAdminDiagnostics = canViewAdminDiagnostics(req);
   const latest = await Inspection.findOne({
     where: { toilet_unit_id: toiletId },
@@ -1976,22 +2260,60 @@ const getToiletLatestInspection = async (toiletId, req) => {
       media
         .filter((item) => stageOf(item) === 'before')
         .map((row) =>
-          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics, displayTimezone: display.timezone })
         )
     ),
     Promise.all(
       media
         .filter((item) => stageOf(item) === 'after')
         .map((row) =>
-          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics })
+          mapMediaEvidence(row, { mediaUrlCache, includeAdminDiagnostics, displayTimezone: display.timezone })
         )
     ),
   ]);
 
+  const displayTime = resolveInspectionDisplayTime(latest, {
+    mediaRows: media,
+    displayTimezone: display.timezone,
+  });
+  const cleanedTime = resolveInspectionStageDisplayTime(latest, 'after', {
+    mediaRows: media,
+    displayTimezone: display.timezone,
+    latest: true,
+  });
   return {
     id: latest.id,
     submittedAt: latest.submitted_at,
+    submittedAtUtc: displayTime.submittedAtUtc,
+    createdAtUtc: displayTime.createdAtUtc,
     capturedAt: latest.captured_at,
+    capturedAtUtc: displayTime.capturedAtUtc,
+    rawCapturedAtUtc: includeAdminDiagnostics ? displayTime.rawCapturedAtUtc : null,
+    captureTimezone: displayTime.captureTimezone,
+    displayTimezone: display.timezone,
+    displayTimezoneSource: display.source,
+    displaySource: displayTime.displaySource,
+    captureOffsetMinutes: displayTime.captureOffsetMinutes,
+    capturedAtLabel: displayTime.capturedAtLabel,
+    captureTimeSource: displayTime.captureTimeSource,
+    correctedLegacyLocalAsUtc: displayTime.correctedLegacyLocalAsUtc,
+    isFallbackUsed: displayTime.isFallbackUsed,
+    timestampWarning: displayTime.warning,
+    displayTime,
+    cleanedTime: cleanedTime
+      ? {
+          capturedAtUtc: cleanedTime.utc,
+          captureTimezone: cleanedTime.captureTimezone,
+          displayTimezone: cleanedTime.displayTimezone,
+          displaySource: cleanedTime.displaySource,
+          captureOffsetMinutes: cleanedTime.captureOffsetMinutes,
+          capturedAtLabel: cleanedTime.label,
+          correctedLegacyLocalAsUtc: cleanedTime.correctedLegacyLocalAsUtc,
+          warning: cleanedTime.warning,
+        }
+      : null,
+    cleanedAtUtc: cleanedTime?.utc || null,
+    cleanedDisplaySource: cleanedTime?.displaySource || null,
     worker: latest.inspector
       ? {
           id: latest.inspector.id,
@@ -2027,7 +2349,14 @@ const getToiletInspectionHistory = async (toiletId, req, { page = 1, limit = 30 
 };
 
 const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
-  await assertToiletScope(toiletId, req);
+  const unit = await assertToiletScope(toiletId, req);
+  const display = await resolveDisplayTimezone({
+    tenantId: unit.Facility?.tenant_id || req.user?.tenantId || null,
+    facilityId: unit.facility_id,
+    toiletId,
+    user: req.user,
+    explicitTimezone: req.query?.displayTimezone,
+  });
   const safeDays = Math.min(Math.max(Number(days) || 30, 1), 180);
 
   const rows = await ToiletScoreDaily.findAll({
@@ -2068,7 +2397,12 @@ const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
       'id',
       'inspection_type',
       'captured_at',
+      'captured_at_utc',
+      'capture_timezone',
+      'capture_offset_minutes',
+      'capture_time_source',
       'submitted_at',
+      'created_at',
       'before_image_count',
       'after_image_count',
       'avg_before_score',
@@ -2114,7 +2448,14 @@ const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
       aiResult: aiByInspection.get(String(row.id)) || null,
     });
 
-    const dateKey = normalizeDateKey(row.submitted_at || row.captured_at);
+    const mediaRows = mediaByInspection.get(String(row.id)) || [];
+    const displayTime = resolveInspectionDisplayTime(row, {
+      mediaRows,
+      displayTimezone: display.timezone,
+    });
+    const dateKey =
+      toTimezoneDateKey(displayTime.capturedAtUtc, display.timezone) ||
+      normalizeDateKey(row.captured_at_utc || row.captured_at || row.submitted_at);
     if (!dateKey) continue;
     if (!grouped.has(dateKey)) {
       grouped.set(dateKey, {
@@ -2163,6 +2504,13 @@ const getToiletScoreTrends = async (toiletId, req, { days = 30 } = {}) => {
 
 const getToiletDetails = async (toiletId, req) => {
   const unit = await assertToiletScope(toiletId, req);
+  const display = await resolveDisplayTimezone({
+    tenantId: unit.Facility?.tenant_id || req.user?.tenantId || null,
+    facilityId: unit.facility_id,
+    toiletId,
+    user: req.user,
+    explicitTimezone: req.query?.displayTimezone,
+  });
   await ensureAllQrImagesForToilet({
     toiletUnitId: unit.id,
     appQrCodeValue: unit.qr_code || unit.code,
@@ -2274,19 +2622,85 @@ const getToiletDetails = async (toiletId, req) => {
     0
   );
 
-  const lastInspectionAt =
-    unit.last_inspection_at ||
-    latestInspection?.submittedAt ||
-    latestInspection?.capturedAt ||
-    historyLatest?.submittedAt ||
-    historyLatest?.capturedAt ||
-    null;
+  const lastInspection = latestInspection?.capturedAtUtc
+    ? {
+        timeUtc: latestInspection.capturedAtUtc,
+        capturedAtUtc: latestInspection.capturedAtUtc,
+        submittedAtUtc: latestInspection.submittedAtUtc || null,
+        createdAtUtc: latestInspection.createdAtUtc || null,
+        source: latestInspection.displaySource || 'inspection_capture',
+        displaySource: latestInspection.displaySource || 'inspection_capture',
+        captureTimezone: latestInspection.captureTimezone || display.timezone,
+        displayTimezone: display.timezone,
+        captureOffsetMinutes: latestInspection.captureOffsetMinutes ?? null,
+        label: latestInspection.capturedAtLabel || null,
+        isFallbackUsed: Boolean(latestInspection.isFallbackUsed),
+        warning: latestInspection.timestampWarning || null,
+      }
+    : historyLatest?.capturedAtUtc
+      ? {
+          timeUtc: historyLatest.capturedAtUtc,
+          capturedAtUtc: historyLatest.capturedAtUtc,
+          submittedAtUtc: historyLatest.submittedAtUtc || historyLatest.submittedAt || null,
+          createdAtUtc: historyLatest.createdAtUtc || null,
+          source: historyLatest.displaySource || 'history_capture',
+          displaySource: historyLatest.displaySource || 'history_capture',
+          captureTimezone: historyLatest.captureTimezone || display.timezone,
+          displayTimezone: display.timezone,
+          captureOffsetMinutes: historyLatest.captureOffsetMinutes ?? null,
+          label: historyLatest.capturedAtLabel || null,
+          isFallbackUsed: Boolean(historyLatest.isFallbackUsed),
+          warning: historyLatest.timestampWarning || null,
+        }
+      : null;
 
-  const lastCleanedAt =
-    unit.last_cleaned_at ||
-    historyItems.find((item) => toNumber(item.avgAfterScore, null) !== null)?.submittedAt ||
-    historyItems.find((item) => toNumber(item.avgAfterScore, null) !== null)?.capturedAt ||
-    null;
+  const unitLastCleanedIso = toIsoOrNull(unit.last_cleaned_at);
+  const unitLastInspectionIso = toIsoOrNull(unit.last_inspection_at);
+  const unitCleanedLooksDuplicated =
+    unitLastCleanedIso && unitLastInspectionIso && unitLastCleanedIso === unitLastInspectionIso;
+  const lastCleaned = latestInspection?.cleanedTime
+    ? {
+        timeUtc: latestInspection.cleanedTime.capturedAtUtc,
+        capturedAtUtc: latestInspection.cleanedTime.capturedAtUtc,
+        source: latestInspection.cleanedTime.displaySource || 'after_image_capture',
+        displaySource: latestInspection.cleanedTime.displaySource || 'after_image_capture',
+        captureTimezone: latestInspection.cleanedTime.captureTimezone || display.timezone,
+        displayTimezone: display.timezone,
+        captureOffsetMinutes: latestInspection.cleanedTime.captureOffsetMinutes ?? null,
+        label: latestInspection.cleanedTime.capturedAtLabel || null,
+        isFallbackUsed: false,
+        warning: latestInspection.cleanedTime.warning || null,
+      }
+    : unitLastCleanedIso && !unitCleanedLooksDuplicated
+      ? {
+          timeUtc: unitLastCleanedIso,
+          capturedAtUtc: unitLastCleanedIso,
+          source: 'legacy_cleaned_aggregate',
+          displaySource: 'legacy_cleaned_aggregate',
+          captureTimezone: display.timezone,
+          displayTimezone: display.timezone,
+          captureOffsetMinutes: null,
+          label: null,
+          isFallbackUsed: true,
+          warning: 'Using legacy cleaned aggregate because no after-image capture source was available.',
+        }
+      : {
+          timeUtc: null,
+          capturedAtUtc: null,
+          source: 'not_recorded',
+          displaySource: 'not_recorded',
+          captureTimezone: display.timezone,
+          displayTimezone: display.timezone,
+          captureOffsetMinutes: null,
+          label: null,
+          isFallbackUsed: true,
+          warning: unitCleanedLooksDuplicated
+            ? 'Last cleaned aggregate matched submitted/inspection time and was not treated as a separate cleaning source.'
+            : null,
+        };
+
+  const lastInspectionAt = lastInspection?.timeUtc || null;
+  const lastCleanedAt = lastCleaned?.timeUtc || null;
 
   const events = await InspectionEvent.findAll({
     where: {
@@ -2356,6 +2770,10 @@ const getToiletDetails = async (toiletId, req) => {
             ? Number(unit.Facility.longitude)
             : null,
       contractor: unit.Facility?.metadata?.contractor || null,
+      timezone: display.timezone,
+      timezoneSource: display.source,
+      facilityTimezone: unit.Facility?.timezone || unit.Facility?.metadata?.timezone || null,
+      toiletTimezone: unit.timezone || null,
       status: unit.status,
       latestScore,
       latestScoreLabel: scoreLabel(latestScore),
@@ -2371,6 +2789,8 @@ const getToiletDetails = async (toiletId, req) => {
       latestImprovementScore: toNumber(latestInspection?.improvementScore, null),
       lastInspectionAt,
       lastCleanedAt,
+      lastInspection,
+      lastCleaned,
       totalInspections,
       dirtyFrequency,
       lowPerformanceFrequency,
@@ -2384,11 +2804,17 @@ const getToiletDetails = async (toiletId, req) => {
     history: history.items,
     trends,
     auditTrail,
+    timezone: {
+      displayTimezone: display.timezone,
+      source: display.source,
+      label: `Displayed in ${display.timezone}`,
+    },
   };
 };
 
 module.exports = {
   mapMediaEvidence,
+  resolveInspectionDisplayTime,
   scoreLabel,
   recomputeInspectionAggregates,
   recomputeToiletAggregates,

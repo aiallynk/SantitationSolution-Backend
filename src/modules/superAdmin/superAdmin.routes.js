@@ -1,5 +1,6 @@
 const express = require('express');
 const superAdminController = require('./superAdmin.controller');
+const apiAccessController = require('./apiAccess.controller');
 const backupController = require('../backups/backup.controller');
 const {
   validateTenantProvision,
@@ -45,6 +46,10 @@ router.get('/tenants', superAdminController.getTenants);
 router.get('/tenants/:id', superAdminController.getTenantById);
 router.post('/tenants', validate(validateTenantProvision), superAdminController.postTenantProvision);
 router.patch('/tenants/:id', validate(validateTenantPatch), superAdminController.patchTenant);
+router.get('/tenants/:id/limits', superAdminController.getTenantLimits);
+router.put('/tenants/:id/limits', superAdminController.upsertTenantLimits);
+router.get('/tenants/:id/usage', superAdminController.getTenantUsage);
+router.post('/tenants/:id/usage/recalculate', superAdminController.recalculateTenantUsage);
 router.get('/regions', superAdminController.getRegions);
 router.get('/platform-metrics', superAdminController.getPlatformMetrics);
 router.get('/storage', validate(validateListQuery), superAdminController.getStorage);
@@ -88,6 +93,25 @@ router.patch('/sync-failures/:id', validate(validateSyncFailurePatch), superAdmi
 router.get('/device-fleet', superAdminController.getDeviceFleet);
 router.get('/tenant-health', validate(validateListQuery), superAdminController.getTenantHealth);
 
+router.get('/api-access/overview', apiAccessController.getOverview);
+router.get('/api-access/tenants', apiAccessController.listTenantsForScope);
+router.get('/api-access/analytics', apiAccessController.getAnalytics);
+router.get('/api-access/logs', apiAccessController.listLogs);
+router.get('/api-access/events', apiAccessController.listEvents);
+router.get('/api-access/keys', apiAccessController.listKeys);
+router.get('/api-access/projects', apiAccessController.listProjects);
+router.post('/api-access/projects', apiAccessController.createProject);
+router.get('/api-access/projects/:projectId', apiAccessController.getProjectById);
+router.patch('/api-access/projects/:projectId', apiAccessController.updateProject);
+router.get('/api-access/projects/:projectId/keys', apiAccessController.listKeys);
+router.post('/api-access/projects/:projectId/keys', apiAccessController.createKey);
+router.get('/api-access/projects/:projectId/logs', apiAccessController.listLogs);
+router.get('/api-access/projects/:projectId/events', apiAccessController.listEvents);
+router.get('/api-access/projects/:projectId/analytics', apiAccessController.getAnalytics);
+router.patch('/api-access/keys/:keyId', apiAccessController.updateKey);
+router.post('/api-access/keys/:keyId/revoke', apiAccessController.revokeKey);
+router.post('/api-access/keys/:keyId/regenerate', apiAccessController.regenerateKey);
+
 router.get('/support', validate(validateListQuery), superAdminController.getSupportConsole);
 router.post('/support', validate(validateSupportTicketCreate), superAdminController.createSupportTicket);
 router.patch('/support/:id', validate(validateSupportTicketPatch), superAdminController.patchSupportTicket);
@@ -116,4 +140,3 @@ router.get('/settings', superAdminController.getSettings);
 router.patch('/settings', superAdminController.patchSettings);
 
 module.exports = router;
-

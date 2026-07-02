@@ -1,5 +1,15 @@
 const { isBlank } = require('../../utils/validators');
 const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
+const isValidTimezone = (value) => {
+  const timezone = String(value || '').trim();
+  if (!timezone) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
 const allowedScopeLevels = new Set(['country', 'state', 'district', 'city', 'zone']);
 const allowedGeographyLevels = new Set(['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster']);
 const scopeRequiredFields = {
@@ -19,6 +29,9 @@ const validateTenantCreate = (req) => {
   }
   if (req.body.scopeLevel !== undefined && !allowedScopeLevels.has(String(req.body.scopeLevel).trim().toLowerCase())) {
     errors.push('scopeLevel must be one of country|state|district|city|zone');
+  }
+  if (req.body.timezone !== undefined && !isValidTimezone(req.body.timezone)) {
+    errors.push('timezone must be a valid IANA timezone');
   }
   const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
   const requiredFields = scopeRequiredFields[scopeLevel] || [];
@@ -55,6 +68,9 @@ const validateFacilityCreate = (req) => {
   if (isBlank(req.body.code)) errors.push('code is required');
   if (isBlank(req.body.name)) errors.push('name is required');
   if (isBlank(req.body.facilityType)) errors.push('facilityType is required');
+  if (req.body.timezone !== undefined && !isBlank(req.body.timezone) && !isValidTimezone(req.body.timezone)) {
+    errors.push('timezone must be a valid IANA timezone');
+  }
   return errors;
 };
 
@@ -82,6 +98,9 @@ const validateUnitCreate = (req) => {
   }
   if (req.body.locationLabel && String(req.body.locationLabel).length > 300) {
     errors.push('locationLabel must be 300 characters or fewer');
+  }
+  if (req.body.timezone !== undefined && !isBlank(req.body.timezone) && !isValidTimezone(req.body.timezone)) {
+    errors.push('timezone must be a valid IANA timezone');
   }
   return errors;
 };

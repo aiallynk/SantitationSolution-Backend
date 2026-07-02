@@ -34,6 +34,7 @@ const {
 } = require('./toiletQr.service');
 const { runtimeConfig } = require('../../config/runtime');
 const { computeToiletRiskWeight } = require('./toiletMapRisk.helper');
+const { getDefaultTimezone, isValidIanaTimezone, normalizeTimezone } = require('../../utils/timezone');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -96,6 +97,19 @@ const sanitizeOptionalText = (value, limit = 180) => {
   if (value === undefined || value === null) return null;
   const normalized = sanitizeText(value, limit);
   return normalized || null;
+};
+
+const normalizeTimezoneInput = (value, { nullable = false } = {}) => {
+  if (value === undefined) return undefined;
+  const raw = String(value || '').trim();
+  if (!raw) return nullable ? null : getDefaultTimezone();
+  if (!isValidIanaTimezone(raw)) {
+    throw new AppError('timezone must be a valid IANA timezone', 400, {
+      code: 'INVALID_TIMEZONE',
+      details: { timezone: raw },
+    });
+  }
+  return raw;
 };
 
 const toFiniteNumber = (value) => {
@@ -228,6 +242,7 @@ const mapTenantRow = (tenant) => ({
   zoneName: tenant.zone_name || null,
   addressLine: tenant.address_line || null,
   rootGeographyId: tenant.root_geography_id || null,
+  timezone: normalizeTimezone(tenant.timezone || tenant.metadata?.timezone || getDefaultTimezone()),
   metadata: tenant.metadata || null,
 });
 
@@ -1399,6 +1414,9 @@ const mapUnitRow = (row, options = {}) => {
     baselineConfidence: resolveBaselineConfidence(totalInspections),
     totalInspections,
     lastInspectionAt: row.last_inspection_at || null,
+    timezone: row.timezone || null,
+    timezoneSource: row.timezone ? 'toilet' : row.Facility?.timezone ? 'facility' : 'tenant',
+    facilityTimezone: row.Facility?.timezone || row.Facility?.metadata?.timezone || null,
     dirtyFrequency:
       row.dirty_frequency !== null && row.dirty_frequency !== undefined
         ? Number(row.dirty_frequency)
@@ -2021,6 +2039,12 @@ const createTenant = async (req) => {
       zoneName,
     },
   });
+  const tenantTimezone = normalizeTimezoneInput(req.body.timezone ?? getDefaultTimezone(), { nullable: false });
+  const tenantMetadata =
+    req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
+      ? { ...req.body.metadata }
+      : {};
+  tenantMetadata.timezone = tenantTimezone;
   const tenant = await Tenant.create({
     name: tenantName,
     code: tenantCode,
@@ -2037,7 +2061,8 @@ const createTenant = async (req) => {
     zone_name: zoneName,
     address_line: sanitizeOptionalText(req.body.addressLine, 300),
     root_geography_id: req.body.rootGeographyId || null,
-    metadata: req.body.metadata || null,
+    timezone: tenantTimezone,
+    metadata: tenantMetadata,
   });
   await createAuditLog({
     req,
@@ -2102,6 +2127,18 @@ const patchTenant = async (req) => {
     },
   });
 
+  const nextTimezone =
+    req.body.timezone !== undefined
+      ? normalizeTimezoneInput(req.body.timezone, { nullable: false })
+      : normalizeTimezone(tenant.timezone || tenant.metadata?.timezone || getDefaultTimezone());
+  const nextTenantMetadata = {
+    ...(tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {}),
+    ...(req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
+      ? req.body.metadata
+      : {}),
+    timezone: nextTimezone,
+  };
+
   await tenant.update({
     name: req.body.name ? sanitizeText(req.body.name, 200) : tenant.name,
     code:
@@ -2143,7 +2180,8 @@ const patchTenant = async (req) => {
       req.body.rootGeographyId !== undefined
         ? req.body.rootGeographyId || null
         : tenant.root_geography_id,
-    metadata: req.body.metadata ?? tenant.metadata,
+    timezone: nextTimezone,
+    metadata: nextTenantMetadata,
     updated_at: new Date(),
   });
   await createAuditLog({
@@ -2163,7 +2201,7 @@ const mapTenantProfileForClient = (tenant) => {
     ...row,
     addressLine2: metadata.addressLine2 || null,
     pincode: metadata.pincode || null,
-    timezone: metadata.timezone || null,
+    timezone: normalizeTimezone(tenant.timezone || metadata.timezone || getDefaultTimezone()),
   };
 };
 
@@ -2203,8 +2241,9 @@ const patchOwnTenantProfile = async (req) => {
     nextMetadata.pincode = pincode;
   }
   if (req.body.timezone !== undefined) {
-    nextMetadata.timezone = sanitizeOptionalText(req.body.timezone, 64);
+    nextMetadata.timezone = normalizeTimezoneInput(req.body.timezone, { nullable: false });
   }
+  const nextTimezone = nextMetadata.timezone || normalizeTimezone(tenant.timezone || getDefaultTimezone());
 
   await tenant.update({
     name: req.body.name ? sanitizeText(req.body.name, 200) : tenant.name,
@@ -2248,6 +2287,7 @@ const patchOwnTenantProfile = async (req) => {
       req.body.addressLine !== undefined
         ? sanitizeOptionalText(req.body.addressLine, 300)
         : tenant.address_line,
+    timezone: nextTimezone,
     metadata: nextMetadata,
     updated_at: new Date(),
   });
@@ -2609,6 +2649,7 @@ const mapFacilityRow = (row) => ({
   latitude: row.latitude !== null ? Number(row.latitude) : null,
   longitude: row.longitude !== null ? Number(row.longitude) : null,
   status: row.status,
+  timezone: row.timezone || row.metadata?.timezone || null,
   metadata: row.metadata || null,
 });
 
@@ -2693,6 +2734,7 @@ const createFacility = async (req) => {
     tenantId,
   });
 
+  const facilityTimezone = normalizeTimezoneInput(req.body.timezone, { nullable: true });
   const facility = await Facility.create({
     tenant_id: tenantId,
     geography_id: geography?.id || ward?.id || zone?.id || null,
@@ -2705,6 +2747,7 @@ const createFacility = async (req) => {
     address_line: req.body.addressLine ? sanitizeText(req.body.addressLine, 300) : null,
     latitude: toFiniteNumber(req.body.latitude),
     longitude: toFiniteNumber(req.body.longitude),
+    timezone: facilityTimezone,
     status: req.body.status || 'active',
     metadata: req.body.metadata || null,
   });
@@ -2777,6 +2820,10 @@ const patchFacility = async (req) => {
       ? geography?.id || ward?.id || zone?.id || null
       : facility.geography_id;
 
+  const facilityTimezone =
+    req.body.timezone !== undefined
+      ? normalizeTimezoneInput(req.body.timezone, { nullable: true })
+      : facility.timezone;
   await facility.update({
     geography_id: nextGeographyId,
     zone_geography_id:
@@ -2793,6 +2840,7 @@ const patchFacility = async (req) => {
       req.body.addressLine !== undefined ? sanitizeOptionalText(req.body.addressLine, 300) : facility.address_line,
     latitude: req.body.latitude !== undefined ? toFiniteNumber(req.body.latitude) : facility.latitude,
     longitude: req.body.longitude !== undefined ? toFiniteNumber(req.body.longitude) : facility.longitude,
+    timezone: facilityTimezone,
     status: req.body.status || facility.status,
     metadata: req.body.metadata ?? facility.metadata,
     updated_at: new Date(),
@@ -2988,6 +3036,7 @@ const listUnits = async (req) => {
       'address_line',
       'latitude',
       'longitude',
+      'timezone',
 
       'geography_id',
       'zone_geography_id',
@@ -3146,6 +3195,7 @@ const listToiletMap = async (req) => {
       'address_line',
       'latitude',
       'longitude',
+      'timezone',
       'geography_id',
       'zone_geography_id',
       'ward_geography_id',
@@ -3336,6 +3386,8 @@ const listToiletMap = async (req) => {
         zoneGeographyId: row.Facility?.zone_geography_id || null,
         facilityId: row.facility_id,
         facilityName: row.Facility?.name || null,
+        timezone: row.timezone || row.Facility?.timezone || row.Facility?.metadata?.timezone || null,
+        timezoneSource: row.timezone ? 'toilet' : row.Facility?.timezone ? 'facility' : 'tenant',
         locationLabel: row.location_label || row.Facility?.address_line || row.Facility?.name || null,
         lastInspectionAt: row.last_inspection_at || null,
         activeComplaintsCount,
@@ -3468,6 +3520,7 @@ const createUnit = async (req) => {
           : facility.address_line || facility.name,
         latitude: toOptionalCoordinate(req.body.latitude ?? facility.latitude),
         longitude: toOptionalCoordinate(req.body.longitude ?? facility.longitude),
+        timezone: normalizeTimezoneInput(req.body.timezone, { nullable: true }),
       },
       { transaction }
     );

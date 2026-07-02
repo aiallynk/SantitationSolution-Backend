@@ -8,7 +8,8 @@ node_modules/
 
 # Runtime uploads/temp
 uploads/
-backups/
+/backups/
+db-backups/
 tmp/backfills/
 
 # Firebase admin credentials (never commit)

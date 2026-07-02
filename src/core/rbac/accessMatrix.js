@@ -118,6 +118,7 @@ const RouteKeyToPaths = {
     '/sa/sync-failures',
     '/sa/device-fleet',
     '/sa/tenant-health',
+    '/sa/api-access',
     '/sa/master-data',
     '/sa/scoring-thresholds',
     '/sa/escalation-policies',

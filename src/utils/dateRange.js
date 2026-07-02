@@ -1,6 +1,7 @@
 const { Op } = require('sequelize');
+const { getDefaultTimezone, normalizeTimezone } = require('./timezone');
 
-const DEFAULT_TIME_ZONE = 'Asia/Kolkata';
+const DEFAULT_TIME_ZONE = getDefaultTimezone();
 
 const DATE_RANGE_DEFS = {
   today: { days: 1, label: 'Today' },
@@ -131,7 +132,7 @@ const resolveDateRange = (query = {}, options = {}) => {
   const maxDays = Number.isFinite(Number(options.maxDays)) ? Number(options.maxDays) : 90;
   const defaultRange = normalizeDateRange(options.defaultRange);
   const now = options.now instanceof Date ? options.now : new Date();
-  const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
+  const timeZone = normalizeTimezone(options.timeZone || DEFAULT_TIME_ZONE);
 
   const from = parseDate(source.from || source.start || source.startDate || source.dateFrom, { timeZone });
   const to = parseDate(source.to || source.end || source.endDate || source.dateTo, { endOfDay: true, timeZone });
