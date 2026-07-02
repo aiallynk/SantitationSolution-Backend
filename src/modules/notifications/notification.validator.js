@@ -212,24 +212,6 @@ const validateBroadcastSend = (req) => {
     errors.push('userIds must only contain valid UUID values');
   }
 
-  if (
-    req.body?.payload !== undefined &&
-    (typeof req.body.payload !== 'object' ||
-      Array.isArray(req.body.payload) ||
-      req.body.payload === null)
-  ) {
-    errors.push('payload must be an object when provided');
-  }
-
-  if (
-    req.body?.metadata !== undefined &&
-    (typeof req.body.metadata !== 'object' ||
-      Array.isArray(req.body.metadata) ||
-      req.body.metadata === null)
-  ) {
-    errors.push('metadata must be an object when provided');
-  }
-
   return errors;
 };
 

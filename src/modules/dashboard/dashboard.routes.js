@@ -2,7 +2,7 @@ const express = require('express');
 const dashboardController = require('./dashboard.controller');
 const {
   protect,
-  requirePermissions,
+  requireAnyPermissions,
   requireRouteKey,
   requireScope,
   requireSurface,
@@ -21,12 +21,14 @@ router.use(
   ),
   requireRouteKey(
     RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_REPORTS,
     RouteKeys.OPS_AUDITOR_DASHBOARD,
     RouteKeys.OPS_AUDITOR_MONITORING,
     RouteKeys.OPS_AUDITOR_ATTENDANCE,
+    RouteKeys.OPS_AUDITOR_REPORTS,
   ),
   requireScope({ scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY] }),
-  requirePermissions('dashboard.read'),
+  requireAnyPermissions('dashboard.read', 'reports.read'),
 );
 
 router.get('/dashboard/overview', dashboardController.getOverview);

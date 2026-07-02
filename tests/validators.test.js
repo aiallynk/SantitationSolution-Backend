@@ -154,8 +154,6 @@ test('validateBroadcastSend accepts a valid tenant role broadcast payload', () =
       body: 'Please inspect immediately.',
       priority: 'HIGH',
       notificationType: 'ALERT',
-      payload: { source: 'unit-test' },
-      metadata: { requestedBy: 'tester' },
     },
   });
   assert.deepEqual(errors, []);
