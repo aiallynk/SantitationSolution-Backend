@@ -5,6 +5,9 @@ const {
   ToiletUnit,
   ToiletBlock,
   Facility,
+  Tenant,
+  ApiKey,
+  ApiProject,
   Inspection,
   AiAnalysisResult,
   SensorDevice,
@@ -14,41 +17,27 @@ const {
 const { runtimeConfig } = require('../../config/runtime');
 const { formatInTimezone } = require('../../utils/timezone');
 const { normalizeList } = require('./publicApiAuth.middleware');
+const {
+  DEFAULT_ENDPOINT_PERMISSION,
+  INCLUDE_CLOSED_PERMISSION,
+  getApiScopeTenantIds,
+  haversineMeters,
+  isPublicOperational,
+  isTenantSharingEnabled,
+  normalizeOperationalStatus,
+  normalizeToiletCoordinates,
+  publicUnitWhere,
+  shouldIncludeForCleanliness,
+  toBoolean,
+  toNumberOrNull,
+} = require('./toiletPublicFilters');
 
 const IST_TIMEZONE = 'Asia/Kolkata';
-const DEFAULT_ENDPOINT_PERMISSION = 'toilets:nearby:read';
-const INCLUDE_CLOSED_PERMISSION = 'toilets:include_closed';
-
-const toNumberOrNull = (value) => {
-  if (value === null || value === undefined || value === '') return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-};
 
 const clampScore = (value) => {
   const parsed = toNumberOrNull(value);
   if (parsed === null) return null;
   return Math.max(0, Math.min(100, Number(parsed.toFixed(2))));
-};
-
-const toBoolean = (value, fallback = false) => {
-  if (value === undefined || value === null) return fallback;
-  if (typeof value === 'boolean') return value;
-  const normalized = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return fallback;
-};
-
-const haversineMeters = ({ lat1, lng1, lat2, lng2 }) => {
-  const radiusMeters = 6371_000;
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return radiusMeters * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
 const publicToiletId = (id) =>
@@ -60,12 +49,6 @@ const getMetadata = (row) => {
   return metadata;
 };
 
-const getUnitCoordinates = (unit) => {
-  const lat = toNumberOrNull(unit.latitude) ?? toNumberOrNull(unit.Facility?.latitude);
-  const lng = toNumberOrNull(unit.longitude) ?? toNumberOrNull(unit.Facility?.longitude);
-  return lat === null || lng === null ? null : { lat, lng };
-};
-
 const getPublicName = (unit) => {
   const facilityName = unit.Facility?.name || 'Public Toilet';
   const blockName = unit.ToiletBlock?.name || '';
@@ -74,19 +57,11 @@ const getPublicName = (unit) => {
 };
 
 const getAvailabilityStatus = (unit) => {
-  const unitStatus = String(unit.status || '').toLowerCase();
-  const facilityStatus = String(unit.Facility?.status || '').toLowerCase();
-  const deleted = Boolean(unit.deleted_at);
-  if (deleted || unitStatus === 'out_of_service' || facilityStatus === 'inactive') {
-    return 'closed';
-  }
-  if (facilityStatus === 'maintenance' || unitStatus === 'critical') {
-    return 'temporarily_closed';
-  }
-  return 'operational';
+  const status = normalizeOperationalStatus(unit);
+  if (status === 'Open') return 'operational';
+  if (status === 'Maintenance') return 'temporarily_closed';
+  return 'closed';
 };
-
-const isOperational = (unit) => getAvailabilityStatus(unit) === 'operational';
 
 const extractPublicFacilities = (unit) => {
   const unitMetadata = getMetadata(unit);
@@ -247,15 +222,36 @@ const validateNearbyQuery = (query = {}) => {
   return { lat, lng, radius, limit, cleanlinessMin, includeClosed };
 };
 
-const resolveTenantScope = ({ apiKey, project, requestedTenantId }) => {
-  const projectTenantIds = normalizeList(project?.allowed_tenant_ids);
-  const keyTenantIds = normalizeList(apiKey?.allowed_tenant_ids);
-  const allowed = keyTenantIds.length > 0 ? keyTenantIds : projectTenantIds;
-  if (!requestedTenantId) return allowed;
-  if (!allowed.includes(String(requestedTenantId))) {
+const resolveEligibleTenants = async ({ apiKey, project, requestedTenantId }) => {
+  const scopedTenantIds = getApiScopeTenantIds({ apiKey, project });
+  const requested = requestedTenantId ? String(requestedTenantId) : null;
+  if (requested && scopedTenantIds.length > 0 && !scopedTenantIds.includes(requested)) {
     throw new AppError('Requested tenant is outside API key scope', 403, { code: 'TENANT_SCOPE_FORBIDDEN' });
   }
-  return [String(requestedTenantId)];
+
+  const where = {
+    status: 'active',
+    external_api_sharing_enabled: true,
+  };
+  if (requested) {
+    where.id = requested;
+  } else if (scopedTenantIds.length > 0) {
+    where.id = { [Op.in]: scopedTenantIds };
+  }
+
+  const tenants = await Tenant.findAll({
+    where,
+    attributes: ['id', 'name', 'code', 'status', 'external_api_sharing_enabled', 'metadata'],
+  });
+  const tenantIds = tenants.map((tenant) => String(tenant.id));
+
+  if (requested && !tenantIds.includes(requested)) {
+    throw new AppError('Requested tenant is not enabled for external sharing', 403, {
+      code: 'TENANT_SHARING_DISABLED',
+    });
+  }
+
+  return { tenantIds, tenants };
 };
 
 const fetchLatestSignals = async (toiletIds) => {
@@ -337,26 +333,26 @@ const getNearbyToilets = async (req) => {
     throw new AppError('API key is not allowed to request closed toilets', 403, { code: 'INCLUDE_CLOSED_FORBIDDEN' });
   }
 
-  const tenantIds = resolveTenantScope({
+  const { tenantIds } = await resolveEligibleTenants({
     apiKey,
     project,
     requestedTenantId: req.query.tenant_id,
   });
 
   if (tenantIds.length === 0) {
+    req.publicApi = {
+      ...(req.publicApi || {}),
+      nearbyStats: {
+        eligible_tenant_count: 0,
+        candidate_toilet_count: 0,
+        returned_count: 0,
+      },
+    };
     return { items: [], meta: { count: 0, radiusMeters: radius, limit, tenantScoped: false } };
   }
 
-  const where = {
-    is_public_visible: true,
-    deleted_at: null,
-  };
-  if (!includeClosed) {
-    where.status = { [Op.ne]: 'out_of_service' };
-  }
-
   const units = await ToiletUnit.findAll({
-    where,
+    where: publicUnitWhere({ includeClosed }),
     attributes: [
       'id',
       'facility_id',
@@ -372,6 +368,8 @@ const getNearbyToilets = async (req) => {
       'last_inspection_at',
       'last_cleaned_at',
       'timezone',
+      'location',
+      'created_at',
       'updated_at',
       'deleted_at',
     ],
@@ -382,7 +380,7 @@ const getNearbyToilets = async (req) => {
         attributes: ['id', 'tenant_id', 'name', 'address_line', 'latitude', 'longitude', 'status', 'timezone', 'metadata'],
         where: {
           tenant_id: { [Op.in]: tenantIds },
-          ...(includeClosed ? {} : { status: 'active' }),
+          ...(includeClosed ? {} : { status: { [Op.notIn]: ['inactive', 'maintenance'] } }),
         },
       },
       {
@@ -394,10 +392,27 @@ const getNearbyToilets = async (req) => {
     limit: Math.max(limit * 10, 200),
   });
 
+  const stats = {
+    eligible_tenant_count: tenantIds.length,
+    candidate_toilet_count: units.length,
+    returned_count: 0,
+    dropped_missing_coordinates_count: 0,
+    dropped_invalid_coordinates_count: 0,
+    dropped_tenant_sharing_count: 0,
+    dropped_api_scope_count: 0,
+    dropped_public_visibility_count: 0,
+    dropped_status_count: 0,
+    dropped_cleanliness_count: 0,
+  };
+
   const withinRadius = units
     .map((unit) => {
-      const coordinates = getUnitCoordinates(unit);
-      if (!coordinates) return null;
+      const coordinates = normalizeToiletCoordinates(unit);
+      if (!coordinates.valid) {
+        if (coordinates.reason === 'MISSING_COORDINATES') stats.dropped_missing_coordinates_count += 1;
+        else stats.dropped_invalid_coordinates_count += 1;
+        return null;
+      }
       const distance = haversineMeters({
         lat1: lat,
         lng1: lng,
@@ -408,7 +423,11 @@ const getNearbyToilets = async (req) => {
       return { unit, coordinates, distance };
     })
     .filter(Boolean)
-    .filter(({ unit }) => includeClosed || isOperational(unit))
+    .filter(({ unit }) => {
+      const included = includeClosed || isPublicOperational(unit);
+      if (!included) stats.dropped_status_count += 1;
+      return included;
+    })
     .sort((left, right) => left.distance - right.distance)
     .slice(0, limit);
 
@@ -428,10 +447,11 @@ const getNearbyToilets = async (req) => {
         sensorReading,
         activeComplaintCount: complaintsByToilet.get(unit.id) || 0,
       });
-      if (cleanlinessMin !== null && cleanliness.cleanliness_score !== null && cleanliness.cleanliness_score < cleanlinessMin) {
-        return null;
-      }
-      if (cleanlinessMin !== null && cleanliness.cleanliness_score === null) {
+      if (!shouldIncludeForCleanliness({
+        cleanlinessScore: cleanliness.cleanliness_score,
+        cleanlinessMin,
+      })) {
+        stats.dropped_cleanliness_count += 1;
         return null;
       }
       const verifiedAt = inspection?.captured_at || unit.last_inspection_at || unit.updated_at || null;
@@ -455,6 +475,12 @@ const getNearbyToilets = async (req) => {
     .filter(Boolean)
     .slice(0, limit);
 
+  stats.returned_count = items.length;
+  req.publicApi = {
+    ...(req.publicApi || {}),
+    nearbyStats: stats,
+  };
+
   return {
     items,
     meta: {
@@ -467,8 +493,234 @@ const getNearbyToilets = async (req) => {
   };
 };
 
+const loadDebugApiKeyContext = async ({ apiKeyId, keyPrefix }) => {
+  if (!apiKeyId && !keyPrefix) return { apiKey: null, project: null };
+  const where = apiKeyId ? { id: apiKeyId } : { key_prefix: { [Op.iLike]: `${String(keyPrefix).trim()}%` } };
+  const apiKey = await ApiKey.findOne({
+    where,
+    include: [{ model: ApiProject, as: 'project', required: false }],
+  });
+  if (!apiKey) {
+    throw new AppError('API key not found for debug simulation', 404, { code: 'API_KEY_NOT_FOUND' });
+  }
+  return { apiKey, project: apiKey.project || apiKey.ApiProject || null };
+};
+
+const sampleToilet = ({ unit, reason = null, fieldValue = undefined, distance = null, cleanliness = null, coordinates = null }) => ({
+  toiletId: unit.id,
+  toiletUnitId: unit.id,
+  toiletName: getPublicName(unit),
+  tenantId: unit.Facility?.tenant_id || null,
+  tenantName: unit.Facility?.Tenant?.name || null,
+  status: normalizeOperationalStatus(unit),
+  isPublicVisible: Boolean(unit.is_public_visible),
+  latitude: unit.latitude ?? null,
+  longitude: unit.longitude ?? null,
+  locationCoordinates: unit.location?.coordinates || null,
+  cleanlinessScore: cleanliness?.cleanliness_score ?? unit.latest_after_score ?? unit.latest_score ?? null,
+  lastInspectionTime: unit.last_inspection_at || null,
+  environment: process.env.NODE_ENV || runtimeConfig.nodeEnv || null,
+  createdAt: unit.created_at || null,
+  updatedAt: unit.updated_at || null,
+  ...(distance !== null ? { distanceMeters: Math.round(distance) } : {}),
+  ...(coordinates ? { normalizedCoordinates: coordinates } : {}),
+  ...(reason ? { reason, fieldValue } : {}),
+});
+
+const addExcluded = (excludedSamples, payload) => {
+  if (excludedSamples.length >= 50) return;
+  excludedSamples.push(payload);
+};
+
+const getDebugNearbyToilets = async ({
+  lat,
+  lng,
+  radius,
+  apiKeyId = null,
+  keyPrefix = null,
+  cleanlinessMin = 0,
+  includeClosed = false,
+} = {}) => {
+  const query = {
+    lat,
+    lng,
+    radius,
+    cleanliness_min: cleanlinessMin,
+    include_closed: includeClosed,
+    limit: 50,
+  };
+  const validated = validateNearbyQuery(query);
+  const { apiKey, project } = await loadDebugApiKeyContext({ apiKeyId, keyPrefix });
+  const scopedTenantIds = apiKey || project ? getApiScopeTenantIds({ apiKey, project }) : [];
+  const tenants = await Tenant.findAll({
+    attributes: ['id', 'name', 'code', 'status', 'external_api_sharing_enabled', 'metadata', 'created_at', 'updated_at'],
+  });
+  const tenantById = new Map(tenants.map((tenant) => [String(tenant.id), tenant]));
+  const sharingTenantIds = tenants.filter(isTenantSharingEnabled).map((tenant) => String(tenant.id));
+  const allowedTenantIds = scopedTenantIds.length > 0
+    ? sharingTenantIds.filter((tenantId) => scopedTenantIds.includes(tenantId))
+    : sharingTenantIds;
+
+  const units = await ToiletUnit.findAll({
+    attributes: [
+      'id',
+      'facility_id',
+      'toilet_block_id',
+      'code',
+      'unit_type',
+      'status',
+      'is_public_visible',
+      'location_label',
+      'latitude',
+      'longitude',
+      'latest_score',
+      'latest_after_score',
+      'last_inspection_at',
+      'location',
+      'created_at',
+      'updated_at',
+      'deleted_at',
+    ],
+    include: [
+      {
+        model: Facility,
+        required: false,
+        attributes: ['id', 'tenant_id', 'name', 'address_line', 'latitude', 'longitude', 'status', 'metadata'],
+        include: [{ model: Tenant, attributes: ['id', 'name', 'code', 'external_api_sharing_enabled'], required: false }],
+      },
+      { model: ToiletBlock, required: false, attributes: ['id', 'name', 'gender_type', 'status'] },
+    ],
+    limit: 5000,
+  });
+
+  const toiletIds = units.map((unit) => unit.id).filter(Boolean);
+  const { inspectionsByToilet, aiByInspection, sensorByToilet, complaintsByToilet } = await fetchLatestSignals(toiletIds);
+  const funnel = {
+    totalToiletsInDb: units.length,
+    withValidCoordinates: 0,
+    withinRadius: 0,
+    afterTenantSharing: 0,
+    afterApiKeyScope: 0,
+    afterPublicVisible: 0,
+    afterStatusFilter: 0,
+    afterCleanlinessFilter: 0,
+    finalReturned: 0,
+  };
+  const excludedSamples = [];
+  const matchedSamples = [];
+
+  for (const unit of units) {
+    const coordinates = normalizeToiletCoordinates(unit);
+    if (!coordinates.valid) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: coordinates.reason, fieldValue: coordinates, coordinates }));
+      continue;
+    }
+    funnel.withValidCoordinates += 1;
+    const distance = haversineMeters({
+      lat1: validated.lat,
+      lng1: validated.lng,
+      lat2: coordinates.lat,
+      lng2: coordinates.lng,
+    });
+    if (distance > validated.radius) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'OUTSIDE_RADIUS', fieldValue: Math.round(distance), distance, coordinates }));
+      continue;
+    }
+    funnel.withinRadius += 1;
+
+    const tenantId = String(unit.Facility?.tenant_id || '');
+    const tenant = tenantById.get(tenantId) || unit.Facility?.Tenant || null;
+    if (!tenant || !isTenantSharingEnabled(tenant)) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'TENANT_SHARING_DISABLED', fieldValue: tenant?.external_api_sharing_enabled ?? null, distance, coordinates }));
+      continue;
+    }
+    funnel.afterTenantSharing += 1;
+
+    if (scopedTenantIds.length > 0 && !scopedTenantIds.includes(tenantId)) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'API_KEY_TENANT_SCOPE_DENIED', fieldValue: tenantId, distance, coordinates }));
+      continue;
+    }
+    funnel.afterApiKeyScope += 1;
+
+    if (unit.is_public_visible !== true) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'IS_PUBLIC_VISIBLE_FALSE', fieldValue: unit.is_public_visible, distance, coordinates }));
+      continue;
+    }
+    funnel.afterPublicVisible += 1;
+
+    if (!validated.includeClosed && !isPublicOperational(unit)) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'STATUS_NOT_ALLOWED', fieldValue: normalizeOperationalStatus(unit), distance, coordinates }));
+      continue;
+    }
+    funnel.afterStatusFilter += 1;
+
+    const inspection = inspectionsByToilet.get(unit.id) || null;
+    const aiResult = inspection ? aiByInspection.get(inspection.id) || null : null;
+    const cleanliness = computeCleanliness({
+      unit,
+      inspection,
+      aiResult,
+      sensorReading: sensorByToilet.get(unit.id) || null,
+      activeComplaintCount: complaintsByToilet.get(unit.id) || 0,
+    });
+    if (!shouldIncludeForCleanliness({ cleanlinessScore: cleanliness.cleanliness_score, cleanlinessMin: validated.cleanlinessMin })) {
+      addExcluded(excludedSamples, sampleToilet({ unit, reason: 'CLEANLINESS_BELOW_THRESHOLD', fieldValue: cleanliness.cleanliness_score, distance, cleanliness, coordinates }));
+      continue;
+    }
+    funnel.afterCleanlinessFilter += 1;
+    funnel.finalReturned += 1;
+    if (matchedSamples.length < 50) {
+      matchedSamples.push(sampleToilet({ unit, distance, cleanliness, coordinates }));
+    }
+  }
+
+  const recommendedFixes = [];
+  if (funnel.withinRadius > funnel.afterTenantSharing) {
+    recommendedFixes.push('Enable external API sharing for tenants that should publish toilets.');
+  }
+  if (funnel.afterApiKeyScope > funnel.afterPublicVisible) {
+    recommendedFixes.push('Mark selected intended toilets as public visible.');
+  }
+  if (funnel.afterPublicVisible > funnel.afterStatusFilter) {
+    recommendedFixes.push('Set intended public toilets to an open or operational status.');
+  }
+  if (funnel.afterStatusFilter > funnel.afterCleanlinessFilter) {
+    recommendedFixes.push('Review cleanliness_min or unknown cleanliness policy.');
+  }
+  if (scopedTenantIds.length > 0 && funnel.afterTenantSharing > funnel.afterApiKeyScope) {
+    recommendedFixes.push('Update API key/project tenant scope to include the share-enabled tenant.');
+  }
+  if (funnel.withValidCoordinates < funnel.totalToiletsInDb) {
+    recommendedFixes.push('Fix missing or invalid toilet coordinates.');
+  }
+
+  return {
+    input: {
+      lat: validated.lat,
+      lng: validated.lng,
+      radius: validated.radius,
+      cleanliness_min: validated.cleanlinessMin ?? null,
+      include_closed: validated.includeClosed,
+      api_key_id: apiKey?.id || null,
+      key_prefix: apiKey?.key_prefix || keyPrefix || null,
+    },
+    funnel,
+    excludedSamples,
+    matchedSamples,
+    tenantScope: {
+      sharingEnabledTenantCount: sharingTenantIds.length,
+      apiScopeTenantCount: scopedTenantIds.length,
+      eligibleTenantCount: allowedTenantIds.length,
+    },
+    recommendedFixes,
+  };
+};
+
 module.exports = {
   getNearbyToilets,
+  getDebugNearbyToilets,
   validateNearbyQuery,
   computeCleanliness,
+  normalizeToiletCoordinates,
+  resolveEligibleTenants,
 };

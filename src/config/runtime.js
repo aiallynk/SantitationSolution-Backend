@@ -329,6 +329,10 @@ const runtimeConfig = Object.freeze({
       min: 1,
       max: 2160,
     }),
+    includeUnknownCleanlinessWhenMinZero: asBool(
+      rawEnv.PUBLIC_API_INCLUDE_UNKNOWN_CLEANLINESS_WHEN_MIN_ZERO,
+      true
+    ),
     apiKeyHashSecret: asText(rawEnv.PUBLIC_API_KEY_HASH_SECRET, ''),
   },
   live: {

@@ -18,6 +18,7 @@ const {
 } = require('../publicApi/apiKeyCrypto');
 const { EVENT_TYPES, recordApiKeyEvent } = require('../publicApi/apiKeyEvents.service');
 const { getDayWindow, getMonthWindow, DEFAULT_API_TIMEZONE } = require('../publicApi/timeWindow');
+const publicToiletService = require('../publicApi/publicToilet.service');
 
 const DEFAULT_ALLOWED_ENDPOINTS = ['/toilets/nearby'];
 const DEFAULT_PERMISSIONS = ['toilets:nearby:read'];
@@ -479,6 +480,12 @@ const updateKey = async (req) => {
     req.body.allowed_origins !== undefined ||
     req.body.allowedIps !== undefined ||
     req.body.allowed_ips !== undefined;
+  const endpointScopeChanged =
+    req.body.allowedEndpoints !== undefined ||
+    req.body.allowed_endpoints !== undefined;
+  const tenantScopeChanged =
+    req.body.allowedTenantIds !== undefined ||
+    req.body.allowed_tenant_ids !== undefined;
 
   if (req.body.keyName !== undefined || req.body.key_name !== undefined) {
     updates.key_name = sanitizeText(req.body.keyName || req.body.key_name, 180);
@@ -532,6 +539,24 @@ const updateKey = async (req) => {
       eventType: EVENT_TYPES.KEY_SCOPE_UPDATED,
       actorUserId: req.user.id,
       metadata: updates,
+    });
+  }
+  if (endpointScopeChanged) {
+    await recordApiKeyEvent({
+      apiProjectId: apiKey.api_project_id,
+      apiKeyId: apiKey.id,
+      eventType: EVENT_TYPES.KEY_ENDPOINT_SCOPE_UPDATED,
+      actorUserId: req.user.id,
+      metadata: { allowed_endpoints: updates.allowed_endpoints },
+    });
+  }
+  if (tenantScopeChanged) {
+    await recordApiKeyEvent({
+      apiProjectId: apiKey.api_project_id,
+      apiKeyId: apiKey.id,
+      eventType: EVENT_TYPES.KEY_TENANT_SCOPE_UPDATED,
+      actorUserId: req.user.id,
+      metadata: { allowed_tenant_ids: updates.allowed_tenant_ids },
     });
   }
 
@@ -992,7 +1017,7 @@ const getAnalytics = async (req) => {
 const listTenantsForScope = async (req) => {
   ensureSuperAdmin(req);
   const tenants = await Tenant.findAll({
-    attributes: ['id', 'name', 'code', 'status'],
+    attributes: ['id', 'name', 'code', 'status', 'external_api_sharing_enabled'],
     order: [['name', 'ASC']],
   });
   return tenants.map((tenant) => ({
@@ -1000,7 +1025,21 @@ const listTenantsForScope = async (req) => {
     name: tenant.name,
     code: tenant.code,
     status: tenant.status,
+    externalApiSharingEnabled: Boolean(tenant.external_api_sharing_enabled),
   }));
+};
+
+const debugNearbyToilets = async (req) => {
+  ensureSuperAdmin(req);
+  return publicToiletService.getDebugNearbyToilets({
+    lat: req.query.lat,
+    lng: req.query.lng,
+    radius: req.query.radius || 10000,
+    apiKeyId: req.query.api_key_id || req.query.apiKeyId || null,
+    keyPrefix: req.query.key_prefix || req.query.keyPrefix || null,
+    cleanlinessMin: req.query.cleanliness_min ?? req.query.cleanlinessMin ?? 0,
+    includeClosed: req.query.include_closed ?? req.query.includeClosed ?? false,
+  });
 };
 
 module.exports = {
@@ -1018,6 +1057,7 @@ module.exports = {
   listEvents,
   getAnalytics,
   listTenantsForScope,
+  debugNearbyToilets,
   mapKey,
   mapProject,
 };

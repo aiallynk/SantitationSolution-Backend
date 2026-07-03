@@ -97,6 +97,7 @@ router.get('/tenant-health', validate(validateListQuery), superAdminController.g
 
 router.get('/api-access/overview', apiAccessController.getOverview);
 router.get('/api-access/tenants', apiAccessController.listTenantsForScope);
+router.get('/api-access/debug/nearby-toilets', apiAccessController.debugNearbyToilets);
 router.get('/api-access/analytics', apiAccessController.getAnalytics);
 router.get('/api-access/logs', apiAccessController.listLogs);
 router.get('/api-access/events', apiAccessController.listEvents);
