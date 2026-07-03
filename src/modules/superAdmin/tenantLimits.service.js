@@ -233,16 +233,27 @@ async function recalculateTenantUsage(tenantId) {
       // Storage: aggregate content_length from inspection_media via inspections.tenant_id
       sequelize.query(
         `SELECT
-           COALESCE(SUM(im.content_length), 0) AS storage_used_bytes,
-           COUNT(im.id) AS image_count,
-           COALESCE(AVG(im.content_length), 0) AS avg_size,
-           COALESCE(MAX(im.content_length), 0) AS max_size,
-           MAX(im.created_at) AS latest_upload_at
-         FROM inspection_media im
-         JOIN inspections i ON im.inspection_id = i.id
-         WHERE i.tenant_id = :tenantId
-           AND im.upload_status = 'uploaded'
-           AND im.content_length IS NOT NULL`,
+           COALESCE(SUM(media_size_bytes), 0) AS storage_used_bytes,
+           COUNT(id) AS image_count,
+           COALESCE(AVG(media_size_bytes), 0) AS avg_size,
+           COALESCE(MAX(media_size_bytes), 0) AS max_size,
+           MAX(uploaded_at) AS latest_upload_at
+         FROM (
+           SELECT
+             im.id,
+             COALESCE(im.uploaded_at, im.created_at) AS uploaded_at,
+             COALESCE(
+               im.content_length,
+               CASE WHEN (im.metadata->>'bytes') ~ '^[0-9]+$' THEN (im.metadata->>'bytes')::bigint END,
+               CASE WHEN (im.metadata->>'contentLength') ~ '^[0-9]+$' THEN (im.metadata->>'contentLength')::bigint END,
+               CASE WHEN (im.metadata->>'fileSize') ~ '^[0-9]+$' THEN (im.metadata->>'fileSize')::bigint END
+             ) AS media_size_bytes
+           FROM inspection_media im
+           JOIN inspections i ON im.inspection_id = i.id
+           WHERE i.tenant_id = :tenantId
+             AND im.upload_status IN ('uploaded', 'confirmed')
+         ) media_sizes
+         WHERE media_size_bytes IS NOT NULL`,
         { replacements: { tenantId }, type: sequelize.QueryTypes.SELECT }
       ),
       // Total users

@@ -1,7 +1,9 @@
+const path = require('path');
 const dotenv = require('dotenv');
 const { defaults } = require('./defaults');
 
 dotenv.config({
+  path: path.resolve(__dirname, '../../.env'),
   override: false,
   quiet: true,
 });
@@ -241,8 +243,11 @@ const runtimeConfig = Object.freeze({
       apiSecret: asText(rawEnv.CLOUDINARY_API_SECRET, ''),
     },
     s3: {
-      region: asText(rawEnv.AWS_REGION, ''),
-      bucket: asText(rawEnv.AWS_S3_BUCKET, ''),
+      region: asText(rawEnv.AWS_REGION, asText(rawEnv.AWS_DEFAULT_REGION, '')),
+      bucket: asText(
+        rawEnv.AWS_S3_BUCKET,
+        asText(rawEnv.AWS_S3_BUCKET_NAME, asText(rawEnv.S3_BUCKET, asText(rawEnv.S3_BUCKET_NAME, '')))
+      ),
       accessKeyId: asText(rawEnv.AWS_ACCESS_KEY_ID, ''),
       secretAccessKey: asText(rawEnv.AWS_SECRET_ACCESS_KEY, ''),
       sessionToken: asText(rawEnv.AWS_SESSION_TOKEN, ''),

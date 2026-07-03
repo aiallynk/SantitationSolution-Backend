@@ -44,6 +44,7 @@ router.use(alertRoutes);
 router.use(dashboardRoutes);
 router.use(supervisorRoutes);
 router.use('/super-admin', superAdminRoutes);
+router.use('/superadmin', superAdminRoutes);
 router.use(reportRoutes);
 router.use(notificationRoutes);
 router.use(liveRoutes);

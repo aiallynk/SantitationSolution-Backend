@@ -4,6 +4,7 @@ const {
   requireAction,
   requirePermissions,
   requireRouteKey,
+  requireRoles,
   requireScope,
   requireSurface,
 } = require('../../core/middleware/auth');
@@ -14,6 +15,7 @@ const inspectionService = require('../../modules/inspections/inspection.service'
 const analysisService = require('../../modules/analysis/analysis.service');
 const authRouter = require('../../modules/auth/auth.routes');
 const appUpdateController = require('../../modules/appUpdate/appUpdate.controller');
+const storageUsageService = require('../../modules/superAdmin/storageUsage.service');
 const AppError = require('../../core/errors/AppError');
 const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessMatrix');
 
@@ -27,6 +29,16 @@ const COMMON_SCOPE_RULE = {
   scopeTypes: [ScopeTypes.NONE, ScopeTypes.GEOGRAPHY, ScopeTypes.FACILITY],
 };
 const OPS_WEB_SURFACES = [SurfaceTypes.OPS_WEB, SurfaceTypes.OPS_WEB_AND_MOBILE];
+const SUPER_ADMIN_STORAGE_ALIASES = [
+  '/api/superadmin/storage/usage',
+  '/api/super-admin/storage/usage',
+  '/api/v1/superadmin/storage/usage',
+];
+const SUPER_ADMIN_TENANT_STORAGE_ALIASES = [
+  '/api/superadmin/tenants/:id/storage/usage',
+  '/api/super-admin/tenants/:id/storage/usage',
+  '/api/v1/superadmin/tenants/:id/storage/usage',
+];
 
 // Legacy auth aliases
 router.use('/auth', authRouter);
@@ -34,6 +46,46 @@ router.use('/auth', authRouter);
 // Legacy app update aliases.
 router.get('/api/app/update', appUpdateController.getAppUpdateMetadata);
 router.get('/api/app/apk/:version', appUpdateController.downloadApkByVersion);
+
+router.get(
+  SUPER_ADMIN_STORAGE_ALIASES,
+  protect,
+  requireRoles('super_admin'),
+  requireSurface(SurfaceTypes.PLATFORM_WEB),
+  requireRouteKey(
+    RouteKeys.SA_OVERVIEW,
+    RouteKeys.SA_TENANTS,
+    RouteKeys.SA_PLATFORM_HEALTH,
+  ),
+  async (req, res, next) => {
+    try {
+      const data = await storageUsageService.getPlatformStorageUsage(req);
+      return sendSuccess(res, { message: 'S3 storage usage fetched successfully', data });
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+router.get(
+  SUPER_ADMIN_TENANT_STORAGE_ALIASES,
+  protect,
+  requireRoles('super_admin'),
+  requireSurface(SurfaceTypes.PLATFORM_WEB),
+  requireRouteKey(
+    RouteKeys.SA_OVERVIEW,
+    RouteKeys.SA_TENANTS,
+    RouteKeys.SA_PLATFORM_HEALTH,
+  ),
+  async (req, res, next) => {
+    try {
+      const data = await storageUsageService.getSuperAdminTenantStorageUsage(req);
+      return sendSuccess(res, { message: 'Tenant S3 storage usage fetched successfully', data });
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
 
 // Legacy inspections aliases for current frontend contract.
 router.get(

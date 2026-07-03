@@ -53,6 +53,8 @@ router.post('/tenants/:id/usage/recalculate', superAdminController.recalculateTe
 router.get('/regions', superAdminController.getRegions);
 router.get('/platform-metrics', superAdminController.getPlatformMetrics);
 router.get('/storage', validate(validateListQuery), superAdminController.getStorage);
+router.get('/storage/usage', superAdminController.getPlatformStorageUsage);
+router.get('/tenants/:id/storage/usage', superAdminController.getTenantStorageUsage);
 router.get('/api-usage', superAdminController.getApiUsage);
 router.get('/system-health', superAdminController.getSystemHealth);
 router.get('/audit-logs', validate(validateListQuery), superAdminController.getAuditLogs);
