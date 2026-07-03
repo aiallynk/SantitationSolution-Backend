@@ -44,6 +44,10 @@ const {
   startReminderScheduler,
   stopReminderScheduler,
 } = require('./modules/automation/reminder.service');
+const {
+  startBackupScheduler,
+  stopBackupScheduler,
+} = require('./modules/backups/backup.scheduler');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -428,6 +432,9 @@ const bootstrap = async () => {
     bootDebug('startReminderScheduler started');
     startReminderScheduler();
     bootDebug('startReminderScheduler completed');
+    bootDebug('startBackupScheduler started');
+    startBackupScheduler();
+    bootDebug('startBackupScheduler completed');
     bootDebug('startTempFileJanitor started');
     startTempFileJanitor();
     bootDebug('startTempFileJanitor completed');
@@ -487,6 +494,7 @@ const gracefulShutdown = async (signal, exitCode = 0) => {
     stopAnalysisJobWatchdog();
     stopImageSessionReconciler();
     stopReminderScheduler();
+    stopBackupScheduler();
     stopTempFileJanitor();
     await closeQueues();
     await sequelize.close();

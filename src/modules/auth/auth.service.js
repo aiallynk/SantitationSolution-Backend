@@ -10,6 +10,7 @@ const {
   PasswordResetToken,
   Tenant,
   WorkerAssignment,
+  BackupSchedule,
 } = require('../../models');
 const { resolveRoleProfile } = require('../../core/rbac/accessProfiles');
 const { resolveEffectiveScope, uniqueIds } = require('../../core/rbac/scopeResolver');
@@ -22,6 +23,8 @@ const {
 } = require('./token.service');
 const { createAuditLog } = require('../audit/audit.service');
 const { runtimeConfig } = require('../../config/runtime');
+const { isValidIanaTimezone } = require('../../utils/timezone');
+const { nextDailyRun } = require('../backups/backupSchedule');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 
@@ -551,7 +554,6 @@ const getMe = async ({ userId, activeTenantId }) => {
   if (!user) {
     throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
   }
-
   const resolvedActiveTenantId = resolveActiveTenantId({
     user,
     requestedTenantId: activeTenantId || null,
@@ -567,6 +569,10 @@ const updateMe = async ({ userId, body, req }) => {
   if (!user) {
     throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
   }
+  const previousTimezone =
+    user.metadata?.preferences?.timezone ||
+    user.metadata?.accountPreferences?.timezone ||
+    null;
 
   const updates = {
     updated_at: new Date(),
@@ -600,6 +606,31 @@ const updateMe = async ({ userId, body, req }) => {
   }
 
   await user.update(updates);
+
+  const updatedTimezone =
+    body.metadata?.preferences?.timezone ||
+    body.metadata?.accountPreferences?.timezone ||
+    null;
+  if (
+    req.user?.isSuperAdmin &&
+    isValidIanaTimezone(updatedTimezone) &&
+    updatedTimezone !== previousTimezone
+  ) {
+    const schedules = await BackupSchedule.findAll({
+      where: { created_by: user.id },
+      attributes: ['id', 'run_time', 'enabled'],
+    });
+    for (const schedule of schedules) {
+      await schedule.update({
+        timezone: updatedTimezone,
+        next_run_at: schedule.enabled
+          ? nextDailyRun(schedule.run_time || '02:00:00', updatedTimezone)
+          : null,
+        updated_by: user.id,
+        updated_at: new Date(),
+      });
+    }
+  }
 
   await createAuditLog({
     req,

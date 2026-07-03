@@ -96,6 +96,7 @@ const RouteKeyToPaths = {
     '/sa/dashboard',
     '/sa/action-center',
     '/sa/notifications',
+    '/sa/profile',
     '/sa/multi-city',
   ],
   [RouteKeys.SA_TENANTS]: [

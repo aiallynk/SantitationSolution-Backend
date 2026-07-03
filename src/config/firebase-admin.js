@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const { logger } = require('../core/logging/logger');
 
-let firebaseAdmin = null;
+let firebaseApp = null;
+let firebaseMessagingSdk = null;
 let initializationState = {
   initialized: false,
   enabled: false,
@@ -128,10 +129,12 @@ const initializeFirebaseAdmin = () => {
     projectId: null,
   };
 
-  let admin = null;
+  let appSdk = null;
   try {
     // eslint-disable-next-line global-require, import/no-extraneous-dependencies
-    admin = require('firebase-admin');
+    appSdk = require('firebase-admin/app');
+    // eslint-disable-next-line global-require, import/no-extraneous-dependencies
+    firebaseMessagingSdk = require('firebase-admin/messaging');
   } catch (error) {
     initializationState.error = 'firebase-admin package is not available';
     logger.warn('Firebase Admin unavailable. Push delivery disabled.', {
@@ -149,17 +152,17 @@ const initializeFirebaseAdmin = () => {
   }
 
   try {
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert({
+    const existingApp = appSdk.getApps()[0] || null;
+    firebaseApp =
+      existingApp ||
+      appSdk.initializeApp({
+        credential: appSdk.cert({
           projectId: serviceAccount.project_id,
           clientEmail: serviceAccount.client_email,
           privateKey: serviceAccount.private_key,
         }),
         projectId: serviceAccount.project_id,
       });
-    }
-    firebaseAdmin = admin;
     initializationState.enabled = true;
     initializationState.projectId = serviceAccount.project_id;
     logger.info('Firebase Admin initialized successfully.', {
@@ -178,16 +181,16 @@ const initializeFirebaseAdmin = () => {
 
 const getFirebaseAdmin = () => {
   initializeFirebaseAdmin();
-  return firebaseAdmin;
+  return firebaseApp;
 };
 
 const getFirebaseMessaging = () => {
   const state = initializeFirebaseAdmin();
-  if (!state.enabled || !firebaseAdmin) {
+  if (!state.enabled || !firebaseApp || !firebaseMessagingSdk) {
     return null;
   }
   try {
-    return firebaseAdmin.messaging();
+    return firebaseMessagingSdk.getMessaging(firebaseApp);
   } catch (_) {
     return null;
   }

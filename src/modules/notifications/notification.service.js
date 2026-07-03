@@ -478,6 +478,7 @@ const getChannelSettingsForUser = async ({ userId, notificationType }) => {
 const emitNotificationLive = (notificationRow) => {
   eventBus.emit(EVENTS.NOTIFICATION_CREATED, {
     id: notificationRow.id,
+    eventType: notificationRow.event_type,
     tenantId: notificationRow.tenant_id || null,
     userId: notificationRow.user_id || null,
     notificationType: notificationRow.notification_type || NotificationTypes.SYSTEM,

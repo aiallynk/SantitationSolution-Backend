@@ -286,6 +286,7 @@ const uploadBufferToS3 = async ({
   buffer,
   objectKey,
   contentType = 'application/octet-stream',
+  contentDisposition = null,
   metadata = null,
   bucketName = s3Config.bucket,
 }) => {
@@ -300,6 +301,7 @@ const uploadBufferToS3 = async ({
     Key: objectKey,
     Body: body,
     ContentType: contentType,
+    ...(contentDisposition ? { ContentDisposition: contentDisposition } : {}),
     ...(metadata && typeof metadata === 'object' ? { Metadata: metadata } : {}),
     ...(S3_OBJECT_ACL ? { ACL: S3_OBJECT_ACL } : {}),
     ...S3_ENCRYPTION_OPTIONS,
@@ -314,6 +316,7 @@ const uploadBufferToS3 = async ({
     fileUrl: buildObjectUrl(objectKey, { bucketName }),
     bytes: Number(body.length || 0),
     contentType,
+    contentDisposition: contentDisposition || null,
     eTag: response.ETag || null,
   };
 };
@@ -538,23 +541,23 @@ const getObjectBufferFromS3 = async (storageKey) => {
   }
 };
 
-const headObjectFromS3 = async (storageKey) => {
+const headObjectFromS3 = async (storageKey, { bucketName = s3Config.bucket } = {}) => {
   const client = getS3Client();
   if (!client) return null;
 
-  const objectKey = normalizeS3ObjectKey(storageKey);
+  const objectKey = normalizeS3ObjectKey(storageKey, { bucketName });
   if (!objectKey) return null;
 
   try {
     const response = await client.send(
       new HeadObjectCommand({
-        Bucket: s3Config.bucket,
+        Bucket: bucketName,
         Key: objectKey,
       })
     );
 
     return {
-      bucket: s3Config.bucket,
+      bucket: bucketName,
       objectKey,
       eTag: response.ETag || null,
       contentLength: Number(response.ContentLength || 0),
@@ -567,7 +570,7 @@ const headObjectFromS3 = async (storageKey) => {
         response.BucketKeyEnabled !== undefined
           ? Boolean(response.BucketKeyEnabled)
           : null,
-      fileUrl: buildObjectUrl(objectKey),
+      fileUrl: buildObjectUrl(objectKey, { bucketName }),
     };
   } catch (error) {
     return null;

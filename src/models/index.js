@@ -1343,6 +1343,7 @@ const BackupSchedule = sequelize.define(
     cron_expression: { type: DataTypes.STRING(120), allowNull: true },
     timezone: { type: DataTypes.STRING(80), allowNull: false, defaultValue: 'Asia/Kolkata' },
     run_time: { type: DataTypes.TIME, allowNull: true },
+    time_format: { type: DataTypes.STRING(8), allowNull: false, defaultValue: '24' },
     enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     retention_days: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 7 },
     include_storage_metadata: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },

@@ -10,6 +10,7 @@ const {
 const {
   validateLogin,
   validateResetPassword,
+  validateUpdateMe,
 } = require('../src/modules/auth/auth.validator');
 const {
   validateCreateInspection,
@@ -57,6 +58,21 @@ test('validateLogin requires identifier and password', () => {
 test('validateResetPassword enforces minimum password length', () => {
   const errors = validateResetPassword({ body: { token: 'abc', newPassword: '123' } });
   assert.deepEqual(errors, ['newPassword must be at least 8 characters']);
+});
+
+test('validateUpdateMe accepts valid IANA profile timezones and rejects invalid values', () => {
+  assert.deepEqual(
+    validateUpdateMe({
+      body: { metadata: { preferences: { timezone: 'Europe/London' } } },
+    }),
+    [],
+  );
+  assert.deepEqual(
+    validateUpdateMe({
+      body: { metadata: { preferences: { timezone: 'Mars/Base' } } },
+    }),
+    ['metadata.preferences.timezone must be a valid IANA timezone'],
+  );
 });
 
 test('validateCreateInspection validates required fields', () => {
