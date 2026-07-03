@@ -1,8 +1,17 @@
-const { InspectionTask, Facility, ToiletUnit, PlatformUser, TaskAssignmentLog } = require('../../models');
+const { Op } = require('sequelize');
+const {
+  InspectionTask,
+  Facility,
+  ToiletBlock,
+  ToiletUnit,
+  PlatformUser,
+  TaskAssignmentLog,
+} = require('../../models');
 const AppError = require('../../core/errors/AppError');
-const { normalizePagination } = require('../../utils/validators');
+const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
 const { logger } = require('../../core/logging/logger');
+const platformService = require('../platform/platform.service');
 const notificationService = require('../notifications/notification.service');
 const { NotificationAudienceKinds, NotificationPriorities, NotificationTypes } = require('../notifications/notification.constants');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
@@ -274,6 +283,189 @@ const createTask = async (req) => {
   return mapTask(task);
 };
 
+const ensureAssigneeInTenantScope = async ({ req, assignedToUserId }) => {
+  const assignee = await PlatformUser.findByPk(assignedToUserId, {
+    attributes: ['id', 'tenant_id', 'status'],
+  });
+  if (!assignee || assignee.status !== 'active') {
+    throw new AppError('assignedToUserId is invalid', 400, {
+      code: 'ASSIGNEE_NOT_FOUND',
+    });
+  }
+  if (!req.user.isSuperAdmin && assignee.tenant_id !== req.user.tenantId) {
+    throw new AppError('assignedToUserId is out of tenant scope', 403, {
+      code: 'SCOPE_FORBIDDEN',
+    });
+  }
+  return assignee;
+};
+
+const toBlockToken = (value, fallback = 'AUTO') => {
+  const token = String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+  return token || fallback;
+};
+
+const resolveDispatchBlockForFacility = async ({
+  req,
+  facility,
+  requestedToiletBlockId = null,
+}) => {
+  if (requestedToiletBlockId) {
+    const block = await ToiletBlock.findByPk(requestedToiletBlockId, {
+      attributes: ['id', 'facility_id'],
+    });
+    if (!block) {
+      throw new AppError('Toilet block not found', 404, { code: 'TOILET_BLOCK_NOT_FOUND' });
+    }
+    if (String(block.facility_id || '') !== String(facility.id || '')) {
+      throw new AppError('toiletBlockId does not belong to facilityId', 400, {
+        code: 'BLOCK_FACILITY_MISMATCH',
+      });
+    }
+    return block.id;
+  }
+
+  const existing = await ToiletBlock.findOne({
+    where: { facility_id: facility.id },
+    attributes: ['id'],
+    order: [['created_at', 'ASC']],
+  });
+  if (existing) return existing.id;
+
+  const blockBaseCode = `${toBlockToken(facility.code || facility.name || 'AUTO')}-AUTO`.slice(
+    0,
+    110
+  );
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const candidateCode =
+      attempt === 0 ? blockBaseCode : `${blockBaseCode}-${String(attempt + 1)}`.slice(0, 120);
+    const duplicate = await ToiletBlock.findOne({
+      where: {
+        facility_id: facility.id,
+        code: { [Op.iLike]: candidateCode },
+      },
+      attributes: ['id'],
+    });
+    if (duplicate) continue;
+
+    const row = await ToiletBlock.create({
+      facility_id: facility.id,
+      code: candidateCode,
+      name: attempt === 0 ? 'Auto Block' : `Auto Block ${attempt + 1}`,
+      gender_type: null,
+      status: 'active',
+    });
+
+    await createAuditLog({
+      req,
+      tenantId: facility.tenant_id,
+      action: 'toilet_block.create.auto_dispatch',
+      entityType: 'toilet_block',
+      entityId: row.id,
+      details: {
+        facilityId: facility.id,
+        source: 'dispatch_board',
+      },
+    });
+
+    return row.id;
+  }
+
+  throw new AppError('Unable to allocate a toilet block for this facility', 409, {
+    code: 'TOILET_BLOCK_ALLOCATION_FAILED',
+  });
+};
+
+const createToiletAndDispatchTask = async (req) => {
+  const facility = await Facility.findByPk(req.body.facilityId, {
+    attributes: ['id', 'tenant_id', 'code', 'name'],
+  });
+  if (!facility) {
+    throw new AppError('Facility not found', 404, { code: 'FACILITY_NOT_FOUND' });
+  }
+  if (!req.user.isSuperAdmin && facility.tenant_id !== req.user.tenantId) {
+    throw new AppError('Facility out of tenant scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+  if (!isFacilityInScope(req, facility.id)) {
+    throw new AppError('Facility out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
+  }
+
+  await ensureAssigneeInTenantScope({
+    req,
+    assignedToUserId: req.body.assignedToUserId,
+  });
+
+  const toiletBlockId = await resolveDispatchBlockForFacility({
+    req,
+    facility,
+    requestedToiletBlockId: req.body.toiletBlockId || null,
+  });
+
+  const unitType = sanitizeText(req.body.unitType, 40) || 'wc';
+  const toiletCode = sanitizeText(req.body.toiletCode, 120);
+  const locationLabel = sanitizeText(req.body.locationLabel, 300);
+  const taskType = sanitizeText(req.body.taskType, 80) || 'routine_cleaning';
+  const slaMinutesRaw = req.body.slaMinutes;
+  const slaMinutes =
+    slaMinutesRaw === undefined || slaMinutesRaw === null || String(slaMinutesRaw).trim() === ''
+      ? null
+      : Number(slaMinutesRaw);
+  if (slaMinutes !== null && !Number.isFinite(slaMinutes)) {
+    throw new AppError('slaMinutes must be a valid number when provided', 400, {
+      code: 'VALIDATION_ERROR',
+    });
+  }
+
+  const toiletUnit = await platformService.createUnit({
+    ...req,
+    body: {
+      facilityId: facility.id,
+      toiletBlockId,
+      code: toiletCode,
+      unitType,
+      locationLabel: locationLabel || undefined,
+      sectorCode: req.body.sectorCode,
+      latitude: req.body.latitude,
+      longitude: req.body.longitude,
+    },
+  });
+
+  const task = await createTask({
+    ...req,
+    body: {
+      facilityId: facility.id,
+      toiletUnitId: toiletUnit.id,
+      assignedToUserId: req.body.assignedToUserId,
+      taskType,
+      slaMinutes,
+      scheduledAt: req.body.scheduledAt || new Date().toISOString(),
+      status: 'pending',
+    },
+  });
+
+  await TaskAssignmentLog.create({
+    tenant_id: task.tenantId,
+    task_id: task.id,
+    complaint_id: null,
+    toilet_unit_id: task.toiletUnitId || toiletUnit.id,
+    worker_id: task.assignedToUserId,
+    supervisor_user_id: req.user.id,
+    assigned_by_user_id: req.user.id,
+    assignment_source: 'dispatch_toilet_create',
+    reason: 'Toilet created from dispatch board and assigned to worker',
+    status: 'assigned',
+  });
+
+  return {
+    toiletUnit,
+    task,
+  };
+};
+
 const emitTaskUpdated = (task) => {
   eventBus.emit(EVENTS.TASK_UPDATED, {
     tenantId: task.tenant_id,
@@ -519,6 +711,7 @@ module.exports = {
   getTaskById,
   getMyTasks,
   createTask,
+  createToiletAndDispatchTask,
   acceptTask,
   startTask,
   completeTask,

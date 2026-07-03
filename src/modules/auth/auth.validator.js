@@ -1,4 +1,5 @@
 const { isBlank } = require('../../utils/validators');
+const { isValidIanaTimezone } = require('../../utils/timezone');
 
 const validateLogin = (req) => {
   const errors = [];
@@ -89,6 +90,14 @@ const validateUpdateMe = (req) => {
     const isObject = req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata);
     if (req.body.metadata !== null && !isObject) {
       errors.push('metadata must be a JSON object');
+    } else if (isObject) {
+      const preferences = req.body.metadata.preferences || req.body.metadata.accountPreferences;
+      if (
+        preferences?.timezone !== undefined &&
+        !isValidIanaTimezone(preferences.timezone)
+      ) {
+        errors.push('metadata.preferences.timezone must be a valid IANA timezone');
+      }
     }
   }
   return errors;

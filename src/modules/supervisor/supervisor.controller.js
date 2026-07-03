@@ -23,6 +23,19 @@ const getWorkers = async (req, res, next) => {
   }
 };
 
+const postCreateWorker = async (req, res, next) => {
+  try {
+    const data = await supervisorService.createWorker(req);
+    return sendSuccess(res, {
+      statusCode: 201,
+      message: 'Worker created and assigned to supervisor successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getWorkerDetail = async (req, res, next) => {
   try {
     const data = await supervisorService.getWorkerDetail(req);
@@ -160,6 +173,7 @@ module.exports = {
   getLiveMap,
   getLiveLocations,
   getOverview,
+  postCreateWorker,
   getWorkerDetail,
   getWorkers,
   getWorkProgress,

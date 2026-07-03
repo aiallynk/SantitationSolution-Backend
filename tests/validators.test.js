@@ -10,9 +10,11 @@ const {
 const {
   validateLogin,
   validateResetPassword,
+  validateUpdateMe,
 } = require('../src/modules/auth/auth.validator');
 const {
   validateCreateInspection,
+  validateSubmitInspection,
 } = require('../src/modules/inspections/inspection.validator');
 const {
   validateIngestion,
@@ -58,9 +60,51 @@ test('validateResetPassword enforces minimum password length', () => {
   assert.deepEqual(errors, ['newPassword must be at least 8 characters']);
 });
 
+test('validateUpdateMe accepts valid IANA profile timezones and rejects invalid values', () => {
+  assert.deepEqual(
+    validateUpdateMe({
+      body: { metadata: { preferences: { timezone: 'Europe/London' } } },
+    }),
+    [],
+  );
+  assert.deepEqual(
+    validateUpdateMe({
+      body: { metadata: { preferences: { timezone: 'Mars/Base' } } },
+    }),
+    ['metadata.preferences.timezone must be a valid IANA timezone'],
+  );
+});
+
 test('validateCreateInspection validates required fields', () => {
   const errors = validateCreateInspection({ body: {} });
   assert.deepEqual(errors, ['facilityId is required', 'inspectionType is required']);
+});
+
+test('validateSubmitInspection accepts supported submission routing fields', () => {
+  const errors = validateSubmitInspection({
+    params: { id: 'e8d4d4ca-4f91-4e87-8fb5-6c1213f19e8d' },
+    body: {
+      clientSubmissionId: 'auditor-12345',
+      submittedAt: '2026-05-18T08:30:00.000Z',
+      submittedTo: 'ops_admin_city',
+      severity: 'high',
+    },
+  });
+  assert.deepEqual(errors, []);
+});
+
+test('validateSubmitInspection rejects unsupported submittedTo and severity values', () => {
+  const errors = validateSubmitInspection({
+    params: { id: 'e8d4d4ca-4f91-4e87-8fb5-6c1213f19e8d' },
+    body: {
+      submittedTo: 'ops_admin_state',
+      severity: 'urgent',
+    },
+  });
+  assert.deepEqual(errors, [
+    'submittedTo must be one of supervisor|ops_admin_district|ops_admin_city',
+    'severity must be one of low|medium|high|critical',
+  ]);
 });
 
 test('validateIngestion validates sensor payload basics', () => {
@@ -126,8 +170,6 @@ test('validateBroadcastSend accepts a valid tenant role broadcast payload', () =
       body: 'Please inspect immediately.',
       priority: 'HIGH',
       notificationType: 'ALERT',
-      payload: { source: 'unit-test' },
-      metadata: { requestedBy: 'tester' },
     },
   });
   assert.deepEqual(errors, []);

@@ -40,9 +40,16 @@ const toInspectionCode = (value) => {
   return `INS-${text.slice(0, 8)}`;
 };
 
+const isInspectionLinkedAlert = (alert = {}) => {
+  if (alert?.source_type === 'ai_analysis') return true;
+  if (!alert?.source_id) return false;
+  const alertType = String(alert?.alert_type || '').trim().toLowerCase();
+  return alertType.startsWith('inspection_');
+};
+
 const resolveInspectionMetadata = async (alerts = []) => {
   const inspectionIds = alerts
-    .filter((alert) => alert?.source_type === 'ai_analysis' && alert?.source_id)
+    .filter((alert) => isInspectionLinkedAlert(alert))
     .map((alert) => String(alert.source_id));
 
   const uniqueInspectionIds = [...new Set(inspectionIds)];
@@ -60,6 +67,7 @@ const resolveInspectionMetadata = async (alerts = []) => {
       'id',
       'facility_id',
       'toilet_unit_id',
+      'inspection_type',
       'status',
       'processing_status',
       'review_required',
@@ -78,7 +86,7 @@ const resolveInspectionMetadata = async (alerts = []) => {
 
 const mapAlert = (alert, { inspectionById = new Map() } = {}) => {
   const inspection =
-    alert?.source_type === 'ai_analysis' && alert?.source_id
+    isInspectionLinkedAlert(alert) && alert?.source_id
       ? inspectionById.get(String(alert.source_id)) || null
       : null;
 
@@ -100,10 +108,10 @@ const mapAlert = (alert, { inspectionById = new Map() } = {}) => {
     createdAt: alert.created_at,
     acknowledgedAt: alert.acknowledged_at,
     resolvedAt: alert.resolved_at,
-    inspectionId: alert.source_type === 'ai_analysis' ? alert.source_id : null,
-    inspectionCode:
-      alert.source_type === 'ai_analysis' ? toInspectionCode(alert.source_id) : null,
+    inspectionId: isInspectionLinkedAlert(alert) ? alert.source_id : null,
+    inspectionCode: isInspectionLinkedAlert(alert) ? toInspectionCode(alert.source_id) : null,
     inspectionStatus: inspection?.status || null,
+    inspectionType: inspection?.inspection_type || null,
     processingStatus: inspection?.processing_status || null,
     reviewRequired: Boolean(inspection?.review_required),
     inspectionResult: inspection?.inspection_result || null,

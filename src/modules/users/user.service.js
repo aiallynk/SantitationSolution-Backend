@@ -711,11 +711,35 @@ const loadSupervisorCandidate = async ({
   }
 
   const assignmentRows = Array.isArray(supervisor.assignments) ? supervisor.assignments : [];
+  const directFacilities = await Facility.findAll({
+    where: {
+      tenant_id: tenantId,
+      supervisor_user_id: supervisor.id,
+    },
+    attributes: ['id', 'geography_id', 'zone_geography_id', 'ward_geography_id'],
+    raw: true,
+    transaction,
+  });
+  const directFacilityIds = new Set(
+    directFacilities.map((row) => String(row.id || '').trim()).filter(Boolean)
+  );
+  const directGeographyIds = new Set(
+    directFacilities
+      .flatMap((row) => [row.geography_id, row.zone_geography_id, row.ward_geography_id])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  );
+  const hasAnyExplicitSupervisorScope =
+    assignmentRows.length > 0 ||
+    directFacilities.length > 0 ||
+    Boolean(String(supervisor.geography_id || '').trim());
   if (assignmentFacilityId) {
     const inFacilityScope =
       assignmentRows.some((row) => String(row.facility_id || '') === String(assignmentFacilityId)) ||
-      String(supervisor.geography_id || '') === String(assignmentGeographyId || '');
-    if (!inFacilityScope) {
+      directFacilityIds.has(String(assignmentFacilityId || '').trim()) ||
+      String(supervisor.geography_id || '') === String(assignmentGeographyId || '') ||
+      directGeographyIds.has(String(assignmentGeographyId || '').trim());
+    if (!inFacilityScope && hasAnyExplicitSupervisorScope) {
       throw new AppError('Supervisor is not mapped to selected facility scope', 400, {
         code: 'SUPERVISOR_SCOPE_INVALID',
       });
@@ -723,8 +747,11 @@ const loadSupervisorCandidate = async ({
   } else if (assignmentGeographyId) {
     const inGeographyScope =
       assignmentRows.some((row) => String(row.geography_id || '') === String(assignmentGeographyId)) ||
-      String(supervisor.geography_id || '') === String(assignmentGeographyId);
-    if (!inGeographyScope) {
+      String(supervisor.geography_id || '') === String(assignmentGeographyId) ||
+      directGeographyIds.has(String(assignmentGeographyId || '').trim());
+    // Legacy data can have supervisors without explicit geography/facility rows.
+    // Allow assignment in that case and rely on tenant-scoped role constraints.
+    if (!inGeographyScope && hasAnyExplicitSupervisorScope) {
       throw new AppError('Supervisor is not mapped to selected geography scope', 400, {
         code: 'SUPERVISOR_SCOPE_INVALID',
       });

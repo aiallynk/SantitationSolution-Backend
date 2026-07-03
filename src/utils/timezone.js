@@ -107,8 +107,13 @@ const zonedDateTimeToUtcDate = ({
   timeZone = getDefaultTimezone(),
 }) => {
   const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millisecond));
-  const offset = getTimezoneOffsetMinutes(utcGuess, timeZone) || 0;
-  return new Date(utcGuess.getTime() - offset * 60000);
+  const initialOffset = getTimezoneOffsetMinutes(utcGuess, timeZone) || 0;
+  let resolved = new Date(utcGuess.getTime() - initialOffset * 60000);
+  const resolvedOffset = getTimezoneOffsetMinutes(resolved, timeZone);
+  if (resolvedOffset !== null && resolvedOffset !== initialOffset) {
+    resolved = new Date(utcGuess.getTime() - resolvedOffset * 60000);
+  }
+  return resolved;
 };
 
 const formatInTimezone = (
@@ -267,6 +272,8 @@ module.exports = {
   isValidIanaTimezone,
   normalizeTimezone,
   toUtcDate,
+  getTimeZoneParts,
+  zonedDateTimeToUtcDate,
   formatInTimezone,
   getTimezoneOffsetMinutes,
   toTimezoneDateKey,

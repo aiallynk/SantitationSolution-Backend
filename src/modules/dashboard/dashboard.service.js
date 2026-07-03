@@ -499,32 +499,27 @@ const getWorkforce = async (req) => {
   const activityLookbackDays = Number.isFinite(lookbackRaw)
     ? Math.min(Math.max(lookbackRaw, 1), 30)
     : 7;
+  const activeThresholdMinutes = toBoundedNumber(
+    req.query.activeThresholdMinutes,
+    { fallback: 20, min: 5, max: 240 }
+  );
+  const idleThresholdMinutes = toBoundedNumber(
+    req.query.idleThresholdMinutes,
+    { fallback: 120, min: activeThresholdMinutes + 1, max: 720 }
+  );
+  const shiftStartHour = Math.trunc(
+    toBoundedNumber(req.query.shiftStartHour, { fallback: 9, min: 0, max: 23 })
+  );
+  const minShiftHoursForEarlyExit = toBoundedNumber(
+    req.query.minShiftHoursForEarlyExit,
+    { fallback: 8, min: 1, max: 24 }
+  );
 
   const requestedRange = resolveDateRange(req.query, { maxDays: 30 });
   const activityStart = requestedRange.start || new Date(todayStart);
   if (!requestedRange.start) {
     activityStart.setDate(activityStart.getDate() - (activityLookbackDays - 1));
   }
-  const activeThresholdMinutes = toBoundedNumber(req.query.activeThresholdMinutes, {
-    fallback: 20,
-    min: 5,
-    max: 240,
-  });
-  const idleThresholdMinutes = toBoundedNumber(req.query.idleThresholdMinutes, {
-    fallback: 120,
-    min: activeThresholdMinutes + 1,
-    max: 720,
-  });
-  const shiftStartHour = toBoundedNumber(req.query.shiftStartHour, {
-    fallback: 8,
-    min: 0,
-    max: 23,
-  });
-  const minShiftHoursForEarlyExit = toBoundedNumber(req.query.minShiftHoursForEarlyExit, {
-    fallback: 6,
-    min: 1,
-    max: 24,
-  });
   const activityEnd = requestedRange.end || new Date();
   const taskActivityFilter = buildTimestampFilter({
     start: activityStart,

@@ -24,6 +24,17 @@ const {
 const { enqueueInspectionAnalysis } = require('../analysis/analysis.queue');
 const { createAuditLog } = require('../audit/audit.service');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
+const notificationService = require('../notifications/notification.service');
+const {
+  NotificationTypes,
+  NotificationPriorities,
+  NotificationAudienceKinds,
+} = require('../notifications/notification.constants');
+const {
+  resolveUsersByRoleAndScope,
+  resolveSupervisorIds,
+} = require('../notifications/notification.recipientResolver');
+const { ROLE_CODES } = require('../../core/rbac/personaFamilies');
 const {
   buildAccessContextFromUser,
   applyScopeToQuery,
@@ -78,6 +89,73 @@ const INSPECTION_TYPE_ALIASES = {
   complaint_based: 'complaint_based',
   surprise: 'surprise_audit',
 };
+
+const SUBMISSION_TARGETS = Object.freeze({
+  supervisor: {
+    key: 'supervisor',
+    label: 'Supervisor',
+    submittedToRole: ROLE_CODES.SUPERVISOR,
+    submittedToScope: 'facility',
+  },
+  ops_admin_district: {
+    key: 'ops_admin_district',
+    label: 'Ops Admin (District Scope)',
+    submittedToRole: ROLE_CODES.DISTRICT_ADMIN,
+    submittedToScope: 'district',
+  },
+  ops_admin_city: {
+    key: 'ops_admin_city',
+    label: 'Ops Admin (City Scope)',
+    submittedToRole: ROLE_CODES.CITY_ADMIN,
+    submittedToScope: 'city',
+  },
+});
+
+const SUBMISSION_TARGET_ALIASES = Object.freeze({
+  supervisor: 'supervisor',
+  'ops admin (district scope)': 'ops_admin_district',
+  ops_admin_district: 'ops_admin_district',
+  district_admin: 'ops_admin_district',
+  district: 'ops_admin_district',
+  'ops admin (city scope)': 'ops_admin_city',
+  ops_admin_city: 'ops_admin_city',
+  city_admin: 'ops_admin_city',
+  city: 'ops_admin_city',
+});
+
+const ALLOWED_ALERT_SEVERITIES = new Set(['low', 'medium', 'high', 'critical']);
+
+const normalizeEscalationTarget = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  const key = raw ? SUBMISSION_TARGET_ALIASES[raw] || raw : SUBMISSION_TARGETS.supervisor.key;
+  const target = SUBMISSION_TARGETS[key] || null;
+  if (!target) {
+    throw new AppError(
+      'submittedTo must be one of supervisor|ops_admin_district|ops_admin_city',
+      400,
+      { code: 'VALIDATION_ERROR' }
+    );
+  }
+  return target;
+};
+
+const normalizeAlertSeverity = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (ALLOWED_ALERT_SEVERITIES.has(raw)) {
+    return raw;
+  }
+  if (raw === 'urgent') return 'critical';
+  if (raw === 'severe') return 'high';
+  return 'high';
+};
+
+const prettyLabel = (value) =>
+  String(value || '')
+    .replace(/_/g, ' ')
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 
 const ALLOWED_INSPECTION_TYPES = new Set([
   'before_cleaning',
@@ -316,7 +394,15 @@ const includeInspectionRelations = ({ includeEvents = false } = {}) => [
   {
     model: InspectionSubmission,
     as: 'inspectionSubmissions',
-    attributes: ['id', 'status', 'submitted_at'],
+    attributes: [
+      'id',
+      'status',
+      'submitted_at',
+      'submitted_to_role',
+      'submitted_to_scope',
+      'submitted_by_user',
+      'metadata',
+    ],
     required: false,
   },
   ...(includeEvents
@@ -399,6 +485,17 @@ const mediaPriority = (row) => {
 };
 
 const mediaStage = (row) => String(row?.capture_stage || 'evidence').trim().toLowerCase();
+
+const isMediaEvidenceRow = (row) => {
+  if (!row) return false;
+  const mediaType = String(row.media_type || 'image').trim().toLowerCase();
+  if (mediaType === 'csv' || mediaType === 'attachment') return false;
+  const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? row.metadata
+    : {};
+  const uploadKind = String(metadata.uploadKind || metadata.attachmentType || '').trim().toLowerCase();
+  return uploadKind !== 'csv' && uploadKind !== 'attachment';
+};
 
 const mediaKey = (row, index = 0) => {
   const stage = mediaStage(row);
@@ -507,6 +604,61 @@ const hydrateInspectionMediaForDisplay = async (
     media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
     media.thumbnail_url =
       urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
+  }
+};
+
+const hydrateInspectionSubmissionAttachmentsForDisplay = async (
+  inspection,
+  { mediaUrlCache = null } = {}
+) => {
+  const submissions = Array.isArray(inspection?.inspectionSubmissions)
+    ? inspection.inspectionSubmissions
+    : [];
+
+  for (const submission of submissions) {
+    if (!submission || !submission.metadata || typeof submission.metadata !== 'object') {
+      continue;
+    }
+
+    const metadata = submission.metadata;
+
+    // Process beforeMedia
+    if (Array.isArray(metadata.beforeMedia)) {
+      for (const media of metadata.beforeMedia) {
+        if (media && typeof media === 'object') {
+          const urls = await resolveMediaPairUrls(
+            {
+              fileUrl: media.file_url,
+              thumbnailUrl: media.thumbnail_url || media.file_url,
+              storageKey: media.storage_key || null,
+            },
+            { cache: mediaUrlCache }
+          );
+          media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
+          media.thumbnail_url =
+            urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
+        }
+      }
+    }
+
+    // Process afterMedia
+    if (Array.isArray(metadata.afterMedia)) {
+      for (const media of metadata.afterMedia) {
+        if (media && typeof media === 'object') {
+          const urls = await resolveMediaPairUrls(
+            {
+              fileUrl: media.file_url,
+              thumbnailUrl: media.thumbnail_url || media.file_url,
+              storageKey: media.storage_key || null,
+            },
+            { cache: mediaUrlCache }
+          );
+          media.file_url = urls.fileUrl || normalizeMediaUrl(media.file_url);
+          media.thumbnail_url =
+            urls.thumbnailUrl || normalizeMediaUrl(media.thumbnail_url || media.file_url);
+        }
+      }
+    }
   }
 };
 
@@ -685,11 +837,60 @@ const mapInspectionMediaItem = (item, { displayTimezone = getDefaultTimezone() }
   };
 };
 
+const normalizeCsvAttachmentCollection = (items, { captureStage = null } = {}) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const fileUrl = String(item.fileUrl || item.url || item.file_url || '').trim();
+      const storageKey = String(item.storageKey || item.storage_key || '').trim();
+      const mimeType = String(item.mimeType || item.contentType || item.mime_type || item.content_type || '').trim().toLowerCase();
+      const stage = item.captureStage || item.capture_stage || captureStage || 'evidence';
+      return {
+        fileUrl: fileUrl || null,
+        storageKey: storageKey || null,
+        mimeType: mimeType || null,
+        contentLength: item.contentLength !== undefined ? Number(item.contentLength) : null,
+        captureStage: stage,
+        fileName: String(item.fileName || item.file_name || '').trim() || null,
+        uploadedAt: item.uploadedAt || item.uploaded_at || null,
+      };
+    });
+};
+
+const normalizeSubmittedMediaCollection = (items, { captureStage = null } = {}) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const fileUrl = String(item.fileUrl || item.url || item.file_url || '').trim();
+      const storageKey = String(item.storageKey || item.storage_key || '').trim();
+      const mimeType = String(item.mimeType || item.contentType || item.mime_type || item.content_type || '').trim().toLowerCase();
+      const stage = item.captureStage || item.capture_stage || captureStage || 'evidence';
+      return {
+        fileUrl: fileUrl || null,
+        thumbnailUrl: String(item.thumbnailUrl || item.thumbnail_url || item.fileUrl || item.file_url || '').trim() || null,
+        storageKey: storageKey || null,
+        mimeType: mimeType || null,
+        contentLength: item.contentLength !== undefined ? Number(item.contentLength) : null,
+        captureStage: stage,
+        fileName: String(item.fileName || item.file_name || '').trim() || null,
+        uploadedAt: item.uploadedAt || item.uploaded_at || null,
+        clientImageId: String(item.clientImageId || item.client_image_id || '').trim() || null,
+      };
+    });
+};
+
 const mapInspection = (
   inspection,
   { withAnalysis = true, reviewByInspectionId = new Map(), displayTimezone = getDefaultTimezone(), timezoneSource = 'deployment_default' } = {}
 ) => {
-  const media = dedupeInspectionMedia(inspection.InspectionMedia || []);
+  const allMedia = dedupeInspectionMedia(inspection.InspectionMedia || []);
+  const media = allMedia.filter((item) => isMediaEvidenceRow(item));
   const beforeMedia = media.filter((item) => item.capture_stage === 'before');
   const afterMedia = media.filter((item) => item.capture_stage === 'after');
   const result = withAnalysis ? (inspection.AiAnalysisResults || [])[0] : null;
@@ -706,6 +907,26 @@ const mapInspection = (
   const latestSubmission = finalSubmissions
     .slice()
     .sort((a, b) => mediaTimestamp(b.submitted_at) - mediaTimestamp(a.submitted_at))[0] || null;
+  const latestSubmissionMetadata =
+    latestSubmission?.metadata && typeof latestSubmission.metadata === 'object'
+      ? latestSubmission.metadata
+      : {};
+  const beforeCsvFiles = normalizeCsvAttachmentCollection(
+    latestSubmissionMetadata.beforeCsvFiles,
+    { captureStage: 'before' }
+  );
+  const afterCsvFiles = normalizeCsvAttachmentCollection(
+    latestSubmissionMetadata.afterCsvFiles,
+    { captureStage: 'after' }
+  );
+  const submittedBeforeMedia = normalizeSubmittedMediaCollection(
+    latestSubmissionMetadata.beforeMedia,
+    { captureStage: 'before' }
+  );
+  const submittedAfterMedia = normalizeSubmittedMediaCollection(
+    latestSubmissionMetadata.afterMedia,
+    { captureStage: 'after' }
+  );
   const timeline = Array.isArray(inspection.events)
     ? [...inspection.events]
         .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime())
@@ -851,8 +1072,15 @@ const mapInspection = (
     evidence: {
       beforeCount: beforeMedia.length,
       afterCount: afterMedia.length,
-      totalCount: media.length,
-      hasEvidence: beforeMedia.length + afterMedia.length > 0,
+      beforeCsvCount: beforeCsvFiles.length,
+      afterCsvCount: afterCsvFiles.length,
+      totalCount: media.length + beforeCsvFiles.length + afterCsvFiles.length,
+      hasEvidence:
+        beforeMedia.length +
+          afterMedia.length +
+          beforeCsvFiles.length +
+          afterCsvFiles.length >
+        0,
     },
     review,
     reviewStatus,
@@ -860,6 +1088,13 @@ const mapInspection = (
     finalSubmissionCompleted: finalSubmissions.length > 0,
     submissionCount: finalSubmissions.length,
     latestSubmissionStatus: latestSubmission?.status || null,
+    latestSubmittedToRole: latestSubmission?.submitted_to_role || null,
+    latestSubmittedToScope: latestSubmission?.submitted_to_scope || null,
+    latestSubmittedByUser: latestSubmission?.submitted_by_user || null,
+    beforeCsvFiles,
+    afterCsvFiles,
+    submittedBeforeMedia,
+    submittedAfterMedia,
     requiresManualReview:
       Boolean(inspection.review_required) ||
       inspection.processing_status !== 'completed' ||
@@ -1228,36 +1463,122 @@ const uploadInspectionMedia = async (req) => {
   const gpsLat = parseOptionalNumber(req.body.gpsLat ?? req.body.gps_lat);
   const gpsLng = parseOptionalNumber(req.body.gpsLng ?? req.body.gps_lng);
   const watermarkMeta = parseOptionalObject(req.body.watermarkMeta);
+  const mediaType = resolveMediaTypeFromUpload(req.file, req.uploadFileKind);
+  const shouldQueueAi = mediaType === 'image' && isAutoAnalysisOnUploadEnabled();
   const now = new Date();
 
-  const folder = `sanitation/${inspection.tenant_id}/inspections/${inspection.id}`;
+  const folder = `sanitation/${inspection.tenant_id}/inspections/${inspection.id}/${captureStage}`;
   let uploaded;
   try {
-    uploaded = await uploadImage(req.file.path, folder);
+    if (mediaType === 'image') {
+      uploaded = await uploadImage(req.file.path, folder);
+    } else {
+      uploaded = await uploadFile(req.file.path, folder, {
+        contentType: req.file.mimetype,
+        preferCloudinary: false,
+      });
+    }
   } finally {
     await removeTempFile(req.file.path);
   }
+
+  const resolvedFileUrl = await resolveMediaUrl({
+    fileUrl: uploaded.fileUrl,
+    storageKey: uploaded.storageKey || null,
+  });
 
   const metadataPayload = {
     ...uploaded.metadata,
     source: 'inspection-media-upload',
     originalFileName: req.file.originalname,
     mimeType: req.file.mimetype,
+    uploadKind: mediaType,
   };
+
+  if (mediaType === 'csv') {
+    const csvAttachment = normalizeCsvAttachmentRecord(
+      {
+        id: `csv-${Date.now()}-${Math.round(Math.random() * 1e9)}`,
+        captureStage,
+        fileName: req.file.originalname || null,
+        mimeType: req.file.mimetype || metadataPayload.contentType || 'text/csv',
+        contentLength:
+          uploaded?.metadata?.bytes || parseOptionalNumber(req.body.contentLength) || null,
+        fileUrl: resolvedFileUrl || uploaded.fileUrl,
+        storageKey: uploaded.storageKey || null,
+        uploadedAt: now.toISOString(),
+        metadata: metadataPayload,
+      },
+      { captureStage }
+    );
+
+    await inspection.update({
+      pipeline_status: 'uploaded',
+      status: 'IN_PROGRESS',
+      updated_at: now,
+    });
+
+    await createAuditLog({
+      req,
+      tenantId: inspection.tenant_id,
+      action: 'inspection.csv_upload',
+      entityType: 'inspection',
+      entityId: inspection.id,
+      details: {
+        inspectionId: inspection.id,
+        captureStage,
+        fileName: req.file.originalname || null,
+      },
+    });
+
+    eventBus.emit(EVENTS.INSPECTION_UPDATED, {
+      inspectionId: inspection.id,
+      tenantId: inspection.tenant_id,
+      processingStatus: inspection.processing_status,
+      pipelineStatus: inspection.pipeline_status,
+      mediaUploaded: true,
+      attachmentType: 'csv',
+    });
+
+    await createInspectionEvent({
+      inspection,
+      req,
+      eventType: 'inspection.attachment.csv_uploaded',
+      eventStatus: 'uploaded',
+      payload: {
+        captureStage,
+        fileName: req.file.originalname || null,
+        storageKey: uploaded.storageKey || null,
+      },
+    });
+
+    return {
+      attachmentType: 'csv',
+      ...csvAttachment,
+      fileUrl: resolvedFileUrl || csvAttachment?.fileUrl || null,
+      downloadUrl: resolvedFileUrl || csvAttachment?.fileUrl || null,
+      uploadedAt: now.toISOString(),
+    };
+  }
+
+  const normalizedClientImageId =
+    clientImageId ||
+    normalizeClientImageId(`${mediaType}-${captureStage}-${Date.now()}`) ||
+    null;
 
   const mediaPayload = {
     inspection_id: inspection.id,
     toilet_unit_id: inspection.toilet_unit_id || null,
     worker_id: inspection.inspector_user_id || req.user?.id || null,
     assignment_id: inspection.assignment_id || null,
-    client_image_id: clientImageId,
-    media_type: 'image',
+    client_image_id: normalizedClientImageId,
+    media_type: mediaType,
     capture_stage: captureStage,
     upload_status: 'confirmed',
-    processing_state: isAutoAnalysisOnUploadEnabled()
+    processing_state: shouldQueueAi
       ? IMAGE_PROCESSING_STATES.QUEUED_FOR_AI
       : IMAGE_PROCESSING_STATES.STORAGE_VERIFIED,
-    ai_status: isAutoAnalysisOnUploadEnabled() ? 'AI_QUEUED' : 'UPLOADED',
+    ai_status: shouldQueueAi ? 'AI_QUEUED' : 'UPLOADED',
     etag: uploaded.metadata?.eTag || null,
     sha256: String(req.body.sha256 || '').trim() || null,
     content_length: uploaded.metadata?.bytes || null,
@@ -1310,11 +1631,11 @@ const uploadInspectionMedia = async (req) => {
   };
 
   let media = null;
-  if (clientImageId) {
+  if (normalizedClientImageId) {
     media = await InspectionMedia.findOne({
       where: {
         inspection_id: inspection.id,
-        client_image_id: clientImageId,
+        client_image_id: normalizedClientImageId,
       },
       order: [['updated_at', 'DESC']],
     });
@@ -1336,13 +1657,13 @@ const uploadInspectionMedia = async (req) => {
         metadata: metadataPayload,
       });
     } catch (error) {
-      if (!isUniqueConstraintError(error) || !clientImageId) {
+      if (!isUniqueConstraintError(error) || !normalizedClientImageId) {
         throw error;
       }
       media = await InspectionMedia.findOne({
         where: {
           inspection_id: inspection.id,
-          client_image_id: clientImageId,
+          client_image_id: normalizedClientImageId,
         },
         order: [['updated_at', 'DESC']],
       });
@@ -1372,7 +1693,7 @@ const uploadInspectionMedia = async (req) => {
     action: 'inspection.media_upload',
     entityType: 'inspection_media',
     entityId: media.id,
-    details: { inspectionId: inspection.id, captureStage },
+    details: { inspectionId: inspection.id, captureStage, mediaType },
   });
 
   eventBus.emit(EVENTS.INSPECTION_UPDATED, {
@@ -1389,11 +1710,11 @@ const uploadInspectionMedia = async (req) => {
     eventType: 'inspection.media.uploaded_legacy',
     eventStatus: 'uploaded',
     imageId: media.id,
-    payload: { mediaId: media.id, captureStage },
+    payload: { mediaId: media.id, captureStage, mediaType },
   });
 
   let analysisQueue = null;
-  if (isAutoAnalysisOnUploadEnabled()) {
+  if (shouldQueueAi) {
     await inspection.update({
       processing_status: 'queued',
       pipeline_status: 'queued_for_ai',
@@ -1434,8 +1755,9 @@ const uploadInspectionMedia = async (req) => {
 
   await recomputeInspectionAggregates(inspection.id, { updateToilet: false });
 
-  const mediaFileUrl = await resolveMediaUrl({
+  const urls = await resolveMediaPairUrls({
     fileUrl: media.file_url,
+    thumbnailUrl: media.thumbnail_url || media.file_url,
     storageKey: media.storage_key || null,
   });
 
@@ -1456,7 +1778,33 @@ const uploadInspectionMedia = async (req) => {
 
 const submitInspection = async (req) => {
   const inspection = await Inspection.findByPk(req.params.id, {
-    include: [{ model: InspectionMedia }],
+    include: [
+      { model: InspectionMedia },
+      {
+        model: Facility,
+        attributes: [
+          'id',
+          'name',
+          'code',
+          'address_line',
+          'geography_id',
+          'zone_geography_id',
+          'ward_geography_id',
+        ],
+        required: false,
+      },
+      {
+        model: ToiletUnit,
+        attributes: ['id', 'code', 'sector_code', 'location_label'],
+        required: false,
+      },
+      {
+        model: PlatformUser,
+        as: 'inspector',
+        attributes: ['id', 'full_name', 'email'],
+        required: false,
+      },
+    ],
   });
   if (!inspection) {
     throw new AppError('Inspection not found', 404, { code: 'INSPECTION_NOT_FOUND' });
@@ -1471,38 +1819,40 @@ const submitInspection = async (req) => {
     assertToiletAvailableForInspection(unit, facility);
   }
 
-  const hasBefore = inspection.InspectionMedia.some(
-    (item) => item.capture_stage === 'before'
+  const beforeCsvFiles = normalizeCsvAttachmentCollection(req.body.beforeCsvFiles, {
+    captureStage: 'before',
+  });
+  const afterCsvFiles = normalizeCsvAttachmentCollection(req.body.afterCsvFiles, {
+    captureStage: 'after',
+  });
+
+  const evidenceMedia = inspection.InspectionMedia.filter((item) => isMediaEvidenceRow(item));
+  const confirmedMedia = evidenceMedia.filter(
+    (item) => item.upload_status === 'confirmed' || item.upload_status === 'uploaded'
   );
-  const hasAfter = inspection.InspectionMedia.some(
-    (item) => item.capture_stage === 'after'
+  const confirmedBeforeMedia = confirmedMedia.filter(
+    (item) => normalizeCaptureStage(item.capture_stage) === 'before'
   );
-  const confirmedMedia = inspection.InspectionMedia.filter(
-    (item) =>
-      item.upload_status === 'confirmed' ||
-      item.upload_status === 'uploaded'
+  const confirmedAfterMedia = confirmedMedia.filter(
+    (item) => normalizeCaptureStage(item.capture_stage) === 'after'
   );
-  const hasConfirmedBefore = confirmedMedia.some(
-    (item) => item.capture_stage === 'before'
-  );
-  const hasConfirmedAfter = confirmedMedia.some(
-    (item) => item.capture_stage === 'after'
-  );
-  if (!hasBefore || !hasAfter || !hasConfirmedBefore || !hasConfirmedAfter) {
-    throw new AppError('Before and after media are required before submission', 400, {
+
+  const validationError = resolveAttachmentValidationError({
+    inspectionType: inspection.inspection_type,
+    beforeMediaCount: confirmedBeforeMedia.length,
+    afterMediaCount: confirmedAfterMedia.length,
+    beforeCsvCount: beforeCsvFiles.length,
+    afterCsvCount: afterCsvFiles.length,
+  });
+  if (validationError) {
+    throw new AppError(validationError.message, 400, {
       code: 'MEDIA_INCOMPLETE',
-      details: {
-        reason: 'evidence_upload_incomplete',
-        hasBefore,
-        hasAfter,
-        hasConfirmedBefore,
-        hasConfirmedAfter,
-      },
+      details: validationError.details,
     });
   }
 
   const confirmedCount = confirmedMedia.length;
-  const pendingUploadCount = Math.max(inspection.InspectionMedia.length - confirmedCount, 0);
+  const pendingUploadCount = Math.max(evidenceMedia.length - confirmedCount, 0);
 
   const clientSubmissionId = String(req.body.clientSubmissionId || '').trim() || null;
   const idempotencyKey = String(req.header('Idempotency-Key') || '').trim() || null;
@@ -1526,10 +1876,23 @@ const submitInspection = async (req) => {
   }
 
   if (existingSubmission) {
+    const existingMetadata =
+      existingSubmission.metadata && typeof existingSubmission.metadata === 'object'
+        ? existingSubmission.metadata
+        : {};
     return {
       inspectionId: inspection.id,
       submissionId: existingSubmission.id,
       processingStatus: existingSubmission.status || inspection.pipeline_status || 'queued_for_ai',
+      submittedToRole: existingSubmission.submitted_to_role || null,
+      submittedToScope: existingSubmission.submitted_to_scope || null,
+      submittedByUser: existingSubmission.submitted_by_user || null,
+      beforeCsvFiles: normalizeCsvAttachmentCollection(existingMetadata.beforeCsvFiles, {
+        captureStage: 'before',
+      }),
+      afterCsvFiles: normalizeCsvAttachmentCollection(existingMetadata.afterCsvFiles, {
+        captureStage: 'after',
+      }),
       reviewRequired: Boolean(inspection.review_required),
     };
   }
@@ -1551,13 +1914,32 @@ const submitInspection = async (req) => {
     idempotency_key: idempotencyKey,
     status: pipelineStatus,
     submitted_at: now,
+    submitted_to_role: escalationTarget.submittedToRole,
+    submitted_to_scope: escalationTarget.submittedToScope,
+    submitted_by_user: req.user?.id || null,
     acknowledged_at: new Date(),
     metadata: {
-      beforeCount: inspection.InspectionMedia.filter((item) => item.capture_stage === 'before').length,
-      afterCount: inspection.InspectionMedia.filter((item) => item.capture_stage === 'after').length,
-      totalCount: inspection.InspectionMedia.length,
+      beforeCount: confirmedBeforeMedia.length,
+      afterCount: confirmedAfterMedia.length,
+      beforeCsvCount: beforeCsvFiles.length,
+      afterCsvCount: afterCsvFiles.length,
+      totalCount:
+        confirmedMedia.length + beforeCsvFiles.length + afterCsvFiles.length,
       confirmedCount,
       pendingUploadCount,
+      beforeMedia: confirmedBeforeMedia
+        .map((item) => serializeSubmissionMediaRow(item))
+        .filter(Boolean),
+      afterMedia: confirmedAfterMedia
+        .map((item) => serializeSubmissionMediaRow(item))
+        .filter(Boolean),
+      beforeCsvFiles,
+      afterCsvFiles,
+      submittedTo: escalationTarget.key,
+      submittedToRole: escalationTarget.submittedToRole,
+      submittedToScope: escalationTarget.submittedToScope,
+      submittedByUser: req.user?.id || null,
+      severity: alertSeverity,
     },
   });
 
@@ -1589,6 +1971,11 @@ const submitInspection = async (req) => {
     action: 'inspection.submit',
     entityType: 'inspection',
     entityId: inspection.id,
+    details: {
+      submittedToRole: escalationTarget.submittedToRole,
+      submittedToScope: escalationTarget.submittedToScope,
+      severity: alertSeverity,
+    },
   });
 
   await createInspectionEvent({
@@ -1601,6 +1988,9 @@ const submitInspection = async (req) => {
       queued: Boolean(enqueueResult?.queued),
       skipped: Boolean(enqueueResult?.skipped),
       reason: enqueueResult?.reason || null,
+      submittedToRole: escalationTarget.submittedToRole,
+      submittedToScope: escalationTarget.submittedToScope,
+      severity: alertSeverity,
     },
   });
 
@@ -1613,12 +2003,36 @@ const submitInspection = async (req) => {
   });
 
   await recomputeInspectionAggregates(inspection.id, { updateToilet: false });
+  const geographyByLevel = await resolveFacilityGeographyLevels(inspection.Facility);
+  const escalationRecipients = await resolveEscalationRecipients({
+    target: escalationTarget,
+    inspection,
+    facility: inspection.Facility,
+    geographyByLevel,
+  });
+  const escalationAlert = await createSubmissionEscalationAlert({
+    req,
+    inspection,
+    submission,
+    target: escalationTarget,
+    severity: alertSeverity,
+    facility: inspection.Facility,
+    toiletUnit: inspection.ToiletUnit,
+    inspector: inspection.inspector,
+    geographyByLevel,
+    recipientIds: escalationRecipients.recipientIds,
+    recipientGeographyId: escalationRecipients.geographyId,
+  });
 
   return {
     inspectionId: inspection.id,
     submissionId: submission.id,
     processingStatus: pipelineStatus,
     inspectionStatus: 'SUBMITTED',
+    submittedToRole: escalationTarget.submittedToRole,
+    submittedToScope: escalationTarget.submittedToScope,
+    submittedByUser: req.user?.id || null,
+    alertId: escalationAlert?.id || null,
     reviewRequired: Boolean(inspection.review_required),
   };
 };
@@ -1953,9 +2367,12 @@ const listInspections = async (req, myOnly = false) => {
 
   const mediaUrlCache = new Map();
   await Promise.all(
-    rows.map((inspection) =>
-      hydrateInspectionMediaForDisplay(inspection, { mediaUrlCache })
-    )
+    rows.map(async (inspection) => {
+      await hydrateInspectionMediaForDisplay(inspection, { mediaUrlCache });
+      await hydrateInspectionSubmissionAttachmentsForDisplay(inspection, {
+        mediaUrlCache,
+      });
+    })
   );
 
   const reviewMap = await loadLatestReviewByInspectionIds(rows.map((row) => row.id));
@@ -1994,7 +2411,9 @@ const getInspectionById = async (req) => {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   assertInspectionScope(req, inspection);
-  await hydrateInspectionMediaForDisplay(inspection);
+  const mediaUrlCache = new Map();
+  await hydrateInspectionMediaForDisplay(inspection, { mediaUrlCache });
+  await hydrateInspectionSubmissionAttachmentsForDisplay(inspection, { mediaUrlCache });
   const reviewMap = await loadLatestReviewByInspectionIds([inspection.id]);
   const display = await resolveDisplayTimezone({
     tenantId: inspection.tenant_id,

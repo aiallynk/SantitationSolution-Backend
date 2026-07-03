@@ -530,6 +530,7 @@ const runWithConcurrency = async (items = [], concurrency = 1, worker) => {
 const emitNotificationLive = (notificationRow) => {
   eventBus.emit(EVENTS.NOTIFICATION_CREATED, {
     id: notificationRow.id,
+    eventType: notificationRow.event_type,
     tenantId: notificationRow.tenant_id || null,
     userId: notificationRow.user_id || null,
     notificationType: notificationRow.notification_type || NotificationTypes.SYSTEM,
@@ -1801,24 +1802,11 @@ const sendBroadcast = async (req) => {
     templateDefaults.priority
   );
 
-  const metadataInput =
-    req.body?.metadata &&
-    typeof req.body.metadata === 'object' &&
-    !Array.isArray(req.body.metadata)
-      ? req.body.metadata
-      : {};
-  const payloadInput =
-    req.body?.payload &&
-    typeof req.body.payload === 'object' &&
-    !Array.isArray(req.body.payload)
-      ? req.body.payload
-      : {};
   const imageUrl = await resolveBroadcastImageUrl(
-    req.body?.imageUrl || payloadInput?.imageUrl || metadataInput?.imageUrl || null
+    req.body?.imageUrl || null
   );
 
   const metadata = {
-    ...metadataInput,
     source: 'manual_broadcast',
     audience,
     template,
@@ -1830,7 +1818,6 @@ const sendBroadcast = async (req) => {
     ...(imageUrl ? { imageUrl } : {}),
   };
   const payload = {
-    ...payloadInput,
     title,
     body,
     shortBody,

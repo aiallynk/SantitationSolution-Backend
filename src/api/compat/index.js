@@ -40,7 +40,11 @@ router.get(
   '/inspections',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireRouteKey(
+    RouteKeys.OPS_INSPECTIONS,
+    RouteKeys.OPS_AUDITOR_AUDITS,
+    RouteKeys.OPS_AUDITOR_EVIDENCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('inspection.review'),
   async (req, res, next) => {
@@ -60,7 +64,11 @@ router.get(
   '/inspections/recent',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireRouteKey(
+    RouteKeys.OPS_INSPECTIONS,
+    RouteKeys.OPS_AUDITOR_AUDITS,
+    RouteKeys.OPS_AUDITOR_EVIDENCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('inspection.review'),
   async (req, res, next) => {
@@ -89,7 +97,11 @@ router.get(
   '/inspections/:id',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireRouteKey(
+    RouteKeys.OPS_INSPECTIONS,
+    RouteKeys.OPS_AUDITOR_AUDITS,
+    RouteKeys.OPS_AUDITOR_EVIDENCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -106,7 +118,12 @@ router.get(
   '/analytics/summary',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireRouteKey(
+    RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_AUDITOR_DASHBOARD,
+    RouteKeys.OPS_AUDITOR_MONITORING,
+    RouteKeys.OPS_AUDITOR_ATTENDANCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -122,7 +139,12 @@ router.get(
   '/analytics/trends',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireRouteKey(
+    RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_AUDITOR_DASHBOARD,
+    RouteKeys.OPS_AUDITOR_MONITORING,
+    RouteKeys.OPS_AUDITOR_ATTENDANCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -138,7 +160,7 @@ router.get(
   '/analytics/alerts',
   protect,
   requireSurface(...OPS_WEB_SURFACES),
-  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireRouteKey(RouteKeys.OPS_ALERTS, RouteKeys.OPS_AUDITOR_ALERTS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -158,7 +180,12 @@ router.get(
   '/analytics/heatmap',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireRouteKey(
+    RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_AUDITOR_DASHBOARD,
+    RouteKeys.OPS_AUDITOR_MONITORING,
+    RouteKeys.OPS_AUDITOR_ATTENDANCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -174,7 +201,12 @@ router.get(
   '/analytics/zones',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_OVERVIEW),
+  requireRouteKey(
+    RouteKeys.OPS_OVERVIEW,
+    RouteKeys.OPS_AUDITOR_DASHBOARD,
+    RouteKeys.OPS_AUDITOR_MONITORING,
+    RouteKeys.OPS_AUDITOR_ATTENDANCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -201,7 +233,7 @@ router.get(
   '/analytics/critical',
   protect,
   requireSurface(...OPS_WEB_SURFACES),
-  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireRouteKey(RouteKeys.OPS_ALERTS, RouteKeys.OPS_AUDITOR_ALERTS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -279,7 +311,7 @@ router.get(
   '/alerts/:id',
   protect,
   requireSurface(...OPS_WEB_SURFACES),
-  requireRouteKey(RouteKeys.OPS_ALERTS),
+  requireRouteKey(RouteKeys.OPS_ALERTS, RouteKeys.OPS_AUDITOR_ALERTS),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {
@@ -295,7 +327,11 @@ router.get(
   '/analysis/inspections/:inspectionId/result',
   protect,
   requireSurface(...OPS_AND_MOBILE_SURFACES),
-  requireRouteKey(RouteKeys.OPS_INSPECTIONS),
+  requireRouteKey(
+    RouteKeys.OPS_INSPECTIONS,
+    RouteKeys.OPS_AUDITOR_AUDITS,
+    RouteKeys.OPS_AUDITOR_EVIDENCE,
+  ),
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   async (req, res, next) => {

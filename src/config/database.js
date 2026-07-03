@@ -6,8 +6,12 @@ const getDialectOptions = () => {
   const statementTimeout = Number(runtimeConfig.database.statementTimeoutMs || 15000);
   const queryTimeout = Number(runtimeConfig.database.queryTimeoutMs || 15000);
   const idleTxnTimeout = Number(runtimeConfig.database.idleInTxnTimeoutMs || 15000);
+  const connectionTimeout = Number(runtimeConfig.database.connectionTimeoutMs || 10000);
 
   const options = {
+    ...(Number.isFinite(connectionTimeout) && connectionTimeout > 0
+      ? { connectionTimeoutMillis: connectionTimeout }
+      : {}),
     ...(Number.isFinite(statementTimeout) && statementTimeout > 0
       ? { statement_timeout: statementTimeout }
       : {}),

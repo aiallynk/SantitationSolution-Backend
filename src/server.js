@@ -44,6 +44,10 @@ const {
   startReminderScheduler,
   stopReminderScheduler,
 } = require('./modules/automation/reminder.service');
+const {
+  startBackupScheduler,
+  stopBackupScheduler,
+} = require('./modules/backups/backup.scheduler');
 const { execSync } = require('child_process');
 const net = require('net');
 
@@ -57,6 +61,10 @@ const GRACEFUL_SHUTDOWN_TIMEOUT_MS = runtimeConfig.server.gracefulShutdownTimeou
 
 let server = null;
 let shutdownInProgress = false;
+
+const bootDebug = (message, details = undefined) => {
+  logger.info(`[BOOT] ${message}`, details);
+};
 
 const TRANSIENT_DB_ERROR_CODES = new Set([
   'ENOTFOUND',
@@ -157,6 +165,7 @@ const runWithTransientDbRetry = async (label, operation) => {
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
+      bootDebug(`${label}: attempt ${attempt} started`);
       return await operation();
     } catch (error) {
       const shouldRetry = isTransientDatabaseError(error) && attempt < attempts;
@@ -312,17 +321,24 @@ const validateAnalysisConfigAtBoot = () => {
 
 const backfillToiletQrOnBoot = async () => {
   if (!shouldAutoBackfillQrOnBoot()) {
+    bootDebug('Toilet QR bootstrap skipped');
     return;
   }
 
   try {
     const forceRegenerate = Boolean(runtimeConfig.server.qrForceRegenerateOnBoot);
+    bootDebug('Toilet QR bootstrap: ToiletUnit.findAll started');
     const units = await ToiletUnit.findAll({
       attributes: ['id', 'code', 'qr_code'],
     });
+    bootDebug('Toilet QR bootstrap: ToiletUnit.findAll completed', {
+      total: units.length,
+    });
+    bootDebug('Toilet QR bootstrap: ensureQrImagesForToilets started');
     const result = await ensureQrImagesForToilets(units, {
       forceRegenerate,
     });
+    bootDebug('Toilet QR bootstrap: ensureQrImagesForToilets completed');
     logger.info('Toilet QR bootstrap completed', {
       total: result.total,
       generated: result.generated,
@@ -350,30 +366,49 @@ const bootstrap = async () => {
     }
 
     markNotReady('bootstrapping');
+    bootDebug('validateAnalysisConfigAtBoot started');
     validateAnalysisConfigAtBoot();
+    bootDebug('validateAnalysisConfigAtBoot completed');
+    bootDebug('runPendingMigrations started');
     await runPendingMigrations();
+    bootDebug('runPendingMigrations completed');
+    bootDebug('sequelize.authenticate started');
     await runWithTransientDbRetry('Database connection', async () => {
       await sequelize.authenticate();
     });
+    bootDebug('sequelize.authenticate completed');
     logger.info('Database connection established');
+    bootDebug('backfillToiletQrOnBoot started');
     await backfillToiletQrOnBoot();
+    bootDebug('backfillToiletQrOnBoot completed');
+    bootDebug('probeRedisConnectivity started');
     await probeRedisConnectivity();
+    bootDebug('probeRedisConnectivity completed');
+    bootDebug('assertQueueRuntimePolicy started');
     assertQueueRuntimePolicy();
+    bootDebug('assertQueueRuntimePolicy completed');
 
+    bootDebug('registerLiveForwarders started');
     registerLiveForwarders();
+    bootDebug('registerLiveForwarders completed');
+    bootDebug('startHeartbeat started');
     startHeartbeat();
+    bootDebug('startHeartbeat completed');
     try {
+      bootDebug('startLiveRedisBridge started');
       await startLiveRedisBridge({
         onEvent: (event, payload, payloadScope) => {
           broadcastLocal(event, payload, payloadScope);
         },
       });
+      bootDebug('startLiveRedisBridge completed');
     } catch (error) {
       logger.warn('Live Redis bridge unavailable, using single-node live events', {
         error: error.message,
       });
     }
 
+    bootDebug('analysis worker startup branch started');
     const runEmbeddedWorker = Boolean(runtimeConfig.server.analysisWorkerEmbedded);
     if (isRedisEnabled() && runEmbeddedWorker) {
       registerAnalysisWorker();
@@ -386,17 +421,33 @@ const bootstrap = async () => {
       }
       logger.warn('Redis disabled: analysis queue running in inline fallback mode');
     }
+    bootDebug('analysis worker startup branch completed');
 
+    bootDebug('startAnalysisJobWatchdog started');
     startAnalysisJobWatchdog();
+    bootDebug('startAnalysisJobWatchdog completed');
+    bootDebug('startImageSessionReconciler started');
     startImageSessionReconciler();
+    bootDebug('startImageSessionReconciler completed');
+    bootDebug('startReminderScheduler started');
     startReminderScheduler();
+    bootDebug('startReminderScheduler completed');
+    bootDebug('startBackupScheduler started');
+    startBackupScheduler();
+    bootDebug('startBackupScheduler completed');
+    bootDebug('startTempFileJanitor started');
     startTempFileJanitor();
+    bootDebug('startTempFileJanitor completed');
 
+    bootDebug('startHttpServer started');
     server = await startHttpServer();
+    bootDebug('startHttpServer completed');
     server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
     server.headersTimeout = SERVER_HEADERS_TIMEOUT_MS;
     server.keepAliveTimeout = SERVER_KEEPALIVE_TIMEOUT_MS;
+    bootDebug('startWebSocketServer started');
     startWebSocketServer(server);
+    bootDebug('startWebSocketServer completed');
     logger.info('Server is running', {
       port: PORT,
       requestTimeoutMs: SERVER_REQUEST_TIMEOUT_MS,
@@ -443,6 +494,7 @@ const gracefulShutdown = async (signal, exitCode = 0) => {
     stopAnalysisJobWatchdog();
     stopImageSessionReconciler();
     stopReminderScheduler();
+    stopBackupScheduler();
     stopTempFileJanitor();
     await closeQueues();
     await sequelize.close();

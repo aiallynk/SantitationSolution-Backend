@@ -1,6 +1,7 @@
 const { Op } = require('sequelize');
 const AppError = require('../../core/errors/AppError');
 const {
+  sequelize,
   Complaint,
   Facility,
   ToiletUnit,
@@ -12,6 +13,7 @@ const {
   CleaningEvent,
 } = require('../../models');
 const { sanitizeText, normalizePagination, isUuid } = require('../../utils/validators');
+const { logger } = require('../../core/logging/logger');
 const { createAuditLog } = require('../audit/audit.service');
 const { uploadImage, removeTempFile } = require('../media/storage.service');
 const { resolveMediaUrl } = require('../media/mediaUrl.service');
@@ -441,6 +443,39 @@ const escapeHtml = (value) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
+const extractFirstFailingDbQuery = (error) => {
+  const visited = new Set();
+  const queue = [error];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || visited.has(current)) continue;
+    visited.add(current);
+
+    const query = current.sql || current.query || current.parent?.sql || current.original?.sql || null;
+    const detail =
+      current.detail ||
+      current.parent?.detail ||
+      current.original?.detail ||
+      current.hint ||
+      current.parent?.hint ||
+      current.original?.hint ||
+      null;
+
+    if (query) {
+      return {
+        message: current.message || null,
+        query,
+        detail,
+      };
+    }
+
+    queue.push(current.original, current.parent, current.cause);
+  }
+
+  return null;
+};
+
 /** When radio N is checked, stars 1..N must look selected (gold). Pure CSS :has fallback if inline script is blocked. */
 const buildPublicFeedbackRatingHasCss = (idPrefix) => {
   const blocks = [];
@@ -746,55 +781,7 @@ const buildPublicFeedbackPage = ({
       </div>
     </div>
   </div>
-  <script>
-    (function () {
-      function starValueFromLabel(label) {
-        var id = label.getAttribute('for');
-        if (!id) return 0;
-        var inp = document.getElementById(id);
-        if (!inp || !inp.value) return 0;
-        var v = parseInt(String(inp.value), 10);
-        return v >= 1 && v <= 5 ? v : 0;
-      }
-      function applyStarDisplay(group, n) {
-        var labels = group.querySelectorAll('label');
-        var v = Math.max(0, Math.min(5, n || 0));
-        labels.forEach(function (lab, idx) {
-          lab.classList.toggle('is-filled', idx < v);
-        });
-      }
-      function syncFromChecked(group) {
-        var checked = group.querySelector('input[type="radio"]:checked');
-        applyStarDisplay(group, checked ? parseInt(String(checked.value), 10) : 0);
-      }
-      function wireStarGroups() {
-        document.querySelectorAll('.rating-stars').forEach(function (group) {
-          if (group.getAttribute('data-ssms-stars-wired') === '1') return;
-          group.setAttribute('data-ssms-stars-wired', '1');
-          syncFromChecked(group);
-          group.addEventListener('change', function () {
-            syncFromChecked(group);
-          });
-          group.addEventListener('input', function () {
-            syncFromChecked(group);
-          });
-          group.querySelectorAll('label').forEach(function (label) {
-            label.addEventListener('mouseenter', function () {
-              applyStarDisplay(group, starValueFromLabel(label));
-            });
-          });
-          group.addEventListener('mouseleave', function () {
-            syncFromChecked(group);
-          });
-        });
-      }
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', wireStarGroups);
-      } else {
-        wireStarGroups();
-      }
-    })();
-  <\/script>
+  <script src="/api/v1/public-feedback/assets/rating-stars.js" defer></script>
 </body>
 </html>`;
 };
@@ -858,24 +845,58 @@ const createPublicComplaint = async (req) => {
     }
   }
 
-  const complaint = await Complaint.create({
-    tenant_id: facility.tenant_id,
-    facility_id: facility.id,
-    toilet_unit_id: unit.id,
-    reporter_user_id: null,
-    source_channel: 'public_qr',
-    reporter_name: null,
-    reporter_contact: null,
-    complaint_type: 'public_feedback',
-    description,
-    evidence_image_url: uploaded?.fileUrl || null,
-    status: 'open',
-    priority: derivePublicFeedbackPriority({
-      experienceRating,
-      cleanlinessRating,
-      airQualityRating,
-    }),
-  });
+  let complaint = null;
+  let transaction = null;
+  try {
+    transaction = await sequelize.transaction();
+    complaint = await Complaint.create(
+      {
+        tenant_id: facility.tenant_id,
+        facility_id: facility.id,
+        toilet_unit_id: unit.id,
+        reporter_user_id: null,
+        source_channel: 'public_qr',
+        reporter_name: null,
+        reporter_contact: null,
+        complaint_type: 'public_feedback',
+        description,
+        evidence_image_url: uploaded?.fileUrl || null,
+        status: 'open',
+        priority: derivePublicFeedbackPriority({
+          experienceRating,
+          cleanlinessRating,
+          airQualityRating,
+        }),
+      },
+      { transaction }
+    );
+    await transaction.commit();
+  } catch (error) {
+    if (transaction) {
+      try {
+        await transaction.rollback();
+      } catch (rollbackError) {
+        logger.error('Public feedback transaction rollback failed', {
+          toiletId: unit?.id || req.params.toiletId || null,
+          error: rollbackError.message,
+        });
+      }
+    }
+
+    const firstFailingQuery = extractFirstFailingDbQuery(error);
+    logger.error('Public feedback transaction failed', {
+      toiletId: unit?.id || req.params.toiletId || null,
+      tenantId: facility?.tenant_id || null,
+      firstFailingQuery,
+      error: error.message,
+    });
+
+    throw new AppError(
+      'Unable to submit feedback right now. Please try again in a few moments.',
+      500,
+      { code: 'PUBLIC_FEEDBACK_SUBMIT_FAILED' }
+    );
+  }
 
   await createAuditLog({
     req,
@@ -897,10 +918,28 @@ const createPublicComplaint = async (req) => {
     include: complaintInclude(),
   });
   const mapped = await mapComplaint(hydrated || complaint);
-  const automation = await criticalComplaintService.handleComplaintCriticality({
-    complaintId: complaint.id,
-    req,
-  });
+  let automation = {
+    triggered: false,
+    created: false,
+    deduped: false,
+    task: null,
+    reason: 'Automation unavailable',
+  };
+  try {
+    automation = await criticalComplaintService.handleComplaintCriticality({
+      complaintId: complaint.id,
+      req,
+    });
+  } catch (error) {
+    const firstFailingQuery = extractFirstFailingDbQuery(error);
+    logger.error('Public feedback automation failed', {
+      complaintId: complaint.id,
+      toiletId: unit?.id || null,
+      firstFailingQuery,
+      error: error.message,
+    });
+  }
+
   return { ...mapped, automation };
 };
 

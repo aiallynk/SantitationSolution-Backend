@@ -27,6 +27,10 @@ const publicUpload = createImageDiskUpload({
 });
 
 router.get(
+  '/public-feedback/assets/rating-stars.js',
+  complaintController.getPublicFeedbackStarsScript
+);
+router.get(
   '/public-feedback/toilets/:toiletId',
   complaintController.getPublicFeedbackForm
 );

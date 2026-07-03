@@ -14,6 +14,7 @@ const {
   SensorDevice,
   SensorReading,
   TaskAssignmentLog,
+  Tenant,
   ToiletUnit,
   UserRole,
   WorkerAssignment,
@@ -21,7 +22,7 @@ const {
 } = require('../../models');
 const AppError = require('../../core/errors/AppError');
 const { runtimeConfig } = require('../../config/runtime');
-const { normalizePagination } = require('../../utils/validators');
+const { normalizePagination, sanitizeText } = require('../../utils/validators');
 const { resolveDateRange } = require('../../utils/dateRange');
 const { createAuditLog } = require('../audit/audit.service');
 const { resolveMediaUrl } = require('../media/mediaUrl.service');
@@ -32,12 +33,16 @@ const {
   normalizeToken,
   toNumberOrNull,
 } = require('../automation/automation.constants');
+const userService = require('../users/user.service');
 
 const ROLE_CODES = {
   AUDITOR: 'auditor',
   FIELD_WORKER: 'field_worker',
   SUPERVISOR: 'supervisor',
 };
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const PREFERRED_GEOGRAPHY_LEVELS = ['ward', 'zone', 'city', 'district', 'state', 'country', 'cluster'];
 
 const LOW_BATTERY_PERCENT = 20;
 const OFFLINE_THRESHOLD_MINUTES = 120;
@@ -1143,7 +1148,7 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
   alertWhere[Op.or] = alertOr;
   const alertRows = await Alert.findAll({
     where: withDateField(alertWhere, 'created_at', range),
-    include: [{ model: Facility, attributes: ['id', 'name', 'code'], required: false }],
+    include: [{ model: Facility, attributes: ['id', 'name', 'code', 'ward_geography_id', 'address_line'], required: false }],
     order: [['created_at', 'DESC']],
     limit: 500,
   });
@@ -1180,6 +1185,26 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
       workersById.get(String(alert.assigned_to_user_id || '')) ||
       [...workersById.values()].find((candidate) => candidate.facilityIds.has(String(alert.facility_id || ''))) ||
       null;
+    const inspectionType = linkedInspection?.inspection_type || null;
+    const inspectionCode = linkedInspection?.id
+      ? `INS-${String(linkedInspection.id || '').replace(/-/g, '').slice(0, 8).toUpperCase()}`
+      : null;
+    const toiletLabel = linkedInspection?.ToiletUnit?.code || linkedInspection?.ToiletUnit?.location_label || null;
+    const submittedBy =
+      linkedInspection?.inspector?.full_name ||
+      linkedInspection?.inspector?.email ||
+      null;
+    const submittedAt = toIsoOrNull(linkedInspection?.submitted_at || linkedInspection?.captured_at || alert.created_at);
+    const wardName = wardNameById.get(String(alert?.Facility?.ward_geography_id || '')) || null;
+    const sectorCode = linkedInspection?.ToiletUnit?.sector_code || null;
+    const locationLabel =
+      linkedInspection?.ToiletUnit?.location_label ||
+      alert?.Facility?.address_line ||
+      null;
+    const enrichedMessage =
+      String(alert.alert_type || '').toLowerCase().startsWith('inspection_') && inspectionCode
+        ? `${alert.message} | ${inspectionCode}${inspectionType ? ` | Type: ${inspectionType}` : ''}${submittedBy ? ` | Submitted by: ${submittedBy}` : ''}`
+        : alert.message;
     const mappedAlert = {
       id: alert.id,
       source: 'backend_alert',
@@ -1191,9 +1216,17 @@ const buildSupervisorSnapshot = async (req, { defaultDays = 1, maxDays = 30 } = 
       alertType: alert.alert_type,
       timestamp: toIsoOrNull(alert.created_at),
       status: alert.status,
-      message: alert.message,
+      message: enrichedMessage,
       suggestedAction: alert.status === 'open' ? 'Acknowledge and escalate if field action is required' : 'Monitor until resolved',
       resolutionStatus: alert.status,
+      inspectionType,
+      inspectionCode,
+      toiletLabel,
+      submittedBy,
+      submittedAt,
+      ward: wardName,
+      sector: sectorCode,
+      location: locationLabel,
     };
     actualAlerts.push(mappedAlert);
     if (worker) worker.alerts.push(mappedAlert);
@@ -1237,6 +1270,267 @@ const summarizeSnapshot = (snapshot) => {
     alertsRequiringAttention: alerts.filter((alert) => alert.status !== 'resolved').length,
     lowMobileBatteryCount: workers.filter((worker) => worker.phoneBatteryPct !== null && worker.phoneBatteryPct < LOW_BATTERY_PERCENT).length,
     lowSensorBatteryCount: workers.filter((worker) => worker.device.sensorBatteryPct !== null && worker.device.sensorBatteryPct < LOW_BATTERY_PERCENT).length,
+  };
+};
+
+const createWorker = async (req) => {
+  const actorRoleCodes = uniqueIds(req.user?.roleCodes || []).map((roleCode) =>
+    String(roleCode || '').trim().toLowerCase()
+  );
+  if (!actorRoleCodes.includes(ROLE_CODES.SUPERVISOR)) {
+    throw new AppError('Only supervisor users can create workers', 403, {
+      code: 'ROLE_FORBIDDEN',
+    });
+  }
+
+  const fullName = sanitizeText(req.body.fullName, 180);
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const mobileNumber = String(req.body.mobileNumber || '').trim();
+  const password = String(req.body.password || '');
+  const confirmPassword = String(req.body.confirmPassword || '');
+  const address = sanitizeText(req.body.address, 300);
+  const gender = sanitizeText(req.body.gender, 40);
+
+  const errors = [];
+  if (isBlank(fullName)) errors.push('fullName is required');
+  if (isBlank(email)) errors.push('email is required');
+  if (!isBlank(email) && !EMAIL_PATTERN.test(email)) {
+    errors.push('email must be a valid email address');
+  }
+  if (isBlank(mobileNumber)) errors.push('mobileNumber is required');
+  if (isBlank(password)) errors.push('password is required');
+  if (isBlank(confirmPassword)) errors.push('confirmPassword is required');
+  if (!isBlank(password) && !isBlank(confirmPassword) && password !== confirmPassword) {
+    errors.push('confirmPassword must match password');
+  }
+  if (isBlank(address)) errors.push('address is required');
+  if (isBlank(gender)) errors.push('gender is required');
+  if (errors.length > 0) {
+    throw new AppError('Validation failed', 400, {
+      code: 'VALIDATION_ERROR',
+      errors,
+    });
+  }
+
+  const supervisorProfile = await PlatformUser.findOne({
+    where: tenantWhere(req, { id: req.user.id, status: 'active' }),
+    attributes: [
+      'id',
+      'geography_id',
+      'country_name',
+      'state_name',
+      'district_name',
+      'city_name',
+      'zone_name',
+      'ward_name',
+    ],
+    raw: true,
+  });
+  if (!supervisorProfile) {
+    throw new AppError('Supervisor profile is not active in tenant scope', 403, {
+      code: 'SUPERVISOR_SCOPE_INVALID',
+    });
+  }
+
+  const supervisorScope = await resolveSupervisorScope(req);
+  const geographyCandidates = uniqueIds([
+    supervisorProfile.geography_id,
+    req.user?.geographyId,
+    ...(req.user?.assignmentGeographyIds || []),
+    ...((req.user?.activeMemberships || []).map((membership) => membership?.geographyId).filter(Boolean)),
+    ...(supervisorScope?.geographyIds || []),
+    ...(req.user?.scopeGeographyIds || []),
+  ]);
+  const facilityCandidates = uniqueIds([
+    ...(req.user?.assignmentFacilityIds || []),
+    ...(supervisorScope?.facilityIds || []),
+    ...(req.user?.scopeFacilityIds || []),
+  ]);
+
+  const facilityRows =
+    facilityCandidates.length > 0
+      ? await Facility.findAll({
+          where: {
+            ...tenantWhere(req),
+            id: { [Op.in]: facilityCandidates },
+          },
+          attributes: ['id', 'geography_id', 'zone_geography_id', 'ward_geography_id'],
+          raw: true,
+        })
+      : [];
+  const validFacilityIds = new Set(facilityRows.map((row) => String(row.id || '').trim()).filter(Boolean));
+  let facilityId = firstScopedId(
+    facilityCandidates.filter((candidateId) => validFacilityIds.has(String(candidateId || '').trim()))
+  );
+  const selectedFacility =
+    facilityId
+      ? facilityRows.find((row) => String(row.id || '').trim() === String(facilityId || '').trim()) || null
+      : null;
+
+  const geographyRows =
+    geographyCandidates.length > 0
+      ? await Geography.findAll({
+          where: {
+            ...tenantWhere(req),
+            id: { [Op.in]: geographyCandidates },
+          },
+          attributes: ['id'],
+          raw: true,
+        })
+      : [];
+  const validGeographyIds = new Set(
+    geographyRows.map((row) => String(row.id || '').trim()).filter(Boolean)
+  );
+  const geographyId = firstScopedId(
+    geographyCandidates.filter((candidateId) => validGeographyIds.has(String(candidateId || '').trim()))
+  );
+
+  let resolvedGeographyId = geographyId;
+  if (!resolvedGeographyId && selectedFacility) {
+    resolvedGeographyId = firstScopedId([
+      selectedFacility.ward_geography_id,
+      selectedFacility.zone_geography_id,
+      selectedFacility.geography_id,
+    ]);
+  }
+  if (!facilityId && !resolvedGeographyId) {
+    const tenant = await Tenant.findByPk(req.user?.tenantId || null, {
+      attributes: ['id', 'root_geography_id'],
+    });
+    if (tenant?.root_geography_id) {
+      const rootGeography = await Geography.findOne({
+        where: {
+          ...tenantWhere(req),
+          id: tenant.root_geography_id,
+        },
+        attributes: ['id'],
+        raw: true,
+      });
+      if (rootGeography?.id) {
+        resolvedGeographyId = String(rootGeography.id).trim();
+      }
+    }
+  }
+
+  if (!facilityId && !resolvedGeographyId) {
+    const fallbackGeographies = await Geography.findAll({
+      where: tenantWhere(req),
+      attributes: ['id', 'level'],
+      raw: true,
+      limit: 500,
+      order: [['created_at', 'ASC']],
+    });
+    if (fallbackGeographies.length > 0) {
+      const byPriority = [...fallbackGeographies].sort((left, right) => {
+        const leftRank = PREFERRED_GEOGRAPHY_LEVELS.indexOf(String(left.level || '').toLowerCase());
+        const rightRank = PREFERRED_GEOGRAPHY_LEVELS.indexOf(String(right.level || '').toLowerCase());
+        const safeLeft = leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank;
+        const safeRight = rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank;
+        return safeLeft - safeRight;
+      });
+      resolvedGeographyId = String(byPriority[0]?.id || '').trim() || null;
+    }
+  }
+
+  if (!resolvedGeographyId && !facilityId) {
+    throw new AppError('Supervisor scope is missing worker assignment context', 400, {
+      code: 'SUPERVISOR_SCOPE_INVALID',
+      details: {
+        supervisorId: req.user?.id || null,
+        tenantId: req.user?.tenantId || null,
+        geographyCandidates,
+        facilityCandidates,
+        validGeographyCandidates: [...validGeographyIds],
+        validFacilityCandidates: [...validFacilityIds],
+      },
+    });
+  }
+
+  const scopedFacilityIds = uniqueIds([
+    ...(req.user?.scopeFacilityIds || []),
+    ...(supervisorScope?.facilityIds || []),
+    ...[...validFacilityIds],
+  ]);
+  const scopedGeographyIds = uniqueIds([
+    ...(req.user?.scopeGeographyIds || []),
+    ...(supervisorScope?.geographyIds || []),
+    ...(resolvedGeographyId ? [resolvedGeographyId] : []),
+    ...(selectedFacility
+      ? [
+          selectedFacility.geography_id,
+          selectedFacility.zone_geography_id,
+          selectedFacility.ward_geography_id,
+        ]
+      : []),
+    ...[...validGeographyIds],
+  ]);
+  const canAssignFacilityDirectly =
+    req.user?.isSuperAdmin ||
+    req.user?.scopeLevel !== 'facility' ||
+    scopedFacilityIds.includes(String(facilityId || '').trim());
+  if (facilityId && !canAssignFacilityDirectly) {
+    facilityId = null;
+  }
+
+  const metadataBase =
+    req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
+      ? req.body.metadata
+      : {};
+  const inheritedLocations = {
+    countryName: String(supervisorProfile.country_name || '').trim() || undefined,
+    stateName: String(supervisorProfile.state_name || '').trim() || undefined,
+    districtName: String(supervisorProfile.district_name || '').trim() || undefined,
+    cityName: String(supervisorProfile.city_name || '').trim() || undefined,
+    zoneName: String(supervisorProfile.zone_name || '').trim() || undefined,
+    wardName: String(supervisorProfile.ward_name || '').trim() || undefined,
+  };
+
+  const workerPayload = {
+    fullName,
+    email,
+    phone: mobileNumber,
+    password,
+    roleCodes: [ROLE_CODES.FIELD_WORKER],
+    supervisorUserId: req.user.id,
+    status: 'active',
+    geographyId: facilityId ? undefined : resolvedGeographyId || undefined,
+    ...inheritedLocations,
+    assignments: facilityId
+      ? [
+          {
+            facilityId,
+            assignmentLevel: 'facility',
+            assignmentRole: 'worker',
+            supervisorUserId: req.user.id,
+          },
+        ]
+      : undefined,
+    metadata: {
+      ...metadataBase,
+      address,
+      gender,
+    },
+  };
+
+  const worker = await userService.createUser({
+    ...req,
+    user: {
+      ...req.user,
+      scopeFacilityIds: scopedFacilityIds,
+      scopeGeographyIds: scopedGeographyIds,
+    },
+    body: workerPayload,
+  });
+
+  return {
+    id: worker.id,
+    fullName: worker.fullName,
+    email: worker.email,
+    mobileNumber: worker.phone || null,
+    address: worker.metadata?.address || address,
+    gender: worker.metadata?.gender || gender,
+    role: 'WORKER',
+    status: worker.status || 'active',
   };
 };
 
@@ -2067,6 +2361,7 @@ const acknowledgeAlert = async (req) => {
 
 module.exports = {
   acknowledgeAlert,
+  createWorker,
   getAlerts,
   getAttendance,
   getCheckins,

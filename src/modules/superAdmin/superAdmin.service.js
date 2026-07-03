@@ -666,37 +666,217 @@ const patchFeatureFlags = async (req) => {
 
 const getActionCenter = async (req) => {
   ensureSuperAdmin(req);
-  const [criticalAlerts, pendingApprovals, openSyncFailures, openSupportTickets, queue] = await Promise.all([
-    Alert.findAll({
+  const [approvals, syncFailures, supportTickets, queue, tenants, recentHistory] = await Promise.all([
+    SuperAdminApproval.findAll({
+      where: { status: 'pending' },
+      order: [['created_at', 'DESC']],
+    }),
+    SuperAdminSyncFailure.findAll({
+      where: { status: 'open' },
+      order: [['first_seen_at', 'DESC']],
+    }),
+    SuperAdminSupportTicket.findAll({
+      where: { status: { [Op.in]: ['open', 'in_progress'] } },
+      order: [['created_at', 'DESC']],
+    }),
+    getQueueMetrics(ANALYSIS_QUEUE),
+    Tenant.findAll({
+      attributes: ['id', 'name', 'city_name'],
+    }),
+    AuditLog.findAll({
       where: {
-        status: { [Op.in]: ['open', 'acknowledged'] },
-        severity: { [Op.in]: ['high', 'critical'] },
+        action: {
+          [Op.in]: [
+            'super_admin.approval_update',
+            'super_admin.sync_failure_update',
+            'super_admin.support_ticket_update',
+          ],
+        },
       },
       order: [['created_at', 'DESC']],
-      limit: 10,
+      limit: 20,
     }),
-    SuperAdminApproval.count({ where: { status: 'pending' } }),
-    SuperAdminSyncFailure.count({ where: { status: 'open' } }),
-    SuperAdminSupportTicket.count({ where: { status: { [Op.in]: ['open', 'in_progress'] } } }),
-    getQueueMetrics(ANALYSIS_QUEUE),
   ]);
+
+  const userIds = new Set();
+  approvals.forEach((row) => {
+    if (row.requested_by_user_id) userIds.add(row.requested_by_user_id);
+  });
+  supportTickets.forEach((row) => {
+    if (row.opened_by_user_id) userIds.add(row.opened_by_user_id);
+    if (row.assigned_to_user_id) userIds.add(row.assigned_to_user_id);
+  });
+  recentHistory.forEach((row) => {
+    if (row.actor_user_id) userIds.add(row.actor_user_id);
+  });
+  const users = userIds.size > 0
+    ? await PlatformUser.findAll({
+        where: { id: { [Op.in]: [...userIds] } },
+        attributes: ['id', 'full_name'],
+      })
+    : [];
+
+  const tenantMap = new Map(tenants.map((tenant) => [tenant.id, tenant]));
+  const userMap = new Map(users.map((user) => [user.id, user.full_name]));
+  const tenantContext = (tenantId) => {
+    const tenant = tenantMap.get(tenantId);
+    return {
+      tenantName: tenant?.name || '',
+      cityName: tenant?.city_name || '',
+    };
+  };
+  const readable = (value, fallback = 'Platform operations') => {
+    const text = String(value || '').trim();
+    if (!text) return fallback;
+    return text
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/\b\w/g, (character) => character.toUpperCase());
+  };
+  const dueAfterHours = (value, hours) => {
+    const timestamp = new Date(value).getTime();
+    return Number.isFinite(timestamp)
+      ? new Date(timestamp + hours * 60 * 60 * 1000).toISOString()
+      : null;
+  };
+  const syncSlaHours = {
+    critical: 1,
+    high: 4,
+    medium: 8,
+    low: 24,
+  };
+  const supportSlaHours = {
+    critical: 2,
+    high: 8,
+    medium: 24,
+    low: 48,
+  };
+
+  const approvalItems = approvals.map((row) => ({
+    id: row.id,
+    category: 'approval',
+    priority: String(row.category || '').toLowerCase().includes('critical') ? 'high' : 'medium',
+    title: `Review ${readable(row.category, 'approval request')}`,
+    description: row.notes || `Approval requested for ${readable(row.entity_type, 'platform record')}.`,
+    ...tenantContext(row.tenant_id),
+    module: readable(row.entity_type),
+    status: 'pending',
+    createdAt: row.created_at,
+    dueAt: dueAfterHours(row.created_at, 24),
+    relatedEntityType: row.entity_type,
+    relatedEntityId: row.entity_id || row.id,
+    userName: userMap.get(row.requested_by_user_id) || '',
+    actions: ['view', 'approve', 'reject'],
+  }));
+
+  const syncItems = syncFailures.map((row) => ({
+    id: row.id,
+    category: 'sync_failure',
+    priority: row.severity,
+    title: `Sync failure in ${readable(row.source_module)}`,
+    description: row.reason,
+    ...tenantContext(row.tenant_id),
+    module: readable(row.source_module),
+    status: 'failed',
+    createdAt: row.first_seen_at,
+    dueAt: dueAfterHours(row.first_seen_at, syncSlaHours[row.severity] || 8),
+    relatedEntityType: 'sync_failure',
+    relatedEntityId: row.reference_id || row.id,
+    issueId: row.reference_id || row.id,
+    actions: ['view_logs', 'retry', 'mark_resolved'],
+  }));
+
+  const supportItems = supportTickets.map((row) => ({
+    id: row.id,
+    category: 'support_ticket',
+    priority: row.severity,
+    title: row.subject,
+    description: row.description,
+    ...tenantContext(row.tenant_id),
+    module: readable(row.metadata?.module, 'Support operations'),
+    status: row.status,
+    createdAt: row.created_at,
+    dueAt: dueAfterHours(row.created_at, supportSlaHours[row.severity] || 24),
+    relatedEntityType: 'support_ticket',
+    relatedEntityId: row.id,
+    issueId: row.id,
+    userName: userMap.get(row.opened_by_user_id) || '',
+    assignedTo: userMap.get(row.assigned_to_user_id) || '',
+    metadata: row.metadata || null,
+    actions: ['view', 'assign', 'update_status', 'close'],
+  }));
+
+  const queueBacklog = Number(queue.counts.waiting || 0) + Number(queue.counts.active || 0);
+  const now = new Date();
+  const queueItems = queueBacklog > 0
+    ? [{
+        id: `queue:${ANALYSIS_QUEUE}`,
+        category: 'queue_job',
+        priority: queueBacklog > 50 ? 'critical' : queueBacklog > 10 ? 'high' : 'medium',
+        title: `${readable(ANALYSIS_QUEUE)} backlog`,
+        description: `${queue.counts.waiting || 0} waiting and ${queue.counts.active || 0} active jobs require monitoring.`,
+        tenantName: '',
+        cityName: '',
+        module: 'Inspection analysis',
+        status: 'pending',
+        createdAt: now.toISOString(),
+        dueAt: dueAfterHours(now, 2),
+        relatedEntityType: 'queue',
+        relatedEntityId: ANALYSIS_QUEUE,
+        quantity: queueBacklog,
+        actions: ['view_logs', 'retry', 'cancel'],
+      }]
+    : [];
+
+  const items = [
+    ...approvalItems,
+    ...syncItems,
+    ...supportItems,
+    ...queueItems,
+  ].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+
+  const historyCategory = {
+    super_admin_approval: 'approval',
+    super_admin_sync_failure: 'sync_failure',
+    super_admin_support_ticket: 'support_ticket',
+  };
+  const historyActionLabel = (row) => {
+    if (row.details?.actionLabel) return row.details.actionLabel;
+    if (row.entity_type === 'super_admin_approval') {
+      if (row.details?.status === 'approved') return 'Approve';
+      if (row.details?.status === 'rejected') return 'Reject';
+      return 'Update approval';
+    }
+    if (row.entity_type === 'super_admin_sync_failure') {
+      return row.details?.status === 'resolved' ? 'Mark resolved' : 'Retry';
+    }
+    if (row.entity_type === 'super_admin_support_ticket') {
+      if (row.details?.status === 'closed') return 'Close';
+      if (row.details?.status === 'resolved') return 'Update status';
+      return 'Assign';
+    }
+    return 'Update';
+  };
+  const history = recentHistory.map((row) => ({
+    id: row.id,
+    action: historyActionLabel(row),
+    category: historyCategory[row.entity_type] || 'platform_health_alert',
+    target: row.details?.target || `${readable(row.entity_type)} ${String(row.entity_id || '').slice(0, 8)}`.trim(),
+    performedBy: userMap.get(row.actor_user_id) || 'Super Admin',
+    remark: row.details?.remark || '',
+    time: row.created_at,
+  }));
 
   return {
     counters: {
-      pendingApprovals,
-      openSyncFailures,
-      openSupportTickets,
-      queueBacklog: Number(queue.counts.waiting || 0) + Number(queue.counts.active || 0),
+      pendingApprovals: approvalItems.length,
+      openSyncFailures: syncItems.length,
+      openSupportTickets: supportItems.length,
+      queueBacklog,
     },
-    criticalAlerts: criticalAlerts.map((row) => ({
-      id: row.id,
-      tenantId: row.tenant_id,
-      severity: row.severity,
-      message: row.message,
-      status: row.status,
-      facilityId: row.facility_id,
-      createdAt: row.created_at,
-    })),
+    items,
+    history,
   };
 };
 
@@ -1100,7 +1280,11 @@ const patchApprovalStatus = async (req) => {
     entityType: 'super_admin_approval',
     entityId: row.id,
     tenantId: row.tenant_id,
-    details: { status: req.body.status },
+    details: {
+      status: req.body.status,
+      target: row.category,
+      remark: req.body.notes ? sanitizeText(req.body.notes, 800) : '',
+    },
   });
   return row;
 };
@@ -1311,6 +1495,19 @@ const patchSyncFailureStatus = async (req) => {
     resolved_at: req.body.status === 'resolved' ? new Date() : null,
     updated_at: new Date(),
   });
+  await createAuditLog({
+    req,
+    action: 'super_admin.sync_failure_update',
+    entityType: 'super_admin_sync_failure',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+    details: {
+      status: req.body.status,
+      actionLabel: req.body.action === 'retry' ? 'Retry' : req.body.action === 'mark_resolved' ? 'Mark resolved' : null,
+      target: row.reason,
+      remark: req.body.remark ? sanitizeText(req.body.remark, 800) : '',
+    },
+  });
   return row;
 };
 
@@ -1419,6 +1616,27 @@ const patchSupportTicket = async (req) => {
     resolved_at: req.body.status === 'resolved' ? new Date() : row.resolved_at,
     metadata: req.body.metadata ?? row.metadata,
     updated_at: new Date(),
+  });
+  const actionName = req.body.metadata?.actionCenterAction;
+  const actionLabel = {
+    assign: 'Assign',
+    update_status: 'Update status',
+    close: 'Close',
+  }[actionName] || null;
+  await createAuditLog({
+    req,
+    action: 'super_admin.support_ticket_update',
+    entityType: 'super_admin_support_ticket',
+    entityId: row.id,
+    tenantId: row.tenant_id,
+    details: {
+      status: row.status,
+      actionLabel,
+      target: row.subject,
+      remark: req.body.metadata?.actionCenterRemark
+        ? sanitizeText(req.body.metadata.actionCenterRemark, 800)
+        : '',
+    },
   });
   return row;
 };

@@ -51,6 +51,19 @@ const postTask = async (req, res, next) => {
   }
 };
 
+const postDispatchToiletTask = async (req, res, next) => {
+  try {
+    const data = await taskService.createToiletAndDispatchTask(req);
+    return sendSuccess(res, {
+      statusCode: 201,
+      message: 'Toilet created and assigned to worker successfully',
+      data,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const patchTaskStart = async (req, res, next) => {
   try {
     const task = await taskService.startTask(req);
@@ -104,6 +117,7 @@ module.exports = {
   getTaskById,
   getMyTasks,
   postTask,
+  postDispatchToiletTask,
   postTaskAccept,
   patchTaskStart,
   patchTaskComplete,
