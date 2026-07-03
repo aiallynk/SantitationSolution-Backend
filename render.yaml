@@ -28,6 +28,8 @@ services:
         value: "false"
       - key: CORS_ORIGIN
         value: https://greentoilet-aially.vercel.app,https://*.vercel.app
+      - key: API_PUBLIC_BASE_URL
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
@@ -35,4 +37,10 @@ services:
       - key: JWT_REFRESH_SECRET
         sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
         sync: false

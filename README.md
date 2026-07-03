@@ -53,6 +53,8 @@ Recommended production env values:
 - `DB_SSL=true`
 - `AUTO_RUN_MIGRATIONS=false` (migrate in pre-deploy)
 - `CORS_ORIGIN=https://*.vercel.app,https://<your-domain>`
+- `API_PUBLIC_BASE_URL=https://<your-render-service>.onrender.com`
+- `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, and `FIREBASE_PRIVATE_KEY` for push notifications
 - `REDIS_REQUIRED_IN_PROD=false` (set `true` only when Redis is configured and reachable)
 
 ## Domain Modules
