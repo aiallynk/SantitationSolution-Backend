@@ -53,13 +53,34 @@ const isTemplateSecret = (value) => {
   );
 };
 
+const hasExplicitS3Credentials = () =>
+  !isTemplateSecret(s3Config.accessKeyId) && !isTemplateSecret(s3Config.secretAccessKey);
+
+const hasDefaultCredentialProviderHint = () =>
+  Boolean(
+    process.env.AWS_PROFILE ||
+      process.env.AWS_WEB_IDENTITY_TOKEN_FILE ||
+      process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI ||
+      process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI ||
+      process.env.AWS_ROLE_ARN ||
+      runtimeConfig.isProduction
+  );
+
 const isS3Enabled = () =>
   Boolean(
     s3Config.region &&
       s3Config.bucket &&
-      !isTemplateSecret(s3Config.accessKeyId) &&
-      !isTemplateSecret(s3Config.secretAccessKey)
+      (hasExplicitS3Credentials() || hasDefaultCredentialProviderHint())
   );
+
+const getS3Config = () => ({
+  region: s3Config.region,
+  bucket: s3Config.bucket,
+  endpoint: s3Config.endpoint,
+  forcePathStyle: Boolean(s3Config.forcePathStyle),
+  hasExplicitCredentials: hasExplicitS3Credentials(),
+  enabled: isS3Enabled(),
+});
 
 let cachedS3Client = null;
 
@@ -203,12 +224,15 @@ const getS3Client = () => {
   const clientOptions = {
     region: s3Config.region,
     forcePathStyle: s3Config.forcePathStyle,
-    credentials: {
+  };
+
+  if (hasExplicitS3Credentials()) {
+    clientOptions.credentials = {
       accessKeyId: s3Config.accessKeyId,
       secretAccessKey: s3Config.secretAccessKey,
       ...(s3Config.sessionToken ? { sessionToken: s3Config.sessionToken } : {}),
-    },
-  };
+    };
+  }
 
   if (s3Config.endpoint) {
     clientOptions.endpoint = s3Config.endpoint;
@@ -436,14 +460,13 @@ const deleteObjectFromS3 = async ({ storageKey, bucketName = s3Config.bucket }) 
   return true;
 };
 
-const calculateS3Usage = async ({
+const calculateS3UsageWithClient = async ({
+  client,
   prefix = '',
-  bucketName = s3Config.bucket,
+  bucketName,
   maxPages = 10_000,
+  commandFactory = (params) => new ListObjectsV2Command(params),
 } = {}) => {
-  const client = getS3Client();
-  if (!client) return null;
-
   const normalizedPrefix = normalizeObjectKey(prefix);
   let continuationToken = null;
   let totalBytes = 0;
@@ -455,7 +478,7 @@ const calculateS3Usage = async ({
   do {
     pageCount += 1;
     const response = await client.send(
-      new ListObjectsV2Command({
+      commandFactory({
         Bucket: bucketName,
         Prefix: normalizedPrefix || undefined,
         ContinuationToken: continuationToken || undefined,
@@ -485,6 +508,114 @@ const calculateS3Usage = async ({
     truncated: Boolean(continuationToken || truncated),
     pageCount,
   };
+};
+
+const calculateS3Usage = async ({
+  prefix = '',
+  bucketName = s3Config.bucket,
+  maxPages = 10_000,
+} = {}) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  return calculateS3UsageWithClient({
+    client,
+    prefix,
+    bucketName,
+    maxPages,
+  });
+};
+
+const calculateS3UsageByTenantPrefixWithClient = async ({
+  client,
+  basePrefix = 'sanitation/',
+  bucketName,
+  knownTenantIds = [],
+  maxPages = 10_000,
+  commandFactory = (params) => new ListObjectsV2Command(params),
+} = {}) => {
+  const normalizedBasePrefix = normalizeObjectKey(basePrefix);
+  const baseParts = normalizedBasePrefix.split('/').filter(Boolean);
+  const tenantIdSet = new Set(
+    (knownTenantIds || []).map((value) => String(value || '').trim()).filter(Boolean)
+  );
+  const byTenant = new Map();
+  let continuationToken = null;
+  let totalBytes = 0;
+  let objectCount = 0;
+  let pageCount = 0;
+  let truncated = false;
+
+  do {
+    pageCount += 1;
+    const response = await client.send(
+      commandFactory({
+        Bucket: bucketName,
+        Prefix: normalizedBasePrefix || undefined,
+        ContinuationToken: continuationToken || undefined,
+        MaxKeys: 1000,
+      })
+    );
+
+    for (const object of response.Contents || []) {
+      const key = normalizeObjectKey(object.Key);
+      const parts = key.split('/').filter(Boolean);
+      const matchesBase = baseParts.every((part, index) => parts[index] === part);
+      const tenantId = matchesBase ? parts[baseParts.length] : null;
+      if (!tenantId || (tenantIdSet.size > 0 && !tenantIdSet.has(tenantId))) {
+        continue;
+      }
+
+      const size = Number(object.Size || 0);
+      const modifiedAt = object.LastModified ? new Date(object.LastModified).toISOString() : null;
+      const current = byTenant.get(tenantId) || {
+        tenantId,
+        prefix: `${normalizedBasePrefix.replace(/\/?$/, '/')}${tenantId}/`,
+        totalBytes: 0,
+        objectCount: 0,
+        latestModifiedAt: null,
+      };
+      current.totalBytes += size;
+      current.objectCount += 1;
+      if (modifiedAt && (!current.latestModifiedAt || modifiedAt > current.latestModifiedAt)) {
+        current.latestModifiedAt = modifiedAt;
+      }
+      byTenant.set(tenantId, current);
+      totalBytes += size;
+      objectCount += 1;
+    }
+
+    continuationToken = response.NextContinuationToken || null;
+    truncated = Boolean(response.IsTruncated);
+  } while (continuationToken && pageCount < maxPages);
+
+  return {
+    bucketName,
+    basePrefix: normalizedBasePrefix,
+    tenants: [...byTenant.values()].sort((a, b) => b.totalBytes - a.totalBytes),
+    totalBytes,
+    objectCount,
+    truncated: Boolean(continuationToken || truncated),
+    pageCount,
+  };
+};
+
+const calculateS3UsageByTenantPrefix = async ({
+  basePrefix = 'sanitation/',
+  bucketName = s3Config.bucket,
+  knownTenantIds = [],
+  maxPages = 10_000,
+} = {}) => {
+  const client = getS3Client();
+  if (!client) return null;
+
+  return calculateS3UsageByTenantPrefixWithClient({
+    client,
+    basePrefix,
+    bucketName,
+    knownTenantIds,
+    maxPages,
+  });
 };
 
 const getObjectDataUrlFromS3 = async (storageKey) => {
@@ -541,9 +672,15 @@ const getObjectBufferFromS3 = async (storageKey) => {
   }
 };
 
-const headObjectFromS3 = async (storageKey, { bucketName = s3Config.bucket } = {}) => {
+
+const headObjectFromS3 = async (storageKey, { throwOnError = false, bucketName = s3Config.bucket } = {}) => {
   const client = getS3Client();
-  if (!client) return null;
+  if (!client) {
+    if (throwOnError) {
+      throw new Error('S3 client is not configured');
+    }
+    return null;
+  }
 
   const objectKey = normalizeS3ObjectKey(storageKey, { bucketName });
   if (!objectKey) return null;
@@ -573,16 +710,23 @@ const headObjectFromS3 = async (storageKey, { bucketName = s3Config.bucket } = {
       fileUrl: buildObjectUrl(objectKey, { bucketName }),
     };
   } catch (error) {
+    if (throwOnError) {
+      throw error;
+    }
     return null;
   }
 };
 
 module.exports = {
   isS3Enabled,
+  getS3Config,
   uploadFileToS3,
   uploadBufferToS3,
   deleteObjectFromS3,
   calculateS3Usage,
+  calculateS3UsageWithClient,
+  calculateS3UsageByTenantPrefix,
+  calculateS3UsageByTenantPrefixWithClient,
   getPresignedPutObjectUrl,
   getPresignedGetObjectUrl,
   getObjectDataUrlFromS3,

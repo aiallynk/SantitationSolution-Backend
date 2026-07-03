@@ -2,6 +2,7 @@ const { sendSuccess } = require('../../core/http/response');
 const superAdminService = require('./superAdmin.service');
 const tenantLimitsService = require('./tenantLimits.service');
 const { buildQuotaStatus } = require('./tenantQuota.service');
+const storageUsageService = require('./storageUsage.service');
 
 const wrap = (serviceFn, message) => async (req, res, next) => {
   try {
@@ -18,6 +19,8 @@ module.exports = {
   getRegions: wrap(superAdminService.getRegions, 'Super admin regions fetched successfully'),
   getPlatformMetrics: wrap(superAdminService.getPlatformMetrics, 'Super admin platform metrics fetched successfully'),
   getStorage: wrap(superAdminService.getStorage, 'Super admin storage metrics fetched successfully'),
+  getPlatformStorageUsage: wrap(storageUsageService.getPlatformStorageUsage, 'S3 storage usage fetched successfully'),
+  getTenantStorageUsage: wrap(storageUsageService.getSuperAdminTenantStorageUsage, 'Tenant S3 storage usage fetched successfully'),
   getApiUsage: wrap(superAdminService.getApiUsage, 'Super admin API usage fetched successfully'),
   getSystemHealth: wrap(superAdminService.getSystemHealth, 'Super admin system health fetched successfully'),
   getAuditLogs: wrap(superAdminService.getAuditLogs, 'Super admin audit logs fetched successfully'),
