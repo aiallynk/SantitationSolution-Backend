@@ -120,6 +120,144 @@ function assertS3UsageConfigured() {
   return config;
 }
 
+function buildS3UsageWarning(error, operation = 'list') {
+  if (error instanceof AppError) {
+    return {
+      code: error.code || error.details?.errorCode || 'S3_USAGE_UNAVAILABLE',
+      operation,
+      message: error.details?.message || error.message || 'S3 usage is unavailable; using database media records.',
+      missing: error.details?.missing || undefined,
+      awsErrorCode: error.details?.awsErrorCode || null,
+      awsStatusCode: error.details?.awsStatusCode || null,
+    };
+  }
+
+  const code = resolveS3UsageErrorCode(error, operation);
+  return {
+    code,
+    operation,
+    message: error?.message || 'S3 usage is unavailable; using database media records.',
+    awsErrorCode: error?.Code || error?.code || error?.name || null,
+    awsStatusCode: getErrorStatusCode(error) || null,
+  };
+}
+
+function dbOnlyTenantUsagePayload({ tenantId, dbUsage, warning = null, bucket = null, prefix = null }) {
+  const safeDbUsage = { ...(dbUsage || {}) };
+  delete safeDbUsage.objects;
+  const totalBytes = toFiniteNumber(safeDbUsage.totalBytes);
+  const objectCount = toFiniteNumber(safeDbUsage.objectCount);
+  const lastCalculatedAt = new Date().toISOString();
+
+  return {
+    success: true,
+    scope: 'tenant',
+    tenantId,
+    bucket,
+    prefix: prefix || tenantPrefix(tenantId),
+    totalBytes,
+    formattedSize: safeDbUsage.formattedSize || formatBytes(totalBytes),
+    objectCount,
+    source: 'db_media_records',
+    storageWarning: warning,
+    dbUsage: {
+      ...safeDbUsage,
+      formattedSize: formatBytes(totalBytes),
+    },
+    prefixUsage: null,
+    latestModifiedAt: safeDbUsage.latestUploadAt || null,
+    lastCalculatedAt,
+  };
+}
+
+function buildPlatformTenantRows({
+  tenantIds,
+  tenantNameMap,
+  dbMap,
+  prefixMap = new Map(),
+  bucket = null,
+  forceDbSource = false,
+}) {
+  return tenantIds
+    .map((tenantId) => {
+      const tenant = tenantNameMap.get(tenantId) || {};
+      const chosen = chooseTenantUsageSource({
+        tenantId,
+        dbUsage: dbMap.get(tenantId),
+        prefixUsage: prefixMap.get(tenantId),
+      });
+      const totalBytes = toFiniteNumber(chosen.totalBytes);
+      const source = forceDbSource ? 'db_media_records' : chosen.source;
+
+      return {
+        tenantId,
+        tenantName: tenant.name || null,
+        tenantCode: tenant.code || null,
+        bucket,
+        prefix: chosen.prefix || tenantPrefix(tenantId),
+        totalBytes,
+        usedBytes: totalBytes,
+        formattedSize: chosen.formattedSize || formatBytes(totalBytes),
+        objectCount: toFiniteNumber(chosen.objectCount),
+        source,
+        dbMissingSizeCount: toFiniteNumber(chosen.dbMissingSizeCount || chosen.missingSizeCount),
+        latestModifiedAt: chosen.latestModifiedAt || chosen.latestUploadAt || null,
+      };
+    })
+    .filter((row) => row.totalBytes > 0 || row.objectCount > 0 || row.dbMissingSizeCount > 0)
+    .sort((a, b) => b.totalBytes - a.totalBytes);
+}
+
+function summarizePlatformTenantRows(tenantRows) {
+  let latestModifiedAt = null;
+
+  for (const row of tenantRows || []) {
+    if (row.latestModifiedAt && (!latestModifiedAt || row.latestModifiedAt > latestModifiedAt)) {
+      latestModifiedAt = row.latestModifiedAt;
+    }
+  }
+
+  return {
+    totalBytes: (tenantRows || []).reduce((sum, row) => sum + toFiniteNumber(row.totalBytes), 0),
+    objectCount: (tenantRows || []).reduce((sum, row) => sum + toFiniteNumber(row.objectCount), 0),
+    latestModifiedAt,
+  };
+}
+
+function buildPlatformUsagePayload({
+  tenantRows,
+  bucket = null,
+  bucketUsage = null,
+  tenantPrefixUsage = null,
+  warning = null,
+}) {
+  const tenantTotals = summarizePlatformTenantRows(tenantRows);
+  const totalBytes = bucketUsage?.totalBytes ?? tenantTotals.totalBytes;
+  const objectCount = bucketUsage?.objectCount ?? tenantTotals.objectCount;
+
+  return {
+    success: true,
+    scope: 'platform',
+    bucket,
+    prefix: '',
+    totalBytes,
+    usedBytes: totalBytes,
+    formattedSize: formatBytes(totalBytes),
+    objectCount,
+    latestModifiedAt: bucketUsage?.latestModifiedAt || tenantTotals.latestModifiedAt,
+    lastCalculatedAt: new Date().toISOString(),
+    tenantPrefixBase: DEFAULT_TENANT_PREFIX_BASE,
+    tenants: tenantRows,
+    source: bucketUsage ? 's3_bucket' : 'db_media_records',
+    storageWarning: warning,
+    pagination: {
+      pageCount: bucketUsage?.pageCount || 0,
+      tenantPrefixPageCount: tenantPrefixUsage?.pageCount || 0,
+      truncated: Boolean(bucketUsage?.truncated || tenantPrefixUsage?.truncated),
+    },
+  };
+}
+
 function ensureSuperAdmin(req) {
   if (!req.user?.isSuperAdmin) {
     throw new AppError('Only super admin can access this endpoint', 403, { code: 'SUPER_ADMIN_ONLY' });
@@ -452,12 +590,57 @@ async function calculateTenantDbUsageWithHeadFallback(tenantId) {
 }
 
 async function calculateTenantStorageUsage(tenantId) {
-  const config = assertS3UsageConfigured();
+  let config = null;
+  let configWarning = null;
+  try {
+    config = assertS3UsageConfigured();
+  } catch (error) {
+    configWarning = buildS3UsageWarning(error, 'list');
+  }
   const prefix = tenantPrefix(tenantId);
-  const [dbUsage, prefixUsage] = await Promise.all([
-    calculateTenantDbUsageWithHeadFallback(tenantId),
-    calculateUsageOrThrow({ prefix, tenantId }),
-  ]);
+  const dbUsage = config
+    ? await calculateTenantDbUsageWithHeadFallback(tenantId).catch(async (error) => {
+        const code = resolveS3UsageErrorCode(error, 'head');
+        if (code === 'S3_HEAD_PERMISSION_DENIED') {
+          logger.warn('Falling back to DB media sizes because S3 head permission is unavailable', {
+            tenantId,
+            code,
+          });
+          return calculateTenantDbUsage(tenantId, { includeObjectDetails: true });
+        }
+        throw error;
+      })
+    : await calculateTenantDbUsage(tenantId, { includeObjectDetails: true });
+
+  if (!config) {
+    return dbOnlyTenantUsagePayload({
+      tenantId,
+      dbUsage,
+      warning: configWarning,
+      prefix,
+    });
+  }
+
+  let prefixUsage = null;
+  let warning = null;
+  try {
+    prefixUsage = await calculateUsageOrThrow({ prefix, tenantId });
+  } catch (error) {
+    warning = buildS3UsageWarning(error, 'list');
+    logger.warn('Falling back to DB media storage usage because S3 tenant prefix usage failed', {
+      tenantId,
+      code: warning.code,
+      operation: warning.operation,
+      awsStatusCode: warning.awsStatusCode,
+    });
+    return dbOnlyTenantUsagePayload({
+      tenantId,
+      dbUsage,
+      warning,
+      bucket: config.bucket,
+      prefix,
+    });
+  }
 
   const chosen = chooseTenantUsageSource({ dbUsage, prefixUsage, tenantId });
   const totalBytes = toFiniteNumber(chosen.totalBytes);
@@ -485,6 +668,7 @@ async function calculateTenantStorageUsage(tenantId) {
     formattedSize: chosen.formattedSize || formatBytes(totalBytes),
     objectCount,
     source: chosen.source,
+    storageWarning: warning,
     dbUsage: {
       ...safeDbUsage,
       formattedSize: formatBytes(safeDbUsage.totalBytes || 0),
@@ -531,15 +715,47 @@ async function getTenantDbSummaries() {
 
 async function getPlatformStorageUsage(req) {
   ensureSuperAdmin(req);
-  const config = assertS3UsageConfigured();
   const tenants = await Tenant.findAll({
     attributes: ['id', 'name', 'code'],
     raw: true,
   });
   const tenantIds = tenants.map((tenant) => tenant.id);
+  const dbSummaries = await getTenantDbSummaries();
+  const dbMap = new Map((dbSummaries || []).map((row) => [row.tenantId, row]));
+  const tenantNameMap = new Map(tenants.map((tenant) => [tenant.id, tenant]));
+  let config = null;
+  let configWarning = null;
 
   try {
-    const [bucketUsage, tenantPrefixUsage, dbSummaries] = await Promise.all([
+    config = assertS3UsageConfigured();
+  } catch (error) {
+    configWarning = buildS3UsageWarning(error, 'list');
+  }
+
+  if (!config) {
+    const tenantRows = buildPlatformTenantRows({
+      tenantIds,
+      tenantNameMap,
+      dbMap,
+      bucket: null,
+      forceDbSource: true,
+    });
+
+    logger.debug('[S3_USAGE] platform usage using DB media records', {
+      reason: configWarning?.code || null,
+      objects: tenantRows.reduce((sum, row) => sum + toFiniteNumber(row.objectCount), 0),
+      totalBytes: tenantRows.reduce((sum, row) => sum + toFiniteNumber(row.totalBytes), 0),
+      tenantCount: tenantRows.length,
+    });
+
+    return buildPlatformUsagePayload({
+      tenantRows,
+      warning: configWarning,
+    });
+  }
+
+  try {
+    const [bucketUsage, tenantPrefixUsage] = await Promise.all([
       calculateS3Usage({
         bucketName: config.bucket,
         prefix: '',
@@ -549,50 +765,18 @@ async function getPlatformStorageUsage(req) {
         basePrefix: DEFAULT_TENANT_PREFIX_BASE,
         knownTenantIds: tenantIds,
       }),
-      getTenantDbSummaries(),
     ]);
 
-    if (!bucketUsage || !tenantPrefixUsage) {
-      throw new AppError('Unable to calculate S3 usage', 500, {
-        code: 'S3_CREDENTIALS_MISSING',
-        details: {
-          errorCode: 'S3_CREDENTIALS_MISSING',
-          message: 'S3 client was not created. Configure AWS credentials or IAM role for the backend.',
-        },
-      });
-    }
+    const prefixMap = new Map((tenantPrefixUsage?.tenants || []).map((row) => [row.tenantId, row]));
 
-    const prefixMap = new Map((tenantPrefixUsage.tenants || []).map((row) => [row.tenantId, row]));
-    const dbMap = new Map((dbSummaries || []).map((row) => [row.tenantId, row]));
-    const tenantNameMap = new Map(tenants.map((tenant) => [tenant.id, tenant]));
+    const tenantRows = buildPlatformTenantRows({
+      tenantIds,
+      tenantNameMap,
+      dbMap,
+      prefixMap,
+      bucket: config.bucket,
+    });
 
-    const tenantRows = tenantIds
-      .map((tenantId) => {
-        const tenant = tenantNameMap.get(tenantId) || {};
-        const chosen = chooseTenantUsageSource({
-          tenantId,
-          dbUsage: dbMap.get(tenantId),
-          prefixUsage: prefixMap.get(tenantId),
-        });
-        return {
-          tenantId,
-          tenantName: tenant.name || null,
-          tenantCode: tenant.code || null,
-          bucket: config.bucket,
-          prefix: chosen.prefix || tenantPrefix(tenantId),
-          totalBytes: toFiniteNumber(chosen.totalBytes),
-          usedBytes: toFiniteNumber(chosen.totalBytes),
-          formattedSize: chosen.formattedSize || formatBytes(chosen.totalBytes),
-          objectCount: toFiniteNumber(chosen.objectCount),
-          source: chosen.source,
-          dbMissingSizeCount: toFiniteNumber(chosen.dbMissingSizeCount || chosen.missingSizeCount),
-          latestModifiedAt: chosen.latestModifiedAt || chosen.latestUploadAt || null,
-        };
-      })
-      .filter((row) => row.totalBytes > 0 || row.objectCount > 0 || row.dbMissingSizeCount > 0)
-      .sort((a, b) => b.totalBytes - a.totalBytes);
-
-    const lastCalculatedAt = new Date().toISOString();
     logger.debug('[S3_USAGE] platform usage calculated', {
       bucket: config.bucket,
       prefix: '',
@@ -601,27 +785,33 @@ async function getPlatformStorageUsage(req) {
       tenantCount: tenantRows.length,
     });
 
-    return {
-      success: true,
-      scope: 'platform',
+    return buildPlatformUsagePayload({
+      tenantRows,
       bucket: config.bucket,
-      prefix: '',
-      totalBytes: bucketUsage.totalBytes,
-      usedBytes: bucketUsage.totalBytes,
-      formattedSize: formatBytes(bucketUsage.totalBytes),
-      objectCount: bucketUsage.objectCount,
-      latestModifiedAt: bucketUsage.latestModifiedAt,
-      lastCalculatedAt,
-      tenantPrefixBase: DEFAULT_TENANT_PREFIX_BASE,
-      tenants: tenantRows,
-      pagination: {
-        pageCount: bucketUsage.pageCount,
-        tenantPrefixPageCount: tenantPrefixUsage.pageCount,
-        truncated: Boolean(bucketUsage.truncated || tenantPrefixUsage.truncated),
-      },
-    };
+      bucketUsage,
+      tenantPrefixUsage,
+      warning: configWarning,
+    });
   } catch (error) {
-    throwS3UsageError(error, 'list');
+    const warning = buildS3UsageWarning(error, 'list');
+    logger.warn('Falling back to DB media storage usage because S3 platform usage failed', {
+      code: warning.code,
+      operation: warning.operation,
+      awsStatusCode: warning.awsStatusCode,
+    });
+    const tenantRows = buildPlatformTenantRows({
+      tenantIds,
+      tenantNameMap,
+      dbMap,
+      bucket: config.bucket,
+      forceDbSource: true,
+    });
+
+    return buildPlatformUsagePayload({
+      tenantRows,
+      bucket: config.bucket,
+      warning,
+    });
   }
 }
 

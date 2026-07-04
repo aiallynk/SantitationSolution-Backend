@@ -137,6 +137,7 @@ const mapTenant = (tenant, metrics = null) => {
     name: tenant.name,
     code: tenant.code,
     status: tenant.status,
+    externalApiSharingEnabled: Boolean(tenant.external_api_sharing_enabled),
     countryCode: tenant.country_code,
     contactName: tenant.contact_name || null,
     contactEmail: tenant.contact_email || null,
@@ -563,6 +564,11 @@ const patchTenant = async (req) => {
     }
     if (req.body.contactMobile !== undefined) {
       updates.contact_mobile = req.body.contactMobile ? sanitizeText(req.body.contactMobile, 32) : null;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'externalApiSharingEnabled')) {
+      updates.external_api_sharing_enabled = req.body.externalApiSharingEnabled;
+    } else if (Object.prototype.hasOwnProperty.call(req.body, 'external_api_sharing_enabled')) {
+      updates.external_api_sharing_enabled = req.body.external_api_sharing_enabled;
     }
     if (req.body.scopeLevel !== undefined) {
       updates.scope_level = nextScopeLevel;

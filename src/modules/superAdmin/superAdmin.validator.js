@@ -79,6 +79,12 @@ const validateTenantPatch = (req) => {
   if (req.body.plan !== undefined && isBlank(req.body.plan)) {
     errors.push('plan must be a non-empty string when provided');
   }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'externalApiSharingEnabled') && typeof req.body.externalApiSharingEnabled !== 'boolean') {
+    errors.push('externalApiSharingEnabled must be boolean when provided');
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'external_api_sharing_enabled') && typeof req.body.external_api_sharing_enabled !== 'boolean') {
+    errors.push('external_api_sharing_enabled must be boolean when provided');
+  }
   return errors;
 };
 

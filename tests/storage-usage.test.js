@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const models = require('../src/models');
 const {
   calculateS3UsageWithClient,
   calculateS3UsageByTenantPrefixWithClient,
@@ -13,6 +14,80 @@ const {
   resolveS3UsageErrorCode,
   summarizeMediaRowsForStorage,
 } = require('../src/modules/superAdmin/storageUsage.service');
+
+const S3_ENV_KEYS = [
+  'NODE_ENV',
+  'AWS_REGION',
+  'AWS_DEFAULT_REGION',
+  'AWS_S3_BUCKET',
+  'AWS_S3_BUCKET_NAME',
+  'S3_BUCKET',
+  'S3_BUCKET_NAME',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'AWS_PROFILE',
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+  'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_ROLE_ARN',
+];
+
+const STORAGE_USAGE_MODULES = [
+  '../src/modules/superAdmin/storageUsage.service',
+  '../src/modules/media/s3.service',
+  '../src/config/runtime',
+];
+
+const withStubs = async (stubs, fn) => {
+  const originals = [];
+  for (const [target, key, value] of stubs) {
+    originals.push([target, key, target[key]]);
+    target[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [target, key, value] of originals.reverse()) {
+      target[key] = value;
+    }
+  }
+};
+
+const reloadStorageUsageService = ({ patchS3 = null } = {}) => {
+  for (const modulePath of STORAGE_USAGE_MODULES) {
+    delete require.cache[require.resolve(modulePath)];
+  }
+
+  const s3Service = require('../src/modules/media/s3.service');
+  if (patchS3) {
+    Object.assign(s3Service, patchS3);
+  }
+
+  return require('../src/modules/superAdmin/storageUsage.service');
+};
+
+const withFreshStorageUsageService = async ({ env = {}, patchS3 = null } = {}, fn) => {
+  const previousEnv = new Map(S3_ENV_KEYS.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of S3_ENV_KEYS) {
+      process.env[key] = Object.prototype.hasOwnProperty.call(env, key) ? env[key] : '';
+    }
+    const service = reloadStorageUsageService({ patchS3 });
+    return await fn(service);
+  } finally {
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    for (const modulePath of STORAGE_USAGE_MODULES) {
+      delete require.cache[require.resolve(modulePath)];
+    }
+  }
+};
 
 test('calculateS3UsageWithClient handles paginated S3 listings', async () => {
   const pages = [
@@ -176,4 +251,134 @@ test('tenant usage source falls back to S3 prefix when DB sizes are incomplete',
   assert.equal(chosen.source, 's3_prefix');
   assert.equal(chosen.totalBytes, 4096);
   assert.equal(chosen.formattedSize, '4.00 KB');
+});
+
+test('platform storage usage returns DB media totals when S3 config is missing', async () => {
+  await withFreshStorageUsageService({}, async (storageUsageService) => {
+    await withStubs(
+      [
+        [
+          models.Tenant,
+          'findAll',
+          async () => [
+            {
+              id: 'tenant-1',
+              name: 'Tenant One',
+              code: 'T1',
+            },
+          ],
+        ],
+        [
+          models.InspectionMedia,
+          'findAll',
+          async () => [
+            {
+              tenant_id: 'tenant-1',
+              storage_key: 'sanitation/tenant-1/a.jpg',
+              content_length: 1024,
+              metadata: {},
+              uploaded_at: '2026-07-01T00:00:00.000Z',
+              Inspection: { tenant_id: 'tenant-1' },
+            },
+            {
+              tenant_id: 'tenant-1',
+              storage_key: 'sanitation/tenant-1/b.jpg',
+              content_length: null,
+              metadata: { bytes: 2048 },
+              uploaded_at: '2026-07-02T00:00:00.000Z',
+              Inspection: { tenant_id: 'tenant-1' },
+            },
+          ],
+        ],
+      ],
+      async () => {
+        const result = await storageUsageService.getPlatformStorageUsage({
+          user: { isSuperAdmin: true },
+        });
+
+        assert.equal(result.success, true);
+        assert.equal(result.source, 'db_media_records');
+        assert.equal(result.totalBytes, 3072);
+        assert.equal(result.usedBytes, 3072);
+        assert.equal(result.objectCount, 2);
+        assert.equal(result.storageWarning.code, 'S3_USAGE_CONFIG_MISSING');
+        assert.equal(result.tenants.length, 1);
+        assert.equal(result.tenants[0].tenantId, 'tenant-1');
+        assert.equal(result.tenants[0].source, 'db_media_records');
+        assert.equal(result.tenants[0].usedBytes, 3072);
+      }
+    );
+  });
+});
+
+test('platform storage usage falls back to DB media totals when S3 listing is denied', async () => {
+  const accessDenied = Object.assign(new Error('Access Denied'), {
+    name: 'AccessDenied',
+    $metadata: { httpStatusCode: 403 },
+  });
+
+  await withFreshStorageUsageService(
+    {
+      env: {
+        NODE_ENV: 'test',
+        AWS_REGION: 'ap-south-1',
+        AWS_S3_BUCKET: 'sanitation-media',
+        AWS_ACCESS_KEY_ID: 'test-access-key',
+        AWS_SECRET_ACCESS_KEY: 'test-secret-key',
+      },
+      patchS3: {
+        calculateS3Usage: async () => {
+          throw accessDenied;
+        },
+        calculateS3UsageByTenantPrefix: async () => {
+          throw accessDenied;
+        },
+      },
+    },
+    async (storageUsageService) => {
+      await withStubs(
+        [
+          [
+            models.Tenant,
+            'findAll',
+            async () => [
+              {
+                id: 'tenant-1',
+                name: 'Tenant One',
+                code: 'T1',
+              },
+            ],
+          ],
+          [
+            models.InspectionMedia,
+            'findAll',
+            async () => [
+              {
+                tenant_id: 'tenant-1',
+                storage_key: 'sanitation/tenant-1/a.jpg',
+                content_length: 4096,
+                metadata: {},
+                uploaded_at: '2026-07-03T00:00:00.000Z',
+                Inspection: { tenant_id: 'tenant-1' },
+              },
+            ],
+          ],
+        ],
+        async () => {
+          const result = await storageUsageService.getPlatformStorageUsage({
+            user: { isSuperAdmin: true },
+          });
+
+          assert.equal(result.success, true);
+          assert.equal(result.source, 'db_media_records');
+          assert.equal(result.bucket, 'sanitation-media');
+          assert.equal(result.totalBytes, 4096);
+          assert.equal(result.objectCount, 1);
+          assert.equal(result.storageWarning.code, 'S3_LIST_PERMISSION_DENIED');
+          assert.equal(result.storageWarning.awsStatusCode, 403);
+          assert.equal(result.tenants[0].source, 'db_media_records');
+        }
+      );
+    }
+  );
 });

@@ -556,12 +556,16 @@ const getDebugNearbyToilets = async ({
     attributes: ['id', 'name', 'code', 'status', 'external_api_sharing_enabled', 'metadata', 'created_at', 'updated_at'],
   });
   const tenantById = new Map(tenants.map((tenant) => [String(tenant.id), tenant]));
-  const sharingTenantIds = tenants.filter(isTenantSharingEnabled).map((tenant) => String(tenant.id));
+  const sharingTenantIds = tenants
+    .filter((tenant) => tenant.status === 'active' && isTenantSharingEnabled(tenant))
+    .map((tenant) => String(tenant.id));
   const allowedTenantIds = scopedTenantIds.length > 0
     ? sharingTenantIds.filter((tenantId) => scopedTenantIds.includes(tenantId))
     : sharingTenantIds;
+  const allowedTenantSet = new Set(allowedTenantIds);
 
   const units = await ToiletUnit.findAll({
+    where: { deleted_at: null },
     attributes: [
       'id',
       'facility_id',
@@ -608,10 +612,19 @@ const getDebugNearbyToilets = async ({
   };
   const excludedSamples = [];
   const matchedSamples = [];
+  let hasRelevantPublicToiletWithInvalidCoordinates = false;
 
   for (const unit of units) {
     const coordinates = normalizeToiletCoordinates(unit);
+    const tenantId = String(unit.Facility?.tenant_id || '');
+    const tenant = tenantById.get(tenantId) || unit.Facility?.Tenant || null;
+    const tenantAllowedForPublicApi = allowedTenantSet.has(tenantId);
+    const publicVisible = unit.is_public_visible === true;
+    const statusAllowed = validated.includeClosed || isPublicOperational(unit);
     if (!coordinates.valid) {
+      if (tenantAllowedForPublicApi && publicVisible && statusAllowed) {
+        hasRelevantPublicToiletWithInvalidCoordinates = true;
+      }
       addExcluded(excludedSamples, sampleToilet({ unit, reason: coordinates.reason, fieldValue: coordinates, coordinates }));
       continue;
     }
@@ -628,8 +641,6 @@ const getDebugNearbyToilets = async ({
     }
     funnel.withinRadius += 1;
 
-    const tenantId = String(unit.Facility?.tenant_id || '');
-    const tenant = tenantById.get(tenantId) || unit.Facility?.Tenant || null;
     if (!tenant || !isTenantSharingEnabled(tenant)) {
       addExcluded(excludedSamples, sampleToilet({ unit, reason: 'TENANT_SHARING_DISABLED', fieldValue: tenant?.external_api_sharing_enabled ?? null, distance, coordinates }));
       continue;
@@ -690,7 +701,7 @@ const getDebugNearbyToilets = async ({
   if (scopedTenantIds.length > 0 && funnel.afterTenantSharing > funnel.afterApiKeyScope) {
     recommendedFixes.push('Update API key/project tenant scope to include the share-enabled tenant.');
   }
-  if (funnel.withValidCoordinates < funnel.totalToiletsInDb) {
+  if (hasRelevantPublicToiletWithInvalidCoordinates) {
     recommendedFixes.push('Fix missing or invalid toilet coordinates.');
   }
 
