@@ -25,6 +25,17 @@ const asIntOrNull = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const asNumberOrNull = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const asBoolean = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+};
+
 const percentile = (values, pct) => {
   const sorted = values
     .map((value) => Number(value))
@@ -182,6 +193,7 @@ const createUsageLog = async ({ req, res, startedAt = Date.now(), responseBody =
   const errorMessage = statusCode >= 400 ? responseBody?.message || apiContext.errorMessage || null : null;
   const requestIp = getRequestIp(req);
   const createdAt = new Date();
+  const nearbyStats = apiContext.nearbyStats || {};
 
   const log = await ApiUsageLog.create({
     api_project_id: apiContext.project?.id || apiContext.apiProjectId || null,
@@ -193,6 +205,18 @@ const createUsageLog = async ({ req, res, startedAt = Date.now(), responseBody =
     lat_rounded: roundCoordinate(req.query?.lat),
     lng_rounded: roundCoordinate(req.query?.lng),
     radius: asIntOrNull(req.query?.radius),
+    cleanliness_min: asNumberOrNull(req.query?.cleanliness_min),
+    include_closed: asBoolean(req.query?.include_closed),
+    eligible_tenant_count: nearbyStats.eligible_tenant_count ?? null,
+    candidate_toilet_count: nearbyStats.candidate_toilet_count ?? null,
+    returned_count: nearbyStats.returned_count ?? Number(res.locals?.publicResponseCount || 0),
+    dropped_missing_coordinates_count: nearbyStats.dropped_missing_coordinates_count ?? null,
+    dropped_invalid_coordinates_count: nearbyStats.dropped_invalid_coordinates_count ?? null,
+    dropped_tenant_sharing_count: nearbyStats.dropped_tenant_sharing_count ?? null,
+    dropped_api_scope_count: nearbyStats.dropped_api_scope_count ?? null,
+    dropped_public_visibility_count: nearbyStats.dropped_public_visibility_count ?? null,
+    dropped_status_count: nearbyStats.dropped_status_count ?? null,
+    dropped_cleanliness_count: nearbyStats.dropped_cleanliness_count ?? null,
     response_count: Number(res.locals?.publicResponseCount || 0),
     status_code: statusCode,
     error_code: errorCode,

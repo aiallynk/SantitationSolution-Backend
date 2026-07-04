@@ -19,6 +19,7 @@ const {
   ToiletUnit,
   Geography,
 } = require('../../models');
+const storageUsageService = require('../superAdmin/storageUsage.service');
 const {
   EMPTY_SCOPE_UUID,
   buildAccessContextFromUser,
@@ -1069,6 +1070,10 @@ const getSla = async (req) => {
 };
 
 const getStorageUsage = async (req) => {
+  if (String(req.query.live || 'true').toLowerCase() !== 'false') {
+    return storageUsageService.getTenantStorageUsageForRequest(req);
+  }
+
   const rows = await StorageUsageMetric.findAll({
     where: scopedTenantWhere(req),
     order: [['measured_at', 'DESC']],

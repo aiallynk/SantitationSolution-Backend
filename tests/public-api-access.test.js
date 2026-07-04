@@ -320,6 +320,19 @@ test('valid key returns nearby toilets and public DTO does not expose private fi
   await withStubs(
     [
       [
+        models.Tenant,
+        'findAll',
+        async () => [
+          {
+            id: '22222222-2222-4222-8222-222222222222',
+            name: 'Nashik Zone A',
+            code: 'NZ-A',
+            status: 'active',
+            external_api_sharing_enabled: true,
+          },
+        ],
+      ],
+      [
         models.ToiletUnit,
         'findAll',
         async (options) => {
@@ -397,6 +410,125 @@ test('valid key returns nearby toilets and public DTO does not expose private fi
   );
 });
 
+test('nearby toilets resolves share-enabled tenants when tenant_id is omitted', async () => {
+  let tenantWhere = null;
+  let facilityWhere = null;
+  await withStubs(
+    [
+      [
+        models.Tenant,
+        'findAll',
+        async (options) => {
+          tenantWhere = options.where;
+          return [
+            {
+              id: '22222222-2222-4222-8222-222222222222',
+              name: 'Nashik Zone A',
+              status: 'active',
+              external_api_sharing_enabled: true,
+            },
+          ];
+        },
+      ],
+      [
+        models.ToiletUnit,
+        'findAll',
+        async (options) => {
+          facilityWhere = options.include[0].where;
+          return [
+            {
+              id: 'aakash-toilet-id',
+              code: 'A-1',
+              unit_type: 'male',
+              status: 'clean',
+              is_public_visible: true,
+              location_label: 'Aakash Petrol Pump',
+              latitude: '20.0389977',
+              longitude: '73.8048501',
+              updated_at: new Date(),
+              Facility: {
+                tenant_id: '22222222-2222-4222-8222-222222222222',
+                name: 'Aakash Petrol Pump',
+                address_line: 'Nashik',
+                status: 'active',
+                metadata: {},
+              },
+              ToiletBlock: { name: 'Block A', gender_type: 'male' },
+            },
+          ];
+        },
+      ],
+      [models.Inspection, 'findAll', async () => []],
+      [models.AiAnalysisResult, 'findAll', async () => []],
+      [models.SensorDevice, 'findAll', async () => []],
+      [models.Complaint, 'findAll', async () => []],
+    ],
+    async () => {
+      const result = await publicToiletService.getNearbyToilets({
+        query: {
+          lat: '20.0389977',
+          lng: '73.8048501',
+          radius: '10000',
+          cleanliness_min: '0',
+          include_closed: 'false',
+        },
+        publicApi: {
+          key: {
+            permissions: ['toilets:nearby:read'],
+            allowed_tenant_ids: [],
+          },
+          project: { allowed_tenant_ids: [] },
+        },
+      });
+
+      assert.equal(tenantWhere.status, 'active');
+      assert.equal(tenantWhere.external_api_sharing_enabled, true);
+      assert.deepEqual(facilityWhere.tenant_id[Op.in], ['22222222-2222-4222-8222-222222222222']);
+      assert.equal(result.items.length, 1);
+      assert.equal(result.meta.tenantScoped, false);
+      assert.equal(result.items[0].cleanliness_status, 'Status Unknown');
+    }
+  );
+});
+
+test('include_closed requires explicit API key permission', async () => {
+  await assert.rejects(
+    () =>
+      publicToiletService.getNearbyToilets({
+        query: {
+          lat: '20.0389977',
+          lng: '73.8048501',
+          include_closed: 'true',
+        },
+        publicApi: {
+          key: { permissions: ['toilets:nearby:read'] },
+          project: {},
+        },
+      }),
+    (error) => error.code === 'INCLUDE_CLOSED_FORBIDDEN' && error.statusCode === 403
+  );
+});
+
+test('toilet coordinate normalization supports columns geojson strings and invalid values', () => {
+  assert.deepEqual(
+    publicToiletService.normalizeToiletCoordinates({ latitude: 20.1, longitude: 73.9 }),
+    { lat: 20.1, lng: 73.9, source: 'lat_lng_columns', valid: true, reason: null }
+  );
+  assert.deepEqual(
+    publicToiletService.normalizeToiletCoordinates({ location: { type: 'Point', coordinates: [73.9, 20.1] } }),
+    { lat: 20.1, lng: 73.9, source: 'geojson', valid: true, reason: null }
+  );
+  assert.equal(
+    publicToiletService.normalizeToiletCoordinates({ latitude: 120, longitude: 20 }).reason,
+    'INVALID_COORDINATES'
+  );
+  assert.equal(publicToiletService.normalizeToiletCoordinates({}).reason, 'MISSING_COORDINATES');
+  assert.deepEqual(
+    publicToiletService.normalizeToiletCoordinates({ latitude: '20.1', longitude: '73.9' }),
+    { lat: 20.1, lng: 73.9, source: 'parsed_string', valid: true, reason: null }
+  );
+});
+
 test('tenant scope is enforced on nearby toilets endpoint', async () => {
   await assert.rejects(
     () =>
@@ -415,6 +547,183 @@ test('tenant scope is enforced on nearby toilets endpoint', async () => {
         },
       }),
     (error) => error.code === 'TENANT_SCOPE_FORBIDDEN' && error.statusCode === 403
+  );
+});
+
+test('debug nearby funnel reports exact public visibility drop-off', async () => {
+  await withStubs(
+    [
+      [
+        models.Tenant,
+        'findAll',
+        async () => [
+          {
+            id: '22222222-2222-4222-8222-222222222222',
+            name: 'Nashik Zone A',
+            status: 'active',
+            external_api_sharing_enabled: true,
+          },
+        ],
+      ],
+      [
+        models.ToiletUnit,
+        'findAll',
+        async () => [
+          {
+            id: 'hidden-toilet-id',
+            code: 'A-1',
+            unit_type: 'male',
+            status: 'clean',
+            is_public_visible: false,
+            location_label: 'Aakash Petrol Pump',
+            latitude: '20.0389977',
+            longitude: '73.8048501',
+            updated_at: new Date(),
+            Facility: {
+              tenant_id: '22222222-2222-4222-8222-222222222222',
+              name: 'Aakash Petrol Pump',
+              status: 'active',
+              Tenant: {
+                id: '22222222-2222-4222-8222-222222222222',
+                name: 'Nashik Zone A',
+                external_api_sharing_enabled: true,
+              },
+            },
+            ToiletBlock: { name: 'Block A', gender_type: 'male', status: 'active' },
+          },
+        ],
+      ],
+      [models.Inspection, 'findAll', async () => []],
+      [models.AiAnalysisResult, 'findAll', async () => []],
+      [models.SensorDevice, 'findAll', async () => []],
+      [models.Complaint, 'findAll', async () => []],
+    ],
+    async () => {
+      const result = await publicToiletService.getDebugNearbyToilets({
+        lat: '20.0389977',
+        lng: '73.8048501',
+        radius: '10000',
+        cleanlinessMin: '0',
+      });
+
+      assert.equal(result.funnel.withinRadius, 1);
+      assert.equal(result.funnel.afterPublicVisible, 0);
+      assert.equal(result.excludedSamples[0].reason, 'IS_PUBLIC_VISIBLE_FALSE');
+    }
+  );
+});
+
+test('debug nearby funnel does not recommend coordinate fixes for non-public toilets', async () => {
+  await withStubs(
+    [
+      [
+        models.Tenant,
+        'findAll',
+        async () => [
+          {
+            id: '22222222-2222-4222-8222-222222222222',
+            name: 'Nashik Zone A',
+            status: 'active',
+            external_api_sharing_enabled: true,
+          },
+          {
+            id: '33333333-3333-4333-8333-333333333333',
+            name: 'Nashik Zone B',
+            status: 'active',
+            external_api_sharing_enabled: false,
+          },
+        ],
+      ],
+      [
+        models.ToiletUnit,
+        'findAll',
+        async () => [
+          {
+            id: 'public-enabled-toilet-id',
+            code: 'A-1',
+            unit_type: 'male',
+            status: 'clean',
+            is_public_visible: true,
+            location_label: 'Public Toilet',
+            latitude: '20.0389977',
+            longitude: '73.8048501',
+            updated_at: new Date(),
+            Facility: {
+              tenant_id: '22222222-2222-4222-8222-222222222222',
+              name: 'Public Toilet',
+              status: 'active',
+              Tenant: {
+                id: '22222222-2222-4222-8222-222222222222',
+                name: 'Nashik Zone A',
+                external_api_sharing_enabled: true,
+              },
+            },
+            ToiletBlock: { name: 'Block A', gender_type: 'male', status: 'active' },
+          },
+          {
+            id: 'private-missing-coords-id',
+            code: 'A-2',
+            unit_type: 'male',
+            status: 'clean',
+            is_public_visible: false,
+            location_label: 'Private Toilet',
+            latitude: null,
+            longitude: null,
+            updated_at: new Date(),
+            Facility: {
+              tenant_id: '22222222-2222-4222-8222-222222222222',
+              name: 'Private Toilet',
+              status: 'active',
+              Tenant: {
+                id: '22222222-2222-4222-8222-222222222222',
+                name: 'Nashik Zone A',
+                external_api_sharing_enabled: true,
+              },
+            },
+            ToiletBlock: { name: 'Block B', gender_type: 'male', status: 'active' },
+          },
+          {
+            id: 'share-disabled-toilet-id',
+            code: 'B-1',
+            unit_type: 'male',
+            status: 'clean',
+            is_public_visible: true,
+            location_label: 'Shared Toilet',
+            latitude: '20.0389977',
+            longitude: '73.8048501',
+            updated_at: new Date(),
+            Facility: {
+              tenant_id: '33333333-3333-4333-8333-333333333333',
+              name: 'Shared Toilet',
+              status: 'active',
+              Tenant: {
+                id: '33333333-3333-4333-8333-333333333333',
+                name: 'Nashik Zone B',
+                external_api_sharing_enabled: false,
+              },
+            },
+            ToiletBlock: { name: 'Block C', gender_type: 'male', status: 'active' },
+          },
+        ],
+      ],
+      [models.Inspection, 'findAll', async () => []],
+      [models.AiAnalysisResult, 'findAll', async () => []],
+      [models.SensorDevice, 'findAll', async () => []],
+      [models.Complaint, 'findAll', async () => []],
+    ],
+    async () => {
+      const result = await publicToiletService.getDebugNearbyToilets({
+        lat: '20.0389977',
+        lng: '73.8048501',
+        radius: '10000',
+        cleanlinessMin: '0',
+      });
+
+      assert.equal(result.funnel.withinRadius, 2);
+      assert.equal(result.funnel.afterTenantSharing, 1);
+      assert.ok(result.recommendedFixes.includes('Enable external API sharing for tenants that should publish toilets.'));
+      assert.equal(result.recommendedFixes.includes('Fix missing or invalid toilet coordinates.'), false);
+    }
   );
 });
 

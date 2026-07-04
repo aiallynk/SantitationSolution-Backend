@@ -53,6 +53,8 @@ router.post('/tenants/:id/usage/recalculate', superAdminController.recalculateTe
 router.get('/regions', superAdminController.getRegions);
 router.get('/platform-metrics', superAdminController.getPlatformMetrics);
 router.get('/storage', validate(validateListQuery), superAdminController.getStorage);
+router.get('/storage/usage', superAdminController.getPlatformStorageUsage);
+router.get('/tenants/:id/storage/usage', superAdminController.getTenantStorageUsage);
 router.get('/api-usage', superAdminController.getApiUsage);
 router.get('/system-health', superAdminController.getSystemHealth);
 router.get('/audit-logs', validate(validateListQuery), superAdminController.getAuditLogs);
@@ -95,6 +97,7 @@ router.get('/tenant-health', validate(validateListQuery), superAdminController.g
 
 router.get('/api-access/overview', apiAccessController.getOverview);
 router.get('/api-access/tenants', apiAccessController.listTenantsForScope);
+router.get('/api-access/debug/nearby-toilets', apiAccessController.debugNearbyToilets);
 router.get('/api-access/analytics', apiAccessController.getAnalytics);
 router.get('/api-access/logs', apiAccessController.listLogs);
 router.get('/api-access/events', apiAccessController.listEvents);

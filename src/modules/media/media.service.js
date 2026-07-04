@@ -100,17 +100,22 @@ const uploadComplete = async (req) => {
 
   try {
     const uploaded = await uploadImage(req.file.path, targetFolder);
+    const now = new Date();
     await media.update({
       file_url: uploaded.fileUrl,
       storage_key: uploaded.storageKey,
       upload_status: 'confirmed',
       ai_status: isAutoAnalysisOnUploadEnabled() ? 'AI_QUEUED' : 'UPLOADED',
+      etag: uploaded.metadata?.eTag || uploaded.metadata?.etag || media.etag || null,
+      content_length: Number(uploaded.metadata?.bytes || uploaded.metadata?.contentLength || 0) || media.content_length || null,
+      storage_verified_at: now,
+      confirmed_at: now,
       metadata: {
         ...(media.metadata || {}),
         ...(uploaded.metadata || {}),
       },
-      uploaded_at: new Date(),
-      updated_at: new Date(),
+      uploaded_at: now,
+      updated_at: now,
     });
   } finally {
     await removeTempFile(req.file.path);

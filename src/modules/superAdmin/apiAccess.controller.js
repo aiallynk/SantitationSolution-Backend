@@ -25,4 +25,5 @@ module.exports = {
   listEvents: wrap(apiAccessService.listEvents, 'API key events fetched successfully'),
   getAnalytics: wrap(apiAccessService.getAnalytics, 'API usage analytics fetched successfully'),
   listTenantsForScope: wrap(apiAccessService.listTenantsForScope, 'API access tenant options fetched successfully'),
+  debugNearbyToilets: wrap(apiAccessService.debugNearbyToilets, 'Nearby public toilet debug funnel fetched successfully'),
 };
