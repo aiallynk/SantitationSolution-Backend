@@ -1,5 +1,8 @@
 const {
   Op,
+  col,
+  fn,
+  literal,
 } = require('sequelize');
 const {
   Inspection,
@@ -132,32 +135,69 @@ const getAlertReport = async (req) => {
 };
 
 const getFacilityPerformanceReport = async (req) => {
-  const facilities = await Facility.findAll({ where: scopedFacilityEntityWhere(req) });
   const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
-  const inspections = await Inspection.findAll({
-    where: excludeDeletedToiletsFromInspectionWhere(scopedWhere(req), deletedToiletIds),
-    include: [{ model: AiAnalysisResult }],
-  });
-  const complaints = await Complaint.findAll({
-    where: excludeDeletedToiletsFromInspectionWhere(scopedWhere(req), deletedToiletIds),
-  });
+  const scopedRecordWhere = excludeDeletedToiletsFromInspectionWhere(
+    scopedWhere(req),
+    deletedToiletIds,
+  );
+
+  // Aggregate in Postgres instead of loading every inspection, AI payload, and
+  // complaint into Node. AI rows can contain large JSON fields, so materializing
+  // the full association can exceed the database driver's read timeout.
+  const [facilities, inspectionAggregates, complaintAggregates] = await Promise.all([
+    Facility.findAll({
+      where: scopedFacilityEntityWhere(req),
+      attributes: ['id', 'code', 'name'],
+      raw: true,
+    }),
+    Inspection.findAll({
+      where: scopedRecordWhere,
+      attributes: [
+        'facility_id',
+        [fn('COUNT', literal('DISTINCT "Inspection"."id"')), 'inspectionCount'],
+        [fn('AVG', col('AiAnalysisResults.cleanliness_score')), 'cleanlinessAverage'],
+      ],
+      include: [
+        {
+          model: AiAnalysisResult,
+          attributes: [],
+          required: false,
+        },
+      ],
+      group: ['Inspection.facility_id'],
+      raw: true,
+    }),
+    Complaint.findAll({
+      where: scopedRecordWhere,
+      attributes: [
+        'facility_id',
+        [fn('COUNT', col('Complaint.id')), 'complaintCount'],
+      ],
+      group: ['Complaint.facility_id'],
+      raw: true,
+    }),
+  ]);
+
+  const inspectionsByFacility = new Map(
+    inspectionAggregates.map((row) => [String(row.facility_id), row]),
+  );
+  const complaintsByFacility = new Map(
+    complaintAggregates.map((row) => [String(row.facility_id), row]),
+  );
 
   return facilities.map((facility) => {
-    const inspectionRows = inspections.filter((item) => item.facility_id === facility.id);
-    const complaintRows = complaints.filter((item) => item.facility_id === facility.id);
-    const cleanlinessAvg =
-      inspectionRows.length === 0
-        ? 0
-        : inspectionRows.reduce((sum, item) => sum + Number(item.AiAnalysisResults?.[0]?.cleanliness_score || 0), 0) /
-          inspectionRows.length;
+    const inspectionSummary = inspectionsByFacility.get(String(facility.id));
+    const complaintSummary = complaintsByFacility.get(String(facility.id));
 
     return {
       facilityId: facility.id,
       facilityCode: facility.code,
       facilityName: facility.name,
-      inspections: inspectionRows.length,
-      complaints: complaintRows.length,
-      cleanlinessAverage: Number(cleanlinessAvg.toFixed(2)),
+      inspections: Number(inspectionSummary?.inspectionCount || 0),
+      complaints: Number(complaintSummary?.complaintCount || 0),
+      cleanlinessAverage: Number(
+        Number(inspectionSummary?.cleanlinessAverage || 0).toFixed(2),
+      ),
     };
   });
 };
