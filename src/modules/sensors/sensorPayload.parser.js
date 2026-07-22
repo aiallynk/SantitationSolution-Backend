@@ -2,10 +2,8 @@
  * Version-tolerant parser for BLE Sanitation Wand payloads.
  *
  * Confirmed firmware field sequence:
- *   - V2 (5 fields):  field_1 = overall toilet score, field_2 = MQ135 (air
- *     quality gas), field_3 = MQ137 (ammonia gas), field_4 = temperature,
- *     field_5 = humidity.
- *   - legacy V1 (2 fields): field_1 = score, field_2 = voltage (no env fields).
+ *   - V3 (3 fields): field_1 = PPM (TGS gas concentration sensor),
+ *     field_2 = temperature, field_3 = humidity.
  * Any other shape is stored generically as field_1..field_N with version
  * 'unknown'.
  *
@@ -58,11 +56,10 @@ const rawString = (payload) => {
  * @returns {{
  *   raw: string,
  *   fieldCount: number,
- *   version: 'v2'|'legacy_v1'|'unknown'|'empty',
+ *   version: 'v3'|'unknown'|'empty',
  *   fields: Record<string, number|null>,   // field_1..field_N (numeric where possible)
  *   parsed: {
- *     score: number|null, mq135: number|null, mq137: number|null,
- *     temperature: number|null, humidity: number|null
+ *     ppm: number|null, temperature: number|null, humidity: number|null
  *   }
  * }}
  */
@@ -81,9 +78,7 @@ const parseSensorPayload = (payload) => {
     version: 'unknown',
     fields,
     parsed: {
-      score: null,
-      mq135: null,
-      mq137: null,
+      ppm: null,
       temperature: null,
       humidity: null,
     },
@@ -94,19 +89,13 @@ const parseSensorPayload = (payload) => {
     return result;
   }
 
-  if (tokens.length >= 5) {
-    // V2: field_1 = score, field_2 = MQ135, field_3 = MQ137,
-    // field_4 = temperature, field_5 = humidity.
-    result.version = 'v2';
-    result.parsed.score = toFiniteNumber(tokens[0]);
-    result.parsed.mq135 = toFiniteNumber(tokens[1]);
-    result.parsed.mq137 = toFiniteNumber(tokens[2]);
-    result.parsed.temperature = toFiniteNumber(tokens[3]);
-    result.parsed.humidity = toFiniteNumber(tokens[4]);
-  } else if (tokens.length === 2) {
-    // legacy V1: "Score,Voltage" — no environmental fields.
-    result.version = 'legacy_v1';
-    result.parsed.score = toFiniteNumber(tokens[0]);
+  if (tokens.length >= 3) {
+    // V3: field_1 = PPM (TGS gas concentration), field_2 = temperature,
+    // field_3 = humidity.
+    result.version = 'v3';
+    result.parsed.ppm = toFiniteNumber(tokens[0]);
+    result.parsed.temperature = toFiniteNumber(tokens[1]);
+    result.parsed.humidity = toFiniteNumber(tokens[2]);
   }
 
   return result;

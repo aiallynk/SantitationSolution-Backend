@@ -5,7 +5,7 @@
  * metric plus a list of typed alert candidates. Thresholds come from
  * `runtimeConfig.alerts.sensor` (env-configurable); callers may pass overrides
  * (e.g. future per-tenant settings). A `null` bound disables that check, so an
- * uncalibrated metric (e.g. MQ gas channels) never produces misleading alerts.
+ * uncalibrated metric (e.g. the PPM gas channel) never produces misleading alerts.
  */
 
 const { runtimeConfig } = require('../../config/runtime');
@@ -119,20 +119,13 @@ const evaluateSensorMetrics = (metrics = {}, overrides = {}) => {
     low: { warning: t.humidity.lowWarningPct, critical: t.humidity.lowCriticalPct, type: 'LOW_HUMIDITY' },
   });
 
-  // Gas channels — raw analog; disabled unless operator-calibrated thresholds set.
+  // Gas concentration (TGS sensor) — disabled unless operator-calibrated thresholds set.
   evaluate({
-    key: 'mq135',
-    value: metrics.mq135,
-    unit: '',
-    label: 'Air quality (MQ135)',
-    high: { warning: t.mq135.warning, critical: t.mq135.critical, type: 'AIR_QUALITY_ALERT' },
-  });
-  evaluate({
-    key: 'mq137',
-    value: metrics.mq137,
-    unit: '',
-    label: 'Ammonia (MQ137)',
-    high: { warning: t.mq137.warning, critical: t.mq137.critical, type: 'MQ_ALERT' },
+    key: 'ppm',
+    value: metrics.ppm,
+    unit: 'ppm',
+    label: 'Gas Concentration (PPM)',
+    high: { warning: t.ppm.warning, critical: t.ppm.critical, type: 'AIR_QUALITY_ALERT' },
   });
 
   // Battery — only when the device reports it.

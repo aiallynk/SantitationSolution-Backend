@@ -243,13 +243,10 @@ const normalizeSensorSnapshot = (snapshot) => {
   const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
   return {
     ...snapshot,
-    // Field 1 is firmware-provided sensor channel (legacy "sensor toilet score"), NOT final cleanliness score.
-    field1: toNumberOrNull(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore),
-    field2: toNumberOrNull(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135),
-    field3: toNumberOrNull(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137),
+    // Field 1 is firmware-provided gas concentration (PPM, TGS sensor).
+    ppm: toNumberOrNull(snapshot.ppm ?? snapshot.field1 ?? snapshot.field_1),
     temperature: toNumberOrNull(snapshot.temperature),
     humidity: toNumberOrNull(snapshot.humidity),
-    sensorToiletScore: toNumberOrNull(snapshot.sensorToiletScore ?? snapshot.score ?? snapshot.field1 ?? snapshot.field_1),
     readingTime: readingTime || null,
   };
 };

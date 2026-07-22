@@ -72,6 +72,16 @@ router.patch(
   platformController.patchOwnTenantProfile
 );
 router.get(
+  '/tenants/me/ai-scoring-mode',
+  requireSurface(...OPS_WEB_SURFACES), requireRouteKey(RouteKeys.OPS_SETTINGS), requireScope(COMMON_SCOPE_RULE),
+  requireAnyPermissions('dashboard.read', 'users.manage'), platformController.getOwnTenantAiScoringMode
+);
+router.patch(
+  '/tenants/me/ai-scoring-mode',
+  requireSurface(...OPS_WEB_SURFACES), requireRouteKey(RouteKeys.OPS_SETTINGS), requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('users.manage'), platformController.patchOwnTenantAiScoringMode
+);
+router.get(
   '/tenants',
   requireSurface(...OPS_WEB_SURFACES),
   requireRouteKey(RouteKeys.OPS_ADMINOPS),

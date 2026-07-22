@@ -7,11 +7,9 @@ const SCORE_BANDS = Object.freeze({
     label: 'excellent',
     minScore: 85,
     maxScore: 100,
-    sensorScore: [8.5, 10.0],
     temperature: [24.0, 30.0],
     humidity: [38.0, 58.0],
-    mq135: [0.02, 0.25],
-    mq137: [0.05, 0.65],
+    ppm: [2, 25],
     batteryLevel: [72, 100],
     rssi: [-65, -45],
   },
@@ -19,11 +17,9 @@ const SCORE_BANDS = Object.freeze({
     label: 'good',
     minScore: 70,
     maxScore: 84,
-    sensorScore: [7.0, 8.4],
     temperature: [25.0, 31.5],
     humidity: [45.0, 65.0],
-    mq135: [0.15, 0.55],
-    mq137: [0.35, 1.10],
+    ppm: [15, 55],
     batteryLevel: [60, 100],
     rssi: [-72, -50],
   },
@@ -31,11 +27,9 @@ const SCORE_BANDS = Object.freeze({
     label: 'average',
     minScore: 50,
     maxScore: 69,
-    sensorScore: [5.0, 6.9],
     temperature: [26.0, 33.0],
     humidity: [55.0, 75.0],
-    mq135: [0.45, 1.15],
-    mq137: [0.90, 2.00],
+    ppm: [45, 115],
     batteryLevel: [45, 95],
     rssi: [-82, -55],
   },
@@ -43,11 +37,9 @@ const SCORE_BANDS = Object.freeze({
     label: 'poor',
     minScore: 30,
     maxScore: 49,
-    sensorScore: [3.0, 4.9],
     temperature: [27.0, 36.0],
     humidity: [68.0, 86.0],
-    mq135: [1.00, 2.30],
-    mq137: [1.80, 3.70],
+    ppm: [100, 230],
     batteryLevel: [35, 90],
     rssi: [-88, -60],
   },
@@ -55,22 +47,18 @@ const SCORE_BANDS = Object.freeze({
     label: 'critical',
     minScore: 0,
     maxScore: 29,
-    sensorScore: [0.0, 2.9],
     temperature: [28.0, 38.5],
     humidity: [78.0, 92.0],
-    mq135: [2.00, 4.50],
-    mq137: [3.20, 6.50],
+    ppm: [200, 450],
     batteryLevel: [25, 85],
     rssi: [-92, -65],
   },
 });
 
 const HARD_BOUNDS = Object.freeze({
-  sensorScore: [0.0, 10.0],
   temperature: [18.0, 42.0],
   humidity: [20.0, 95.0],
-  mq135: [0.0, 5.0],
-  mq137: [0.0, 8.0],
+  ppm: [0.0, 500.0],
   batteryLevel: [10, 100],
   rssi: [-95, -35],
 });
@@ -199,15 +187,8 @@ const generateSyntheticSensorSnapshot = ({
   const toiletBaseline = signedRandom(seed, `toilet-baseline:${toiletUnitId || 'none'}`);
   const humidBaseline = toiletBaseline * 2.2 + monthHumidityOffset(readingDate);
   const tempBaseline = signedRandom(seed, 'temp-baseline') * 0.5 + hourTemperatureOffset(readingDate);
-  const mqBaseline = toiletBaseline * 0.06;
+  const ppmBaseline = toiletBaseline * 6;
 
-  const sensorScore = roundTo(
-    clamp(
-      biasedSample({ seed, label: 'sensor-score', range: band.sensorScore, bias: position, jitterWeight: 0.25 }),
-      ...HARD_BOUNDS.sensorScore
-    ),
-    1
-  );
   const temperature = roundTo(
     clamp(
       biasedSample({ seed, label: 'temperature', range: band.temperature, bias: 1 - position * 0.35 }) + tempBaseline,
@@ -224,21 +205,13 @@ const generateSyntheticSensorSnapshot = ({
     ),
     1
   );
-  const mq135 = roundTo(
+  const ppm = roundTo(
     clamp(
-      biasedSample({ seed, label: 'mq135', range: band.mq135, bias: 1 - position, jitterWeight: 0.3 }) + mqBaseline,
-      Math.max(HARD_BOUNDS.mq135[0], band.mq135[0]),
-      Math.min(HARD_BOUNDS.mq135[1], band.mq135[1])
+      biasedSample({ seed, label: 'ppm', range: band.ppm, bias: 1 - position, jitterWeight: 0.3 }) + ppmBaseline,
+      Math.max(HARD_BOUNDS.ppm[0], band.ppm[0]),
+      Math.min(HARD_BOUNDS.ppm[1], band.ppm[1])
     ),
-    2
-  );
-  const mq137 = roundTo(
-    clamp(
-      biasedSample({ seed, label: 'mq137', range: band.mq137, bias: 1 - position, jitterWeight: 0.3 }) + mqBaseline,
-      Math.max(HARD_BOUNDS.mq137[0], band.mq137[0]),
-      Math.min(HARD_BOUNDS.mq137[1], band.mq137[1])
-    ),
-    2
+    1
   );
   const batteryLevel = Math.round(
     clamp(
@@ -254,9 +227,7 @@ const generateSyntheticSensorSnapshot = ({
   );
 
   const rawPayload = [
-    sensorScore.toFixed(1),
-    mq135.toFixed(2),
-    mq137.toFixed(2),
+    ppm.toFixed(1),
     temperature.toFixed(1),
     humidity.toFixed(1),
   ].join(',');
@@ -265,25 +236,18 @@ const generateSyntheticSensorSnapshot = ({
     sensorDeviceId: null,
     deviceName: 'Synthetic Historical Sensor',
     rawPayload,
-    score: sensorScore,
-    field1: sensorScore,
-    field2: mq135,
-    field3: mq137,
-    sensorToiletScore: sensorScore,
-    mq135,
-    mq137,
+    ppm,
+    field1: ppm,
     temperature,
     humidity,
     fields: {
-      field_1: sensorScore,
-      field_2: mq135,
-      field_3: mq137,
-      field_4: temperature,
-      field_5: humidity,
+      field_1: ppm,
+      field_2: temperature,
+      field_3: humidity,
     },
     rssi,
     batteryLevel,
-    schemaVersion: 'synthetic_wand_v2',
+    schemaVersion: 'synthetic_wand_v3',
     clientReadingId: `synthetic-backfill:${batchId}:${inspectionId}`,
     sensorReadingId: null,
     readingTime,

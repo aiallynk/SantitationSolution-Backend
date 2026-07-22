@@ -9,6 +9,7 @@ const {
   InspectionEvent,
   Alert,
   Facility,
+  Tenant,
 } = require('../../models');
 const { eventBus, EVENTS } = require('../../core/live/eventBus');
 const { createAuditLog } = require('../audit/audit.service');
@@ -36,6 +37,11 @@ const {
   applySingleImagePostProcessing,
   buildSupervisorReviewFlags,
 } = require('./sanitationPostProcessing.helper');
+const {
+  AI_SCORING_POLICY_VERSION,
+  resolveAiScoringMode,
+  scoreInspectionFindings,
+} = require('./aiInspectionScoring.service');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -56,6 +62,10 @@ const toSensorNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+// Gas concentration (ppm) above which the TGS sensor reading counts as a risk
+// signal for the sensor-impact penalty. Mirrors the operator-calibrated
+// SENSOR_PPM_WARNING bound used by the live threshold/alert engine.
+const PPM_RISK_THRESHOLD = runtimeConfig.alerts.sensor.ppm.warning ?? 400;
 const parseSensorContext = (snapshot = null) => {
   if (!snapshot || typeof snapshot !== 'object') return null;
   const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
@@ -66,9 +76,7 @@ const parseSensorContext = (snapshot = null) => {
   const context = {
     temperature: toSensorNumber(snapshot.temperature),
     humidity: toSensorNumber(snapshot.humidity),
-    field1: toSensorNumber(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore),
-    field2: toSensorNumber(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135),
-    field3: toSensorNumber(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137),
+    ppm: toSensorNumber(snapshot.ppm ?? snapshot.field1 ?? snapshot.field_1),
     battery: toSensorNumber(snapshot.battery ?? snapshot.batteryLevel),
     rssi: toSensorNumber(snapshot.rssi ?? snapshot.signalStrength),
     readingAgeMinutes,
@@ -107,13 +115,9 @@ const computeSensorImpact = (context = null) => {
     impact -= 3;
     reasons.push('high_temperature');
   }
-  if (context.field2 !== null && context.field2 > 0) {
+  if (context.ppm !== null && context.ppm > PPM_RISK_THRESHOLD) {
     impact -= 2;
-    reasons.push('field2_risk_signal');
-  }
-  if (context.field3 !== null && context.field3 > 0) {
-    impact -= 2;
-    reasons.push('field3_risk_signal');
+    reasons.push('ppm_risk_signal');
   }
   const sensorImpact = clamp(Math.round(impact), -25, 0);
   const environmentalScore = clamp(100 + sensorImpact, 0, 100);
@@ -1140,6 +1144,9 @@ const runInspectionAnalysis = async ({
   if (!inspection) {
     return null;
   }
+  // A missing/legacy tenant configuration must never block the inspection worker.
+  const scoringTenant = await Tenant.findByPk(inspection.tenant_id, { attributes: ['id', 'ai_scoring_mode', 'metadata'] }).catch(() => null);
+  const tenantAiScoringMode = resolveAiScoringMode(scoringTenant?.metadata?.aiScoringMode || scoringTenant?.ai_scoring_mode);
 
   const processingJob = queueJobId
     ? await AiProcessingJob.findOne({
@@ -1314,6 +1321,26 @@ const runInspectionAnalysis = async ({
             perceptualHash,
             processingMs: Date.now() - mediaStartedAt,
           });
+          const cachedPolicy = scoreInspectionFindings({
+            mode: tenantAiScoringMode,
+            baseScore: cachedResult.strictJson?.baseScore ?? cachedResult.result?.overallCleanlinessScore,
+            strictJson: cachedResult.strictJson,
+            fallbackIssues: cachedResult.result?.issueTags,
+          });
+          cachedResult.strictJson = {
+            ...cachedResult.strictJson,
+            overall_cleanliness_score: cachedPolicy.finalScore,
+            score_0_100: cachedPolicy.finalScore,
+            findings: cachedPolicy.findings,
+            ai_scoring: cachedPolicy,
+          };
+          cachedResult.result.overallCleanlinessScore = cachedPolicy.finalScore;
+          cachedResult.result.rawResult = { ...cachedResult.result.rawResult, strictJson: cachedResult.strictJson };
+          await mediaRow.update({
+            overall_score: cachedPolicy.finalScore,
+            metadata: { ...(mediaRow.metadata || {}), ai_scoring: cachedPolicy },
+            updated_at: new Date(),
+          });
           imageResults.push(cachedResult);
           continue;
         }
@@ -1407,7 +1434,14 @@ const runInspectionAnalysis = async ({
         image_quality_status: quality,
       });
       const visualScore = Number(singleImagePost.score_0_100 || 0);
-      const overallScore = clamp(visualScore + appliedSensorImpact, 0, 100);
+      let overallScore = clamp(visualScore + appliedSensorImpact, 0, 100);
+      const appliedScoringPolicy = scoreInspectionFindings({
+        mode: tenantAiScoringMode,
+        baseScore: overallScore,
+        strictJson: { ...strictJson, ...singleImagePost, detected_issues: issues },
+        fallbackIssues: issues,
+      });
+      overallScore = appliedScoringPolicy.finalScore;
       const finalConfidence = Number(singleImagePost.confidence || confidence || 0);
       const floorScore =
         strictJson && strictJson.floor_cleanliness !== undefined
@@ -1505,6 +1539,8 @@ const runInspectionAnalysis = async ({
         detected_issues: issues,
         severity_level: severity,
         human_review_required: reviewRequired,
+        findings: appliedScoringPolicy.findings,
+        ai_scoring: appliedScoringPolicy,
         explanation_summary:
           singleImagePost.score_reason ||
           strictJson?.explanation_summary ||
@@ -1517,9 +1553,12 @@ const runInspectionAnalysis = async ({
           : {};
       const scoringMetadata = {
         ...singleImagePost,
+        ...appliedScoringPolicy,
         applied_at: new Date().toISOString(),
         prompt_version: result.promptVersion || PROMPT_VERSION,
         scoring_version: result.scoringVersion || SCORING_VERSION,
+        tenant_scoring_policy_version: AI_SCORING_POLICY_VERSION,
+        tenant_scoring_mode: appliedScoringPolicy.mode,
         supervisor_flags: supervisorFlags,
       };
       const metadata = {
@@ -1599,6 +1638,8 @@ const runInspectionAnalysis = async ({
           captureStage: mediaRow.capture_stage,
           rawScore: round2(calibratedOverallScore),
           finalScore: round2(overallScore),
+          scoringMode: appliedScoringPolicy.mode,
+          policyVersion: appliedScoringPolicy.policyVersion,
           stars: singleImagePost.star_rating_0_5,
           hygieneRisk: singleImagePost.hygiene_risk,
           capsApplied: singleImagePost.caps_applied,
@@ -2173,6 +2214,20 @@ const runInspectionAnalysis = async ({
     aggregate,
   });
   result.processingMs = processingMs;
+  const policyRows = imageResults.map((item) => item?.strictJson?.ai_scoring).filter(Boolean);
+  const severitySummary = policyRows.reduce((summary, row) => {
+    for (const key of ['minor', 'moderate', 'major', 'critical']) summary[key] += Number(row?.severityCounts?.[key] || 0);
+    return summary;
+  }, { minor: 0, moderate: 0, major: 0, critical: 0 });
+  result.aiScoring = {
+    mode: tenantAiScoringMode,
+    policyVersion: AI_SCORING_POLICY_VERSION,
+    baseScore: round2(mean(policyRows.map((row) => row.baseScore)) ?? result.overallCleanlinessScore),
+    finalScore: result.overallCleanlinessScore,
+    severitySummary,
+    capsApplied: policyRows.flatMap((row) => row.capsApplied || []),
+  };
+  result.rawResult = { ...result.rawResult, aiScoring: result.aiScoring };
 
   const analysis = await AiAnalysisResult.create({
     inspection_id: inspection.id,
@@ -2195,6 +2250,11 @@ const runInspectionAnalysis = async ({
     processing_ms: processingMs,
     anomaly_flags: result.anomalyFlags,
     raw_result: result.rawResult,
+    ai_scoring_mode_applied: result.aiScoring.mode,
+    ai_scoring_policy_version: result.aiScoring.policyVersion,
+    ai_base_score: result.aiScoring.baseScore,
+    ai_final_score: result.aiScoring.finalScore,
+    ai_severity_summary: result.aiScoring.severitySummary,
     processed_at: processedAt,
   });
 
@@ -2205,6 +2265,8 @@ const runInspectionAnalysis = async ({
     overall_status: result.overallStatus,
     review_required: Boolean(refreshedInspection?.review_required || result.reviewRequired),
     last_processing_error: imageFailures.length > 0 ? failureMessage : null,
+    ai_scoring_mode_applied: result.aiScoring.mode,
+    ai_scoring_policy_version: result.aiScoring.policyVersion,
     updated_at: processedAt,
   });
 

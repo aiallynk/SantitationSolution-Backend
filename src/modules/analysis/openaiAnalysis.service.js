@@ -86,6 +86,15 @@ Return this production schema first:
     "usability": 0
   },
   "detectedIssues": [],
+  "findings": [{
+    "area": "toilet_bowl | floor | wall | fixture | general",
+    "category": "cleanliness | hygiene | maintenance | safety | usability",
+    "issue": "short factual issue",
+    "severity": "minor | moderate | major | critical",
+    "confidence": 0.0,
+    "safetyCritical": false,
+    "evidence": "short visible evidence"
+  }],
   "positiveFindings": [],
   "capApplied": false,
   "capReason": "",
@@ -93,6 +102,7 @@ Return this production schema first:
 }
 
 Dimension numbers are 0-100 cleanliness/safety scores where 100 is best. For wetness, stains, trash, and visibleWaste, 100 means dry, unstained, no trash, and no visible waste.
+Findings must be factual and evidence-based. Report critical hygiene and safety risks regardless of any tenant scoring preference; do not duplicate the same defect from one image.
 
 For internal compatibility also include this strict schema when possible:
 {
@@ -130,10 +140,10 @@ For backward compatibility also include legacy fields when possible:
 - explanation_summary
 
 Sensor-context addendum:
-- You may receive optional "Sensor context" metadata (temperature, humidity, generic fields, sensor status, reading age minutes).
+- You may receive optional "Sensor context" metadata (temperature, humidity, gas concentration in ppm, sensor status, reading age minutes).
 - Visual evidence remains PRIMARY. Sensor values are SECONDARY supporting evidence.
 - Never replace visual score with sensor score.
-- If sensor context indicates abnormal environment (very high humidity, abnormal gas channels, stale/offline reading), reduce confidence and apply a moderate score penalty.
+- If sensor context indicates abnormal environment (very high humidity, elevated gas concentration (ppm), stale/offline reading), reduce confidence and apply a moderate score penalty.
 - If image and sensor context disagree, explicitly mention this disagreement in reasoning.
 - Return "sensorImpact" as an integer in range [-25, 0] indicating score reduction from sensor context (0 if no impact).
 - Return "environmentalScore" in range [0,100] when sensor context is present, otherwise null.
@@ -523,6 +533,21 @@ const normalizeStrictSanitationPayload = (raw) => {
   const issues = normalizeArray(
     readFirst(raw, ['detected_issues', 'detectedIssues', 'issues', 'issue_tags']) || []
   );
+  const findings = Array.isArray(raw.findings)
+    ? raw.findings
+        .filter((finding) => finding && typeof finding === 'object')
+        .slice(0, 20)
+        .map((finding) => ({
+          area: String(finding.area || 'general').trim().slice(0, 80),
+          category: String(finding.category || 'cleanliness').trim().slice(0, 80),
+          issue: String(finding.issue || finding.evidence || '').trim().slice(0, 300),
+          severity: String(finding.severity || 'moderate').trim().toLowerCase(),
+          confidence: toConfidence(finding.confidence, null),
+          safetyCritical: Boolean(finding.safetyCritical || finding.safety_critical),
+          evidence: String(finding.evidence || '').trim().slice(0, 500),
+        }))
+        .filter((finding) => finding.issue)
+    : [];
   const criticalFindings = normalizeStrictCriticalFindings(
     readFirst(raw, ['critical_findings', 'criticalFindings']),
     issues
@@ -618,6 +643,7 @@ const normalizeStrictSanitationPayload = (raw) => {
     hygiene_risk: hygieneRisk,
     critical_findings: criticalFindings,
     detected_issues: issues,
+    findings,
     positive_observations: positiveObservations,
     score_reason: scoreReason || null,
     confidence: confidenceScore,
@@ -952,20 +978,16 @@ const buildSensorContext = (snapshot = null) => {
     : null;
   const temperature = toNumberOrNull(snapshot.temperature);
   const humidity = toNumberOrNull(snapshot.humidity);
-  const field1 = toNumberOrNull(snapshot.field1 ?? snapshot.field_1 ?? snapshot.score ?? snapshot.sensorToiletScore);
-  const field2 = toNumberOrNull(snapshot.field2 ?? snapshot.field_2 ?? snapshot.mq135);
-  const field3 = toNumberOrNull(snapshot.field3 ?? snapshot.field_3 ?? snapshot.mq137);
+  const ppm = toNumberOrNull(snapshot.ppm ?? snapshot.field1 ?? snapshot.field_1);
   const battery = toNumberOrNull(snapshot.battery ?? snapshot.batteryLevel);
   const rssi = toNumberOrNull(snapshot.rssi ?? snapshot.signalStrength);
-  const hasData = [temperature, humidity, field1, field2, field3, battery, rssi].some((v) => v !== null);
+  const hasData = [temperature, humidity, ppm, battery, rssi].some((v) => v !== null);
   if (!hasData) return null;
   return {
     version: SENSOR_CONTEXT_VERSION,
     temperature,
     humidity,
-    field1,
-    field2,
-    field3,
+    ppm,
     battery,
     rssi,
     sensorStatus: String(snapshot.sensorStatus || 'ONLINE').toUpperCase(),

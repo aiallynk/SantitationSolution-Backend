@@ -67,10 +67,7 @@ const makeReading = (overrides = {}) => ({
   device_id: DEVICE_UUID,
   client_reading_id: 'client-1',
   timestamp: new Date('2026-06-11T10:00:00.000Z'),
-  odor_ppm: null,
-  ammonia_ppm: null,
-  h2s_ppm: null,
-  methane_ppm: null,
+  ppm: 10,
   humidity: 59.4,
   temperature: 32.4,
   occupancy_count: null,
@@ -78,7 +75,7 @@ const makeReading = (overrides = {}) => ({
   tank_fill_level: null,
   battery_level: null,
   signal_strength: -62,
-  raw_payload: { raw: '10,0.00,1.28,32.4,59.4' },
+  raw_payload: { raw: '10.0,32.4,59.4' },
   ...overrides,
 });
 
@@ -107,7 +104,7 @@ test('ingestion stores parsed BLE reading for the backend-attached toilet', asyn
       deviceId: 'Wand_1234',
       toiletUnitId: TOILET_A,
       clientReadingId: 'client-1',
-      rawPayload: '10,0.00,1.28,32.4,59.4',
+      rawPayload: '10.0,32.4,59.4',
       rssi: -62,
       source: 'mobile_ble',
     })
@@ -117,7 +114,7 @@ test('ingestion stores parsed BLE reading for the backend-attached toilet', asyn
   assert.equal(Number(result.reading.temperature), 32.4);
   assert.equal(Number(result.reading.humidity), 59.4);
   assert.equal(Number(result.reading.signalStrength), -62);
-  assert.equal(result.reading.rawPayload.raw, '10,0.00,1.28,32.4,59.4');
+  assert.equal(result.reading.rawPayload.raw, '10.0,32.4,59.4');
   assert.equal(result.reading.rawPayload.fields.field_1, 10);
 });
 
@@ -129,7 +126,7 @@ test('ingestion is idempotent by device and clientReadingId', async () => {
       deviceId: 'Wand_1234',
       toiletUnitId: TOILET_A,
       clientReadingId: 'client-1',
-      rawPayload: '10,0.00,1.28,32.4,59.4',
+      rawPayload: '10.0,32.4,59.4',
     })
   );
 
@@ -146,7 +143,7 @@ test('ingestion rejects a claimed toilet that differs from backend mapping', asy
         deviceId: 'Wand_1234',
         toiletUnitId: TOILET_B,
         clientReadingId: 'client-2',
-        rawPayload: '10,0.00,1.28,32.4,59.4',
+        rawPayload: '10.0,32.4,59.4',
       })
     ),
     (error) => error.statusCode === 409 && error.code === 'SENSOR_TOILET_MISMATCH'
@@ -162,7 +159,7 @@ test('ingestion rejects a claimed toilet when the device is not attached', async
         deviceId: 'Wand_1234',
         toiletUnitId: TOILET_A,
         clientReadingId: 'client-3',
-        rawPayload: '10,0.00,1.28,32.4,59.4',
+        rawPayload: '10.0,32.4,59.4',
       })
     ),
     (error) => error.statusCode === 409 && error.code === 'SENSOR_TOILET_MISMATCH'
@@ -177,7 +174,7 @@ test('ingestion blocks cross-tenant sensor access', async () => {
       reqFor({
         deviceId: 'Wand_1234',
         clientReadingId: 'client-4',
-        rawPayload: '10,0.00,1.28,32.4,59.4',
+        rawPayload: '10.0,32.4,59.4',
       })
     ),
     (error) => error.statusCode === 403 && error.code === 'SCOPE_FORBIDDEN'
@@ -193,7 +190,7 @@ test('ingestion blocks facility-scoped supervisors outside their scope', async (
         {
           deviceId: 'Wand_1234',
           clientReadingId: 'client-5',
-          rawPayload: '10,0.00,1.28,32.4,59.4',
+          rawPayload: '10.0,32.4,59.4',
         },
         {
           scopeLevel: 'facility',
@@ -213,7 +210,7 @@ test('ingestion allows field workers in the same tenant outside facility scope',
       {
         deviceId: 'Wand_1234',
         clientReadingId: 'client-6',
-        rawPayload: '10,0.00,1.28,32.4,59.4',
+        rawPayload: '10.0,32.4,59.4',
       },
       {
         scopeLevel: 'facility',
@@ -237,7 +234,7 @@ test('ingestion allows unattached devices for tenant field workers', async () =>
       {
         deviceId: 'Wand_1234',
         clientReadingId: 'client-7',
-        rawPayload: '10,0.00,1.28,32.4,59.4',
+        rawPayload: '10.0,32.4,59.4',
       },
       {
         scopeLevel: 'facility',

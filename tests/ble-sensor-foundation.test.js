@@ -10,55 +10,35 @@ const { ROLE_PERMISSION_BUNDLES } = require('../src/core/rbac/defaultRoleBundles
 
 /* --------------------------- payload parser ------------------------------- */
 
-test('parser maps V2 5-field payload (field_4=temp, field_5=humidity)', () => {
-  const result = parseSensorPayload('10,0.00,1.28,32.4,59.4');
-  assert.equal(result.version, 'v2');
-  assert.equal(result.fieldCount, 5);
+test('parser maps V3 3-field payload (field_1=ppm, field_2=temp, field_3=humidity)', () => {
+  const result = parseSensorPayload('10.0,32.4,59.4');
+  assert.equal(result.version, 'v3');
+  assert.equal(result.fieldCount, 3);
+  assert.equal(result.parsed.ppm, 10.0);
   assert.equal(result.parsed.temperature, 32.4);
   assert.equal(result.parsed.humidity, 59.4);
-  // field_1..3 stay generic
   assert.deepEqual(result.fields, {
     field_1: 10,
-    field_2: 0,
-    field_3: 1.28,
-    field_4: 32.4,
-    field_5: 59.4,
+    field_2: 32.4,
+    field_3: 59.4,
   });
 });
 
-test('parser names V2 fields (score, MQ135, MQ137, temp, humidity)', () => {
-  const result = parseSensorPayload('10,0.09,1.29,31.6,58.0');
-  assert.equal(result.version, 'v2');
-  assert.equal(result.parsed.score, 10);
-  assert.equal(result.parsed.mq135, 0.09);
-  assert.equal(result.parsed.mq137, 1.29);
-  assert.equal(result.parsed.temperature, 31.6);
-  assert.equal(result.parsed.humidity, 58.0);
-});
-
 test('parser always preserves the verbatim raw payload', () => {
-  const raw = '10,0.00,1.28,32.4,59.4';
+  const raw = '10.0,32.4,59.4';
   assert.equal(parseSensorPayload(raw).raw, raw);
 });
 
-test('parser tolerates legacy V1 2-field payload (Score,Voltage)', () => {
-  const result = parseSensorPayload('8,0.13');
-  assert.equal(result.version, 'legacy_v1');
-  assert.equal(result.fieldCount, 2);
-  assert.equal(result.parsed.temperature, null);
-  assert.equal(result.parsed.humidity, null);
-  assert.equal(result.fields.field_1, 8);
-  assert.equal(result.fields.field_2, 0.13);
-});
-
 test('parser accepts array input and unknown shapes without throwing', () => {
-  const arr = parseSensorPayload([1, 2, 3, 21.5, 40]);
-  assert.equal(arr.version, 'v2');
+  const arr = parseSensorPayload([10, 21.5, 40]);
+  assert.equal(arr.version, 'v3');
+  assert.equal(arr.parsed.ppm, 10);
   assert.equal(arr.parsed.temperature, 21.5);
+  assert.equal(arr.parsed.humidity, 40);
 
-  const unknown = parseSensorPayload('x,y,z');
+  const unknown = parseSensorPayload('x,y');
   assert.equal(unknown.version, 'unknown');
-  assert.deepEqual(unknown.fields, { field_1: null, field_2: null, field_3: null });
+  assert.deepEqual(unknown.fields, { field_1: null, field_2: null });
 
   const empty = parseSensorPayload('');
   assert.equal(empty.version, 'empty');
@@ -66,8 +46,8 @@ test('parser accepts array input and unknown shapes without throwing', () => {
 });
 
 test('parser extracts raw string from object envelopes', () => {
-  const result = parseSensorPayload({ raw: '10,0.00,1.28,32.4,59.4' });
-  assert.equal(result.raw, '10,0.00,1.28,32.4,59.4');
+  const result = parseSensorPayload({ raw: '10.0,32.4,59.4' });
+  assert.equal(result.raw, '10.0,32.4,59.4');
   assert.equal(result.parsed.humidity, 59.4);
 });
 

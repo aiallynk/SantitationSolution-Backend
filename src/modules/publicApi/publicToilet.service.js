@@ -115,14 +115,10 @@ const getLatestBy = (rows, foreignKey, dateField) => {
 const extractSensorScore = (reading) => {
   if (!reading) return null;
   const payload = getMetadata({ metadata: reading.raw_payload });
-  const odor = toNumberOrNull(reading.odor_ppm) ?? toNumberOrNull(payload.odor_ppm) ?? toNumberOrNull(payload.odor);
-  const ammonia = toNumberOrNull(reading.ammonia_ppm) ?? toNumberOrNull(payload.ammonia_ppm);
-  const h2s = toNumberOrNull(reading.h2s_ppm) ?? toNumberOrNull(payload.h2s_ppm);
+  const ppm = toNumberOrNull(reading.ppm) ?? toNumberOrNull(payload.ppm);
   const humidity = toNumberOrNull(reading.humidity) ?? toNumberOrNull(payload.humidity);
   let score = 100;
-  if (odor !== null) score -= Math.min(25, odor * 2);
-  if (ammonia !== null) score -= Math.min(20, ammonia * 4);
-  if (h2s !== null) score -= Math.min(20, h2s * 6);
+  if (ppm !== null) score -= Math.min(40, ppm * 2);
   if (humidity !== null && humidity > 85) score -= Math.min(15, (humidity - 85) * 1.5);
   return clampScore(score);
 };

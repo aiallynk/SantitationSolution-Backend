@@ -26,6 +26,7 @@ module.exports = {
   getAuditLogs: wrap(superAdminService.getAuditLogs, 'Super admin audit logs fetched successfully'),
   postTenantProvision: wrap(superAdminService.postTenantProvision, 'Tenant provisioned successfully'),
   patchTenant: wrap(superAdminService.patchTenant, 'Tenant updated successfully'),
+  patchTenantAiScoringMode: wrap(superAdminService.patchTenantAiScoringMode, 'Tenant AI scoring mode updated successfully'),
   patchFeatureFlags: wrap(superAdminService.patchFeatureFlags, 'Feature flags updated successfully'),
   getActionCenter: wrap(superAdminService.getActionCenter, 'Super admin action center fetched successfully'),
   getNotificationsFeed: wrap(superAdminService.getNotificationsFeed, 'Super admin notifications fetched successfully'),

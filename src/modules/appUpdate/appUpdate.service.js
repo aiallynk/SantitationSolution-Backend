@@ -7,6 +7,10 @@ const { sanitizeText } = require('../../utils/validators');
 
 const VERSION_TOKEN_PATTERN = /^[0-9A-Za-z._-]+$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const normalizeBuildNumber = (value, fallback = 0) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+};
 
 const resolveAppUpdateConfigPath = () =>
   path.resolve(process.env.APP_UPDATE_CONFIG_PATH || path.join(process.cwd(), 'app-update.json'));
@@ -133,6 +137,11 @@ const readConfigPayload = () => {
 
   const minimumSupportedVersion =
     sanitizeVersionToken(parsed.minimumSupportedVersion, latestVersion) || latestVersion;
+  const latestBuildNumber = normalizeBuildNumber(parsed.latestBuildNumber, 0);
+  const minimumSupportedBuildNumber = normalizeBuildNumber(
+    parsed.minimumSupportedBuildNumber,
+    minimumSupportedVersion === latestVersion ? latestBuildNumber : 0
+  );
   const releaseNotes = sanitizeText(parsed.releaseNotes, 2_000);
   const sha256Raw = sanitizeText(parsed.sha256, 128).toLowerCase();
   const sha256 = SHA256_PATTERN.test(sha256Raw) ? sha256Raw : '';
@@ -143,7 +152,9 @@ const readConfigPayload = () => {
 
   return {
     latestVersion,
+    latestBuildNumber,
     minimumSupportedVersion,
+    minimumSupportedBuildNumber,
     releaseNotes,
     sha256,
     apkFileName,
@@ -187,11 +198,14 @@ const getAppUpdateMetadata = (req) => {
 
   return {
     latestVersion: config.latestVersion,
+    latestBuildNumber: config.latestBuildNumber,
     minimumSupportedVersion: config.minimumSupportedVersion,
+    minimumSupportedBuildNumber: config.minimumSupportedBuildNumber,
     apkUrl,
     apkFileName: config.apkFileName,
     releaseNotes: config.releaseNotes,
     sha256: config.sha256,
+    checksum: config.sha256,
     updatedAt: config.updatedAt,
   };
 };

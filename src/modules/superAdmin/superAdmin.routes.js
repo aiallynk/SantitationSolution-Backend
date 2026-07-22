@@ -46,6 +46,7 @@ router.get('/tenants', superAdminController.getTenants);
 router.get('/tenants/:id', superAdminController.getTenantById);
 router.post('/tenants', validate(validateTenantProvision), superAdminController.postTenantProvision);
 router.patch('/tenants/:id', validate(validateTenantPatch), superAdminController.patchTenant);
+router.patch('/tenants/:id/ai-scoring-mode', superAdminController.patchTenantAiScoringMode);
 router.get('/tenants/:id/limits', superAdminController.getTenantLimits);
 router.put('/tenants/:id/limits', superAdminController.upsertTenantLimits);
 router.get('/tenants/:id/usage', superAdminController.getTenantUsage);

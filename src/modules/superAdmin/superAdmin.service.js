@@ -35,6 +35,7 @@ const { createAuditLog, listAuditLogs: listAuditLogsService } = require('../audi
 const { getQueueMetrics, isRedisEnabled } = require('../../core/queue/queueManager');
 const { ANALYSIS_QUEUE } = require('../analysis/analysis.queue');
 const { runtimeConfig } = require('../../config/runtime');
+const { AI_SCORING_POLICY_VERSION, AI_SCORING_MODES, resolveAiScoringMode } = require('../analysis/aiInspectionScoring.service');
 
 const TENANT_ADMIN_ROLE_CODES = ['tenant_admin', 'country_admin', 'state_admin', 'district_admin', 'city_admin', 'zone_admin'];
 const TENANT_SCOPE_LEVELS = new Set(['country', 'state', 'district', 'city', 'zone']);
@@ -138,6 +139,11 @@ const mapTenant = (tenant, metrics = null) => {
     code: tenant.code,
     status: tenant.status,
     externalApiSharingEnabled: Boolean(tenant.external_api_sharing_enabled),
+    aiScoringMode: resolveAiScoringMode(metadata.aiScoringMode || tenant.ai_scoring_mode),
+    effectiveAiScoringMode: resolveAiScoringMode(metadata.aiScoringMode || tenant.ai_scoring_mode),
+    aiScoringPolicyVersion: AI_SCORING_POLICY_VERSION,
+    aiScoringUpdatedAt: metadata.aiScoringModeUpdatedAt || tenant.updated_at || null,
+    aiScoringUpdatedBy: metadata.aiScoringModeUpdatedBy || null,
     countryCode: tenant.country_code,
     contactName: tenant.contact_name || null,
     contactEmail: tenant.contact_email || null,
@@ -624,6 +630,17 @@ const patchTenant = async (req) => {
         delete metadata.plan;
       }
     }
+    if (req.body.aiScoringMode !== undefined) {
+      const requestedMode = String(req.body.aiScoringMode || '').trim().toLowerCase();
+      if (!AI_SCORING_MODES.has(requestedMode)) {
+        throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+      }
+      updates.ai_scoring_mode = requestedMode;
+      metadata.aiScoringMode = requestedMode;
+      metadata.aiScoringModeUpdatedAt = new Date().toISOString();
+      metadata.aiScoringModeUpdatedBy = { id: req.user?.id || null, name: req.user?.fullName || req.user?.name || null };
+      updates.metadata = metadata;
+    }
     if (req.body.metadata !== undefined || req.body.plan !== undefined) {
       updates.metadata = Object.keys(metadata).length ? metadata : null;
     }
@@ -646,6 +663,19 @@ const patchTenant = async (req) => {
     const metrics = await fetchTenantMetrics(tenant.id, { transaction });
     return mapTenant(refreshed, metrics);
   });
+};
+
+const patchTenantAiScoringMode = async (req) => {
+  ensureSuperAdmin(req);
+  const mode = String(req.body?.aiScoringMode || '').trim().toLowerCase();
+  if (!AI_SCORING_MODES.has(mode)) throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+  const tenant = await Tenant.findByPk(req.params.id);
+  if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  const previousMode = resolveAiScoringMode(tenant.ai_scoring_mode);
+  const metadata = { ...getTenantMetadata(tenant), aiScoringMode: mode, aiScoringModeUpdatedAt: new Date().toISOString(), aiScoringModeUpdatedBy: { id: req.user?.id || null, name: req.user?.fullName || req.user?.name || null } };
+  await tenant.update({ ai_scoring_mode: mode, metadata, updated_at: new Date() });
+  await createAuditLog({ req, actorUserId: req.user?.id, tenantId: tenant.id, action: 'super_admin.tenant_ai_scoring_mode_update', entityType: 'tenant', entityId: tenant.id, details: { previousMode, newMode: mode, changedByRole: req.user?.role || req.user?.roleCodes?.[0] || 'super_admin', source: 'superadmin_tenant_details', requestId: req.id || null } });
+  return mapTenant(tenant);
 };
 
 const patchFeatureFlags = async (req) => {
@@ -1841,6 +1871,7 @@ module.exports = {
   getAuditLogs,
   postTenantProvision,
   patchTenant,
+  patchTenantAiScoringMode,
   patchFeatureFlags,
   getActionCenter,
   getNotificationsFeed,

@@ -9,9 +9,8 @@
  *   - an inspection `sensor_snapshot` object
  *   - a verbatim CSV payload string / array
  *
- * Confirmed wand v2 field sequence: field_1=score, field_2=MQ135 (air quality
- * gas), field_3=MQ137 (ammonia gas), field_4=temperature, field_5=humidity.
- * MQ values are raw, uncalibrated analog readings — never relabelled as ppm.
+ * Confirmed wand v3 field sequence: field_1=ppm (TGS gas concentration
+ * sensor), field_2=temperature, field_3=humidity.
  */
 
 const { parseSensorPayload } = require('./sensorPayload.parser');
@@ -38,17 +37,14 @@ const toDate = (value) => {
 
 /**
  * @returns {{
- *   score: number|null, mq135: number|null, mq137: number|null,
- *   temperature: number|null, humidity: number|null,
+ *   ppm: number|null, temperature: number|null, humidity: number|null,
  *   battery: number|null, rssi: number|null,
  *   readingTime: Date|null, raw: string|null, hasEnvironmental: boolean
  * }}
  */
 const toSensorMetrics = (input) => {
   const empty = {
-    score: null,
-    mq135: null,
-    mq137: null,
+    ppm: null,
     temperature: null,
     humidity: null,
     battery: null,
@@ -63,9 +59,7 @@ const toSensorMetrics = (input) => {
   if (typeof input === 'string' || Array.isArray(input)) {
     const parsed = parseSensorPayload(input);
     return {
-      score: num(parsed.parsed.score),
-      mq135: num(parsed.parsed.mq135),
-      mq137: num(parsed.parsed.mq137),
+      ppm: num(parsed.parsed.ppm),
       temperature: num(parsed.parsed.temperature),
       humidity: num(parsed.parsed.humidity),
       battery: null,
@@ -89,9 +83,7 @@ const toSensorMetrics = (input) => {
     (typeof rawPayload === 'string' ? rawPayload : null);
 
   const metrics = {
-    score: firstNum(input.score, parsedFields.score),
-    mq135: firstNum(input.mq135, input.mq135Raw, parsedFields.mq135),
-    mq137: firstNum(input.mq137, input.mq137Raw, parsedFields.mq137),
+    ppm: firstNum(input.ppm, parsedFields.ppm),
     temperature: firstNum(input.temperature, parsedFields.temperature),
     humidity: firstNum(input.humidity, parsedFields.humidity),
     battery: firstNum(input.battery, input.batteryLevel, input.battery_level),
@@ -104,8 +96,7 @@ const toSensorMetrics = (input) => {
   metrics.hasEnvironmental =
     metrics.temperature != null ||
     metrics.humidity != null ||
-    metrics.mq135 != null ||
-    metrics.mq137 != null;
+    metrics.ppm != null;
   return metrics;
 };
 
