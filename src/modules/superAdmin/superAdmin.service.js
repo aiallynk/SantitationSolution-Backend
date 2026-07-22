@@ -78,6 +78,155 @@ const toNumber = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const toNullableNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const mapGeographyTrailNode = (row) => ({
+  id: row.id,
+  parentId: row.parent_id || null,
+  level: row.level,
+  code: row.code,
+  name: row.name,
+  centroidLatitude: toNullableNumber(row.centroid_latitude),
+  centroidLongitude: toNullableNumber(row.centroid_longitude),
+  boundaryCenterLatitude: toNullableNumber(row.boundary_center_latitude),
+  boundaryCenterLongitude: toNullableNumber(row.boundary_center_longitude),
+});
+
+const coordinatePairFromTrailNode = (node) => {
+  if (!node) return null;
+  const latitude = node.centroidLatitude ?? node.boundaryCenterLatitude ?? null;
+  const longitude = node.centroidLongitude ?? node.boundaryCenterLongitude ?? null;
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return { latitude, longitude };
+};
+
+const buildGeographyTrail = (geographyRow, geographyById) => {
+  const trail = [];
+  const seen = new Set();
+  let current = geographyRow;
+
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    trail.push(mapGeographyTrailNode(current));
+    current = current.parent_id ? geographyById.get(current.parent_id) : null;
+  }
+
+  return trail.reverse();
+};
+
+const resolveTrailPoint = (trail) => {
+  const reversedTrail = [...trail].reverse();
+  for (const node of reversedTrail) {
+    const point = coordinatePairFromTrailNode(node);
+    if (point) {
+      return {
+        ...point,
+        sourceLevel: node.level || null,
+        sourceName: node.name || null,
+        sourceId: node.id || null,
+      };
+    }
+  }
+
+  return {
+    latitude: null,
+    longitude: null,
+    sourceLevel: null,
+    sourceName: null,
+    sourceId: null,
+  };
+};
+
+const buildTenantLocationTrail = (tenant, geographyById) => {
+  const rootGeography = tenant.root_geography_id ? geographyById.get(tenant.root_geography_id) : null;
+  if (rootGeography) {
+    return buildGeographyTrail(rootGeography, geographyById);
+  }
+
+  const tenantLocations = [
+    ['country', tenant.country_code, tenant.country_name],
+    ['state', null, tenant.state_name],
+    ['district', null, tenant.district_name],
+    ['city', null, tenant.city_name],
+    ['zone', null, tenant.zone_name],
+  ];
+
+  return tenantLocations
+    .filter(([, , name]) => Boolean(String(name || '').trim()))
+    .map(([level, code, name], index, locations) => ({
+      id: `${tenant.id}:${level}`,
+      parentId: index > 0 ? `${tenant.id}:${locations[index - 1][0]}` : null,
+      level,
+      code: code || null,
+      name,
+      centroidLatitude: null,
+      centroidLongitude: null,
+      boundaryCenterLatitude: null,
+      boundaryCenterLongitude: null,
+    }));
+};
+
+const toMultiCityRollup = (tenant, geographyById, facilityCount = 0) => {
+  const trail = buildTenantLocationTrail(tenant, geographyById);
+  const trailByLevel = new Map(trail.map((node) => [String(node.level || '').toLowerCase(), node]));
+  const mapPoint = resolveTrailPoint(trail);
+  const country = trailByLevel.get('country') || null;
+  const state = trailByLevel.get('state') || null;
+  const district = trailByLevel.get('district') || null;
+  const city = trailByLevel.get('city') || null;
+  const zone = trailByLevel.get('zone') || null;
+  const ward = trailByLevel.get('ward') || null;
+
+  return {
+    tenantId: tenant.id,
+    tenantName: tenant.name,
+    tenantCode: tenant.code,
+    tenantStatus: tenant.status,
+    geographyId: tenant.root_geography_id || null,
+    scopeLevel: tenant.scope_level || 'city',
+    locationName:
+      tenant.zone_name ||
+      tenant.city_name ||
+      tenant.district_name ||
+      tenant.state_name ||
+      tenant.country_name ||
+      tenant.name,
+    addressLine: tenant.address_line || null,
+    cityName: tenant.city_name || city?.name || null,
+    cityCode: city?.code || null,
+    countryId: country?.id || null,
+    countryName: tenant.country_name || country?.name || null,
+    countryCode: tenant.country_code || country?.code || null,
+    stateId: state?.id || null,
+    stateName: tenant.state_name || state?.name || null,
+    districtId: district?.id || null,
+    districtName: tenant.district_name || district?.name || null,
+    zoneId: zone?.id || null,
+    zoneName: tenant.zone_name || zone?.name || null,
+    wardId: ward?.id || null,
+    wardName: ward?.name || null,
+    mapLatitude: mapPoint.latitude,
+    mapLongitude: mapPoint.longitude,
+    mapSourceLevel: mapPoint.sourceLevel,
+    mapSourceName: mapPoint.sourceName,
+    geocodeQuery: [
+      tenant.address_line,
+      tenant.zone_name,
+      tenant.city_name,
+      tenant.district_name,
+      tenant.state_name,
+      tenant.country_name,
+    ]
+      .filter(Boolean)
+      .join(', '),
+    facilityCount,
+    hierarchy: trail,
+  };
+};
+
 const mapConfigRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -950,37 +1099,55 @@ const getNotificationsFeed = async (req) => {
 
 const getMultiCityRollups = async (req) => {
   ensureSuperAdmin(req);
-  const cities = await Geography.findAll({ where: { level: 'city' }, order: [['name', 'ASC']] });
-  const facilities = await Facility.findAll({ attributes: ['id', 'geography_id'] });
-  const alerts = await Alert.findAll({
-    where: { status: { [Op.in]: ['open', 'acknowledged'] } },
-    attributes: ['facility_id'],
-  });
-
-  const cityIndex = new Map(
-    cities.map((city) => [
-      city.id,
-      {
-        geographyId: city.id,
-        cityName: city.name,
-        cityCode: city.code,
-        facilityCount: 0,
-        openAlerts: 0,
-      },
-    ])
+  const [tenants, geographies, facilityCounts] = await Promise.all([
+    Tenant.findAll({
+      attributes: [
+        'id',
+        'name',
+        'code',
+        'status',
+        'scope_level',
+        'country_code',
+        'country_name',
+        'state_name',
+        'district_name',
+        'city_name',
+        'zone_name',
+        'address_line',
+        'root_geography_id',
+      ],
+      order: [['name', 'ASC']],
+      raw: true,
+    }),
+    Geography.findAll({
+      attributes: [
+        'id',
+        'parent_id',
+        'level',
+        'code',
+        'name',
+        'centroid_latitude',
+        'centroid_longitude',
+        'boundary_center_latitude',
+        'boundary_center_longitude',
+      ],
+      order: [['level', 'ASC'], ['name', 'ASC']],
+      raw: true,
+    }),
+    Facility.findAll({
+      attributes: ['tenant_id', [fn('COUNT', col('id')), 'count']],
+      group: ['tenant_id'],
+      raw: true,
+    }),
+  ]);
+  const geographyById = new Map(geographies.map((row) => [row.id, row]));
+  const facilityCountByTenant = new Map(
+    facilityCounts.map((row) => [row.tenant_id, Number(row.count || 0)])
   );
-  const facilityToCity = new Map();
-  facilities.forEach((facility) => {
-    facilityToCity.set(facility.id, facility.geography_id);
-    const bucket = cityIndex.get(facility.geography_id);
-    if (bucket) bucket.facilityCount += 1;
-  });
-  alerts.forEach((alert) => {
-    const cityId = facilityToCity.get(alert.facility_id);
-    const bucket = cityIndex.get(cityId);
-    if (bucket) bucket.openAlerts += 1;
-  });
-  return [...cityIndex.values()];
+
+  return tenants.map((tenant) =>
+    toMultiCityRollup(tenant, geographyById, facilityCountByTenant.get(tenant.id) || 0)
+  );
 };
 
 const getOrganizations = async (req) => {
