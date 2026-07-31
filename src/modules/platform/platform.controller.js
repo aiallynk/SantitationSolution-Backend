@@ -48,6 +48,15 @@ const patchOwnTenantProfile = async (req, res, next) => {
   }
 };
 
+const getOwnTenantAiScoringMode = async (req, res, next) => {
+  try { return sendSuccess(res, { message: 'AI scoring mode fetched successfully', data: await platformService.getOwnTenantAiScoringMode(req) }); }
+  catch (error) { return next(error); }
+};
+const patchOwnTenantAiScoringMode = async (req, res, next) => {
+  try { return sendSuccess(res, { message: 'AI scoring mode updated successfully', data: await platformService.patchOwnTenantAiScoringMode(req) }); }
+  catch (error) { return next(error); }
+};
+
 const getGeographiesTree = async (req, res, next) => {
   try {
     const data = await platformService.listGeographyTree(req);
@@ -514,6 +523,8 @@ module.exports = {
   patchTenant,
   getOwnTenantProfile,
   patchOwnTenantProfile,
+  getOwnTenantAiScoringMode,
+  patchOwnTenantAiScoringMode,
   getGeographiesTree,
   getGeographyOptions,
   getGlobalGeographyOptions,

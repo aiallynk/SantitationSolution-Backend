@@ -45,12 +45,10 @@ test('score bands match historical backfill boundaries', () => {
 test('generated snapshots stay within hard bounds for boundary scores', () => {
   for (const score of scores) {
     const snapshot = generateSyntheticSensorSnapshot({ ...baseInput, selectedScore: score });
-    assert.ok(snapshot.score >= HARD_BOUNDS.sensorScore[0] && snapshot.score <= HARD_BOUNDS.sensorScore[1]);
-    assert.ok(snapshot.field1 >= HARD_BOUNDS.sensorScore[0] && snapshot.field1 <= HARD_BOUNDS.sensorScore[1]);
+    assert.ok(snapshot.ppm >= HARD_BOUNDS.ppm[0] && snapshot.ppm <= HARD_BOUNDS.ppm[1]);
+    assert.ok(snapshot.field1 >= HARD_BOUNDS.ppm[0] && snapshot.field1 <= HARD_BOUNDS.ppm[1]);
     assert.ok(snapshot.temperature >= HARD_BOUNDS.temperature[0] && snapshot.temperature <= HARD_BOUNDS.temperature[1]);
     assert.ok(snapshot.humidity >= HARD_BOUNDS.humidity[0] && snapshot.humidity <= HARD_BOUNDS.humidity[1]);
-    assert.ok(snapshot.mq135 >= HARD_BOUNDS.mq135[0] && snapshot.mq135 <= HARD_BOUNDS.mq135[1]);
-    assert.ok(snapshot.mq137 >= HARD_BOUNDS.mq137[0] && snapshot.mq137 <= HARD_BOUNDS.mq137[1]);
     assert.ok(snapshot.batteryLevel >= HARD_BOUNDS.batteryLevel[0] && snapshot.batteryLevel <= HARD_BOUNDS.batteryLevel[1]);
     assert.ok(snapshot.rssi >= HARD_BOUNDS.rssi[0] && snapshot.rssi <= HARD_BOUNDS.rssi[1]);
   }
@@ -60,20 +58,12 @@ test('generated raw payload is synchronized with top-level fields', () => {
   const snapshot = generateSyntheticSensorSnapshot({ ...baseInput, selectedScore: 85 });
   assert.equal(
     snapshot.rawPayload,
-    [
-      snapshot.score.toFixed(1),
-      snapshot.mq135.toFixed(2),
-      snapshot.mq137.toFixed(2),
-      snapshot.temperature.toFixed(1),
-      snapshot.humidity.toFixed(1),
-    ].join(',')
+    [snapshot.ppm.toFixed(1), snapshot.temperature.toFixed(1), snapshot.humidity.toFixed(1)].join(',')
   );
   assert.deepEqual(snapshot.fields, {
-    field_1: snapshot.score,
-    field_2: snapshot.mq135,
-    field_3: snapshot.mq137,
-    field_4: snapshot.temperature,
-    field_5: snapshot.humidity,
+    field_1: snapshot.ppm,
+    field_2: snapshot.temperature,
+    field_3: snapshot.humidity,
   });
 });
 
@@ -165,7 +155,7 @@ test('synthetic snapshot (sensorReadingId: null) still yields chartable metrics 
   // The dashboard endpoint reads metrics through toSensorMetrics — all chartable
   // values must be finite numbers despite sensorReadingId being null.
   const metrics = toSensorMetrics(snapshot);
-  for (const key of ['score', 'temperature', 'humidity', 'mq135', 'mq137']) {
+  for (const key of ['ppm', 'temperature', 'humidity']) {
     assert.ok(Number.isFinite(Number(metrics[key])), `${key} should be a finite number, got ${metrics[key]}`);
   }
 });
@@ -183,10 +173,7 @@ test('generated values are score-correlated: cleaner scores -> lower gases/humid
   };
   const clean = generateSyntheticSensorSnapshot({ ...base, selectedScore: 95 });
   const dirty = generateSyntheticSensorSnapshot({ ...base, selectedScore: 10 });
-  assert.ok(clean.mq135 < dirty.mq135, 'clean MQ135 should be lower than dirty');
-  assert.ok(clean.mq137 < dirty.mq137, 'clean MQ137 should be lower than dirty');
+  assert.ok(clean.ppm < dirty.ppm, 'clean PPM should be lower than dirty');
   assert.ok(clean.humidity < dirty.humidity, 'clean humidity should be lower than dirty');
-  assert.ok(clean.score > dirty.score, 'clean sensor score should be higher than dirty');
-  // Raw analog ranges (not ppm): bounded by HARD_BOUNDS.
-  assert.ok(dirty.mq135 <= HARD_BOUNDS.mq135[1] && clean.mq135 >= HARD_BOUNDS.mq135[0]);
+  assert.ok(dirty.ppm <= HARD_BOUNDS.ppm[1] && clean.ppm >= HARD_BOUNDS.ppm[0]);
 });

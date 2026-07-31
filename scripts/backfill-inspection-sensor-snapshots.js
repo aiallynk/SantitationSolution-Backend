@@ -375,7 +375,7 @@ const loadCandidateData = async ({ dateRange, tenantId = null }) => {
 };
 
 const summarizeValues = (proposedRows) => {
-  const metrics = ['score', 'temperature', 'humidity', 'mq135', 'mq137', 'batteryLevel', 'rssi'];
+  const metrics = ['temperature', 'humidity', 'ppm', 'batteryLevel', 'rssi'];
   const result = {};
   for (const metric of metrics) {
     const values = proposedRows
@@ -548,8 +548,7 @@ const proposedCsvRows = (rows) => rows.map((row) => ({
   scoreBand: row.scoreBand,
   temperature: row.generatedSensorSnapshot.temperature,
   humidity: row.generatedSensorSnapshot.humidity,
-  mq135: row.generatedSensorSnapshot.mq135,
-  mq137: row.generatedSensorSnapshot.mq137,
+  ppm: row.generatedSensorSnapshot.ppm,
   batteryLevel: row.generatedSensorSnapshot.batteryLevel,
   rssi: row.generatedSensorSnapshot.rssi,
   snapshot: row.generatedSensorSnapshot,
@@ -573,8 +572,7 @@ const writeDryRunArtifacts = ({ outDir, plan }) => {
     'scoreBand',
     'temperature',
     'humidity',
-    'mq135',
-    'mq137',
+    'ppm',
     'batteryLevel',
     'rssi',
     'snapshot',
@@ -780,10 +778,8 @@ const postApplyVerification = async ({ batchId, dateRange, beforeFingerprints })
         MAX((sensor_snapshot->>'temperature')::numeric) AS max_temperature,
         MIN((sensor_snapshot->>'humidity')::numeric) AS min_humidity,
         MAX((sensor_snapshot->>'humidity')::numeric) AS max_humidity,
-        MIN((sensor_snapshot->>'mq135')::numeric) AS min_mq135,
-        MAX((sensor_snapshot->>'mq135')::numeric) AS max_mq135,
-        MIN((sensor_snapshot->>'mq137')::numeric) AS min_mq137,
-        MAX((sensor_snapshot->>'mq137')::numeric) AS max_mq137
+        MIN((sensor_snapshot->>'ppm')::numeric) AS min_ppm,
+        MAX((sensor_snapshot->>'ppm')::numeric) AS max_ppm
       FROM inspections
       WHERE sensor_snapshot->>'backfillBatchId' = :batchId
     `,

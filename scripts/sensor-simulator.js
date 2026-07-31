@@ -58,29 +58,19 @@ const listDevices = async () => {
 
 const createReadingPayload = (device) => {
   const spike = Math.random() > 0.9;
-  const odorBase = spike ? randomBetween(72, 92) : randomBetween(15, 55);
-  const ammoniaBase = spike ? randomBetween(38, 70) : randomBetween(5, 28);
-  const h2sBase = spike ? randomBetween(11, 20) : randomBetween(1, 8);
+  const ppm = spike ? randomBetween(150, 450) : randomBetween(5, 90);
+  const temperature = randomBetween(18, 37);
+  const humidity = randomBetween(42, 88);
 
   return {
     deviceId: device.id || device.deviceId,
     timestamp: new Date().toISOString(),
-    odorPpm: odorBase,
-    ammoniaPpm: ammoniaBase,
-    h2sPpm: h2sBase,
-    methanePpm: randomBetween(20, spike ? 98 : 65),
-    humidity: randomBetween(42, 88),
-    temperature: randomBetween(18, 37),
-    occupancyCount: Math.round(randomBetween(0, 8)),
-    footfallCount: Math.round(randomBetween(1, 40)),
-    tankFillLevel: randomBetween(15, 95),
+    ppm,
+    temperature,
+    humidity,
     batteryLevel: randomBetween(15, 100),
     signalStrength: randomBetween(40, 99),
-    rawPayload: {
-      simulated: true,
-      profile: spike ? 'spike' : 'normal',
-      generatedAt: new Date().toISOString(),
-    },
+    rawPayload: `${ppm},${temperature},${humidity}`,
   };
 };
 

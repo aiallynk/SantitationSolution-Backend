@@ -53,7 +53,15 @@ const { haversineMeters } = require('../publicApi/toiletPublicFilters');
 const { runtimeConfig } = require('../../config/runtime');
 const { computeToiletRiskWeight } = require('./toiletMapRisk.helper');
 const { getDefaultTimezone, isValidIanaTimezone, normalizeTimezone } = require('../../utils/timezone');
+<<<<<<< HEAD
 const { resolveOrCreateTenantGeographyFromGlobal } = require('../geography-master/activation.service');
+=======
+const {
+  AI_SCORING_POLICY_VERSION,
+  AI_SCORING_MODES,
+  resolveAiScoringMode,
+} = require('../analysis/aiInspectionScoring.service');
+>>>>>>> beddd57f62b9c570ea8cfe3d2b492da90c1e890d
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -708,6 +716,11 @@ const mapTenantRow = (tenant) => ({
   addressLine: tenant.address_line || null,
   rootGeographyId: tenant.root_geography_id || null,
   timezone: normalizeTimezone(tenant.timezone || tenant.metadata?.timezone || getDefaultTimezone()),
+  aiScoringMode: resolveAiScoringMode(tenant.metadata?.aiScoringMode || tenant.ai_scoring_mode),
+  effectiveAiScoringMode: resolveAiScoringMode(tenant.metadata?.aiScoringMode || tenant.ai_scoring_mode),
+  aiScoringPolicyVersion: AI_SCORING_POLICY_VERSION,
+  aiScoringUpdatedAt: tenant.metadata?.aiScoringModeUpdatedAt || tenant.updated_at || null,
+  aiScoringUpdatedBy: tenant.metadata?.aiScoringModeUpdatedBy || null,
   metadata: tenant.metadata || null,
 });
 
@@ -2894,6 +2907,16 @@ const patchOwnTenantProfile = async (req) => {
   const nextMetadata = {
     ...(tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {}),
   };
+  const requestedAiScoringMode =
+    req.body.aiScoringMode !== undefined ? String(req.body.aiScoringMode || '').trim().toLowerCase() : null;
+  const previousAiScoringMode = resolveAiScoringMode(tenant.ai_scoring_mode);
+  if (requestedAiScoringMode !== null && !AI_SCORING_MODES.has(requestedAiScoringMode)) {
+    throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+  }
+  if (requestedAiScoringMode !== null) {
+    nextMetadata.aiScoringModeUpdatedAt = new Date().toISOString();
+    nextMetadata.aiScoringModeUpdatedBy = { id: req.user?.id || null, name: req.user?.fullName || req.user?.name || null };
+  }
   if (req.body.addressLine2 !== undefined) {
     nextMetadata.addressLine2 = sanitizeOptionalText(req.body.addressLine2, 300);
   }
@@ -2952,6 +2975,7 @@ const patchOwnTenantProfile = async (req) => {
         ? sanitizeOptionalText(req.body.addressLine, 300)
         : tenant.address_line,
     timezone: nextTimezone,
+    ai_scoring_mode: requestedAiScoringMode || tenant.ai_scoring_mode,
     metadata: nextMetadata,
     updated_at: new Date(),
   });
@@ -2963,8 +2987,53 @@ const patchOwnTenantProfile = async (req) => {
     entityId: tenant.id,
     tenantId: tenant.id,
   });
+  if (requestedAiScoringMode !== null) {
+    await createAuditLog({
+      req, actorUserId: req.user?.id, tenantId, action: 'tenant.ai_scoring_mode_update', entityType: 'tenant', entityId: tenant.id,
+      details: { previousMode: previousAiScoringMode, newMode: requestedAiScoringMode, changedByRole: req.user?.role || req.user?.roleCodes?.[0] || null, source: 'tenant_settings' },
+    });
+  }
 
   return mapTenantProfileForClient(tenant);
+};
+
+const getOwnTenantAiScoringMode = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  const metadata = tenant.metadata && typeof tenant.metadata === 'object' ? tenant.metadata : {};
+  return {
+    aiScoringMode: resolveAiScoringMode(metadata.aiScoringMode || tenant.ai_scoring_mode),
+    effectiveAiScoringMode: resolveAiScoringMode(metadata.aiScoringMode || tenant.ai_scoring_mode),
+    aiScoringPolicyVersion: AI_SCORING_POLICY_VERSION,
+    updatedAt: metadata.aiScoringModeUpdatedAt || tenant.updated_at,
+    updatedBy: metadata.aiScoringModeUpdatedBy || null,
+  };
+};
+
+const patchOwnTenantAiScoringMode = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
+  const requestedMode = String(req.body?.aiScoringMode || '').trim().toLowerCase();
+  if (!AI_SCORING_MODES.has(requestedMode)) {
+    throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+  }
+  const tenant = await Tenant.findByPk(tenantId);
+  if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });
+  const previousMode = resolveAiScoringMode(tenant.ai_scoring_mode);
+  const metadata = tenant.metadata && typeof tenant.metadata === 'object' ? { ...tenant.metadata } : {};
+  metadata.aiScoringModeUpdatedAt = new Date().toISOString();
+  metadata.aiScoringModeUpdatedBy = {
+    id: req.user?.id || null,
+    name: req.user?.fullName || req.user?.name || null,
+  };
+  await tenant.update({ ai_scoring_mode: requestedMode, metadata, updated_at: new Date() });
+  await createAuditLog({
+    req, actorUserId: req.user?.id, tenantId, action: 'tenant.ai_scoring_mode_update', entityType: 'tenant', entityId: tenantId,
+    details: { previousMode, newMode: requestedMode, changedByRole: req.user?.role || req.user?.roleCodes?.[0] || null, source: 'tenant_settings', requestId: req.id || null },
+  });
+  return getOwnTenantAiScoringMode(req);
 };
 
 const buildGeographyTree = (rows) => {
@@ -6500,6 +6569,8 @@ module.exports = {
   patchTenant,
   getOwnTenantProfile,
   patchOwnTenantProfile,
+  getOwnTenantAiScoringMode,
+  patchOwnTenantAiScoringMode,
   listGeographyTree,
   listGeographyOptions,
   listGlobalGeographyOptions,

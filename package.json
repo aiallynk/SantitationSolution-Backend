@@ -43,7 +43,12 @@
     "media:privacy:fix": "node scripts/audit-media-privacy.js --fix",
     "deps:recover-safe": "npm install sequelize@^6.37.8 firebase-admin@^14.1.0 uuid@^11.1.1",
     "test": "node --test \"tests/**/*.test.js\"",
-    "seed:simulator": "node scripts/sensor-simulator.js"
+    "seed:simulator": "node scripts/sensor-simulator.js",
+    "app-update:prepare": "node scripts/release-app-update.js prepare",
+    "app-update:verify-local": "node scripts/release-app-update.js verify-local",
+    "app-release:build": "node scripts/release-app-update.js build",
+    "app-release:firebase": "node scripts/release-app-update.js firebase",
+    "app-release:complete": "node scripts/release-app-update.js complete"
   },
   "keywords": [
     "sanitation",

@@ -39,8 +39,7 @@ const DEFAULT_BLE_DEVICE_TYPE = 'sanitation_wand';
 const ANALYTICS_METRICS = Object.freeze({
   temperature: { key: 'temperature', label: 'Temperature', unit: 'C', precision: 1 },
   humidity: { key: 'humidity', label: 'Humidity', unit: '%', precision: 1 },
-  mq135: { key: 'mq135', label: 'Air quality MQ135', unit: 'raw', precision: 0 },
-  mq137: { key: 'mq137', label: 'Ammonia MQ137', unit: 'raw', precision: 0 },
+  ppm: { key: 'ppm', label: 'Gas Concentration (PPM)', unit: 'ppm', precision: 1 },
   battery: { key: 'battery', label: 'Battery', unit: '%', precision: 0 },
   rssi: { key: 'rssi', label: 'Signal', unit: 'dBm', precision: 0 },
 });
@@ -167,10 +166,7 @@ const mapReading = (row) => ({
   deviceId: row.device_id,
   clientReadingId: row.client_reading_id || null,
   timestamp: row.timestamp,
-  odorPpm: row.odor_ppm,
-  ammoniaPpm: row.ammonia_ppm,
-  h2sPpm: row.h2s_ppm,
-  methanePpm: row.methane_ppm,
+  ppm: row.ppm,
   humidity: row.humidity,
   temperature: row.temperature,
   occupancyCount: row.occupancy_count,
@@ -303,8 +299,7 @@ const getMetricThresholdSummary = (metricKey) => {
       criticalMax: thresholds.humidity.highCriticalPct,
     };
   }
-  if (key === 'mq135') return { warningMax: thresholds.mq135.warning, criticalMax: thresholds.mq135.critical };
-  if (key === 'mq137') return { warningMax: thresholds.mq137.warning, criticalMax: thresholds.mq137.critical };
+  if (key === 'ppm') return { warningMax: thresholds.ppm.warning, criticalMax: thresholds.ppm.critical };
   if (key === 'battery') return { warningMin: thresholds.battery.lowWarningPct, criticalMin: thresholds.battery.lowCriticalPct };
   return {};
 };
@@ -480,11 +475,7 @@ const emitThresholdAlerts = async ({ device, metrics }) => {
   const activeAlertTypes = new Set(evaluation.alerts.map((item) => item.type));
 
   for (const candidate of evaluation.alerts) {
-    const metricLabel = candidate.metric === 'mq135'
-      ? 'MQ135'
-      : candidate.metric === 'mq137'
-        ? 'MQ137'
-        : candidate.metric;
+    const metricLabel = candidate.metric === 'ppm' ? 'PPM' : candidate.metric;
     await upsertSensorAlert({
       device,
       alertType: candidate.type,
@@ -699,6 +690,7 @@ const ingestSensorReading = async (req) => {
 
   const temperature = parseNumeric(req.body.temperature) ?? parsed?.parsed?.temperature ?? null;
   const humidity = parseNumeric(req.body.humidity) ?? parsed?.parsed?.humidity ?? null;
+  const ppm = parseNumeric(req.body.ppm) ?? parsed?.parsed?.ppm ?? null;
   const signalStrength = parseNumeric(req.body.rssi) ?? parseNumeric(req.body.signalStrength);
 
   const captured = resolveCaptureTimestamp(
@@ -744,10 +736,7 @@ const ingestSensorReading = async (req) => {
       recorded_at_utc: timestamp,
       source_timezone: captured.captureTimezone,
       source_offset_minutes: captured.captureOffsetMinutes,
-      odor_ppm: parseNumeric(req.body.odorPpm),
-      ammonia_ppm: parseNumeric(req.body.ammoniaPpm),
-      h2s_ppm: parseNumeric(req.body.h2sPpm),
-      methane_ppm: parseNumeric(req.body.methanePpm),
+      ppm,
       humidity,
       temperature,
       occupancy_count: parseNumeric(req.body.occupancyCount),
@@ -1353,10 +1342,10 @@ const getFacilityLiveMetrics = async (req) => {
   );
 
   const latestReadings = readings.filter(Boolean).map(mapReading);
-  const odorAvg =
+  const ppmAvg =
     latestReadings.length === 0
       ? 0
-      : latestReadings.reduce((sum, row) => sum + Number(row.odorPpm || 0), 0) /
+      : latestReadings.reduce((sum, row) => sum + Number(row.ppm || 0), 0) /
         latestReadings.length;
 
   return {
@@ -1371,7 +1360,7 @@ const getFacilityLiveMetrics = async (req) => {
     })),
     latestReadings,
     summary: {
-      averageOdorPpm: Number(odorAvg.toFixed(2)),
+      averagePpm: Number(ppmAvg.toFixed(2)),
       activeSensors: devices.filter((device) => device.status === 'active').length,
       totalSensors: devices.length,
     },
@@ -1801,16 +1790,13 @@ const getToiletSensorAnalysis = async (req) => {
   };
 };
 
-// Metrics that can be charted from an inspection sensor_snapshot. Unlike the
-// live-telemetry ANALYTICS_METRICS, this set also exposes the overall sensor
-// `score` (field1 / sensorToiletScore). All values are read-only and derived
-// from inspections.sensor_snapshot — never from sensor_readings/sensor_devices.
+// Metrics that can be charted from an inspection sensor_snapshot. All values
+// are read-only and derived from inspections.sensor_snapshot — never from
+// sensor_readings/sensor_devices.
 const SNAPSHOT_METRICS = Object.freeze({
-  score: { key: 'score', label: 'Sensor score', unit: '', precision: 1 },
   temperature: ANALYTICS_METRICS.temperature,
   humidity: ANALYTICS_METRICS.humidity,
-  mq135: { key: 'mq135', label: 'MQ135 raw', unit: 'raw', precision: 2 },
-  mq137: { key: 'mq137', label: 'MQ137 raw', unit: 'raw', precision: 2 },
+  ppm: ANALYTICS_METRICS.ppm,
 });
 
 const normalizeSnapshotMetricKey = (value) => {
@@ -1883,7 +1869,7 @@ const getInspectionSnapshotTrends = async (req) => {
     if (sourceFilter === 'real' && isSynthetic) continue;
 
     const metrics = toSensorMetrics(snapshot);
-    const rawValue = metricKey === 'score' ? metrics.score : metrics[metricKey];
+    const rawValue = metrics[metricKey];
     if (rawValue === null || rawValue === undefined || !Number.isFinite(Number(rawValue))) continue;
 
     const value = Number(rawValue);
