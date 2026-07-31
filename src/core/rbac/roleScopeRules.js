@@ -4,6 +4,10 @@ const {
   ROLE_CODES,
   normalizeRoleCode,
 } = require('./personaFamilies');
+const {
+  getPersonaScopeLevel,
+  getRequiredLocationFields,
+} = require('./personaLocationScope');
 
 const hasScopedAssignment = (assignments = []) => {
   return (Array.isArray(assignments) ? assignments : []).some((assignment) => {
@@ -23,16 +27,32 @@ const hasSupervisorGeographyScopedInput = ({ geographyId = null, assignments = [
   });
 };
 
-const collectRoleScopeValidationErrors = ({ roleCodes = [], geographyId = null, assignments = [] }) => {
+const collectRoleScopeValidationErrors = ({
+  roleCodes = [],
+  geographyId = null,
+  assignments = [],
+  locationNames = {},
+}) => {
   const normalizedRoleCodes = [...new Set((Array.isArray(roleCodes) ? roleCodes : []).map(normalizeRoleCode).filter(Boolean))];
   const errors = [];
 
   const hasGeographyScopedRole = normalizedRoleCodes.some((roleCode) =>
     GEOGRAPHY_SCOPED_ADMIN_ROLE_CODES.has(roleCode)
   );
-  if (hasGeographyScopedRole && !geographyId && !hasScopedAssignment(assignments)) {
+  const personaScopeLevel = getPersonaScopeLevel(normalizedRoleCodes);
+  const hasCompleteNamedScope =
+    Boolean(personaScopeLevel) &&
+    getRequiredLocationFields(personaScopeLevel).every((field) =>
+      Boolean(String(locationNames?.[field] || '').trim())
+    );
+  if (
+    hasGeographyScopedRole &&
+    !geographyId &&
+    !hasScopedAssignment(assignments) &&
+    !hasCompleteNamedScope
+  ) {
     errors.push(
-      'Scoped ops admin roles (country/state/district/city) require geographyId or scoped assignment'
+      'Scoped ops admin roles (country/state/district/city) require geographyId, location names, or scoped assignment'
     );
   }
 
@@ -59,8 +79,18 @@ const collectRoleScopeValidationErrors = ({ roleCodes = [], geographyId = null, 
   return errors;
 };
 
-const assertRoleScopeRequirements = ({ roleCodes = [], geographyId = null, assignments = [] }) => {
-  const errors = collectRoleScopeValidationErrors({ roleCodes, geographyId, assignments });
+const assertRoleScopeRequirements = ({
+  roleCodes = [],
+  geographyId = null,
+  assignments = [],
+  locationNames = {},
+}) => {
+  const errors = collectRoleScopeValidationErrors({
+    roleCodes,
+    geographyId,
+    assignments,
+    locationNames,
+  });
   if (errors.length > 0) {
     throw new AppError('Role scope validation failed', 400, {
       code: 'ROLE_SCOPE_VALIDATION_FAILED',

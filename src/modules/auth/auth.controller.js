@@ -99,6 +99,56 @@ const verifyResetToken = async (req, res, next) => {
   }
 };
 
+const verifyActivationToken = async (req, res, next) => {
+  try {
+    const payload = await authService.verifyActivationToken({
+      token: req.body.token,
+    });
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'Activation token verified',
+      data: payload,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const activateAccount = async (req, res, next) => {
+  try {
+    const payload = await authService.activateAccount({
+      token: req.body.token,
+      newPassword: req.body.newPassword,
+      req,
+    });
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'Account activated successfully',
+      data: payload,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const changeTemporaryPassword = async (req, res, next) => {
+  try {
+    const payload = await authService.changeTemporaryPassword({
+      userId: req.user.id,
+      activeTenantId: req.user?.tenantId || null,
+      newPassword: req.body.newPassword,
+      req,
+    });
+    return sendSuccess(res, {
+      statusCode: 200,
+      message: 'Password changed successfully',
+      data: payload,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getMe = async (req, res, next) => {
   try {
     const payload = await authService.getMe({
@@ -138,6 +188,9 @@ module.exports = {
   logout,
   forgotPassword,
   verifyResetToken,
+  verifyActivationToken,
+  activateAccount,
+  changeTemporaryPassword,
   resetPassword,
   getMe,
   patchMe,

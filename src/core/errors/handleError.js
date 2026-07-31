@@ -78,6 +78,7 @@ const normalizeSequelizeError = (err) => {
       runtimeConfig.isProduction
         ? undefined
         : {
+            ...(err.details || {}),
             ...dbMeta,
             sequelizeErrorName: err.name || null,
           },

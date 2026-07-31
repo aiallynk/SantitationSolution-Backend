@@ -12,6 +12,7 @@ const isValidTimezone = (value) => {
 };
 const allowedScopeLevels = new Set(['country', 'state', 'district', 'city', 'zone']);
 const allowedGeographyLevels = new Set(['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster']);
+const mapRequiredGeographyLevels = new Set(['country', 'state', 'district', 'city']);
 const scopeRequiredFields = {
   country: ['countryName'],
   state: ['countryName', 'stateName'],
@@ -34,12 +35,15 @@ const validateTenantCreate = (req) => {
     errors.push('timezone must be a valid IANA timezone');
   }
   const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
-  const requiredFields = scopeRequiredFields[scopeLevel] || [];
+  const requiredFields = req.body.rootGeographyId ? [] : scopeRequiredFields[scopeLevel] || [];
   requiredFields.forEach((field) => {
     if (isBlank(req.body[field])) {
       errors.push(`${field} is required for ${scopeLevel} scope`);
     }
   });
+  if (['country', 'state', 'district', 'city'].includes(scopeLevel) && !req.body.rootGeographyId) {
+    errors.push(`rootGeographyId is required for ${scopeLevel} scope`);
+  }
   return errors;
 };
 
@@ -51,7 +55,8 @@ const validateGeographyCreate = (req) => {
   }
   if (req.body.code !== undefined && isBlank(req.body.code)) errors.push('code cannot be blank when provided');
   if (isBlank(req.body.name)) errors.push('name is required');
-  if (isBlank(req.body.tenantId) && !req.user?.tenantId) {
+  const level = String(req.body.level || '').trim().toLowerCase();
+  if (!mapRequiredGeographyLevels.has(level) && isBlank(req.body.tenantId) && !req.user?.tenantId) {
     errors.push('tenantId is required');
   }
   if (req.body.geometryType !== undefined) {
@@ -60,17 +65,65 @@ const validateGeographyCreate = (req) => {
       errors.push('geometryType must be polygon or circle');
     }
   }
+  if (req.body.centroidLatitude !== undefined && Number.isNaN(Number(req.body.centroidLatitude))) {
+    errors.push('centroidLatitude must be a valid number');
+  }
+  if (req.body.centroidLongitude !== undefined && Number.isNaN(Number(req.body.centroidLongitude))) {
+    errors.push('centroidLongitude must be a valid number');
+  }
+  if (mapRequiredGeographyLevels.has(level)) {
+    const hasLat = req.body.centroidLatitude !== undefined && req.body.centroidLatitude !== '';
+    const hasLng = req.body.centroidLongitude !== undefined && req.body.centroidLongitude !== '';
+    const hasPlaceId = !isBlank(req.body.mapPlaceId || req.body.placeId);
+    const bounds = req.body.bounds;
+    const hasBounds =
+      bounds &&
+      typeof bounds === 'object' &&
+      bounds.north !== undefined &&
+      bounds.south !== undefined &&
+      bounds.east !== undefined &&
+      bounds.west !== undefined;
+    if (!hasLat || !hasLng || !hasPlaceId || !hasBounds) {
+      errors.push(`${level} must use a Google Maps selection with valid coordinates and bounds`);
+    }
+  }
   return errors;
 };
 
 const validateFacilityCreate = (req) => {
   const errors = [];
-  if (isBlank(req.body.code)) errors.push('code is required');
   if (isBlank(req.body.name)) errors.push('name is required');
   if (isBlank(req.body.facilityType)) errors.push('facilityType is required');
+  if (isBlank(req.body.areaId || req.body.geographyId || req.body.zoneGeographyId || req.body.wardGeographyId)) {
+    errors.push('areaId is required');
+  }
+  const hasLat = req.body.latitude !== undefined && req.body.latitude !== '';
+  const hasLng = req.body.longitude !== undefined && req.body.longitude !== '';
+  if (hasLat !== hasLng) {
+    errors.push('latitude and longitude must be provided together');
+  }
+  if (hasLat && Number.isNaN(Number(req.body.latitude))) {
+    errors.push('latitude must be a valid number');
+  }
+  if (hasLng && Number.isNaN(Number(req.body.longitude))) {
+    errors.push('longitude must be a valid number');
+  }
   if (req.body.timezone !== undefined && !isBlank(req.body.timezone) && !isValidTimezone(req.body.timezone)) {
     errors.push('timezone must be a valid IANA timezone');
   }
+  if (req.body.contactEmail !== undefined && !isBlank(req.body.contactEmail) && !isLikelyEmail(req.body.contactEmail)) {
+    errors.push('contactEmail must be a valid email');
+  }
+  if (req.body.caretakerEmail !== undefined && !isBlank(req.body.caretakerEmail) && !isLikelyEmail(req.body.caretakerEmail)) {
+    errors.push('caretakerEmail must be a valid email');
+  }
+  return errors;
+};
+
+const validateFacilityQrResolve = (req) => {
+  const errors = [];
+  const token = req.body?.token || req.body?.rawQrValue || req.query?.t;
+  if (isBlank(token)) errors.push('QR token is required');
   return errors;
 };
 
@@ -87,6 +140,9 @@ const validateUnitCreate = (req) => {
   if (isBlank(req.body.facilityId)) errors.push('facilityId is required');
   if (isBlank(req.body.toiletBlockId)) errors.push('toiletBlockId is required');
   if (isBlank(req.body.unitType)) errors.push('unitType is required');
+  if (req.body.latitude === undefined || req.body.longitude === undefined) {
+    errors.push('latitude and longitude are required');
+  }
   if (req.body.latitude !== undefined && Number.isNaN(Number(req.body.latitude))) {
     errors.push('latitude must be a valid number');
   }
@@ -151,6 +207,7 @@ module.exports = {
   validateTenantCreate,
   validateGeographyCreate,
   validateFacilityCreate,
+  validateFacilityQrResolve,
   validateBlockCreate,
   validateUnitCreate,
   validateUnitBulkCreate,

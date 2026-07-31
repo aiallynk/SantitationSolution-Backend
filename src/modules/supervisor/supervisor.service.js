@@ -22,7 +22,7 @@ const {
 } = require('../../models');
 const AppError = require('../../core/errors/AppError');
 const { runtimeConfig } = require('../../config/runtime');
-const { normalizePagination, sanitizeText } = require('../../utils/validators');
+const { normalizePagination, sanitizeText, isBlank } = require('../../utils/validators');
 const { resolveDateRange } = require('../../utils/dateRange');
 const { createAuditLog } = require('../audit/audit.service');
 const { resolveMediaUrl } = require('../media/mediaUrl.service');
@@ -1286,8 +1286,6 @@ const createWorker = async (req) => {
   const fullName = sanitizeText(req.body.fullName, 180);
   const email = String(req.body.email || '').trim().toLowerCase();
   const mobileNumber = String(req.body.mobileNumber || '').trim();
-  const password = String(req.body.password || '');
-  const confirmPassword = String(req.body.confirmPassword || '');
   const address = sanitizeText(req.body.address, 300);
   const gender = sanitizeText(req.body.gender, 40);
 
@@ -1298,11 +1296,6 @@ const createWorker = async (req) => {
     errors.push('email must be a valid email address');
   }
   if (isBlank(mobileNumber)) errors.push('mobileNumber is required');
-  if (isBlank(password)) errors.push('password is required');
-  if (isBlank(confirmPassword)) errors.push('confirmPassword is required');
-  if (!isBlank(password) && !isBlank(confirmPassword) && password !== confirmPassword) {
-    errors.push('confirmPassword must match password');
-  }
   if (isBlank(address)) errors.push('address is required');
   if (isBlank(gender)) errors.push('gender is required');
   if (errors.length > 0) {
@@ -1359,9 +1352,13 @@ const createWorker = async (req) => {
         })
       : [];
   const validFacilityIds = new Set(facilityRows.map((row) => String(row.id || '').trim()).filter(Boolean));
-  let facilityId = firstScopedId(
-    facilityCandidates.filter((candidateId) => validFacilityIds.has(String(candidateId || '').trim()))
-  );
+  const requestedFacilityId = String(req.body.facilityId || '').trim();
+  let facilityId =
+    requestedFacilityId && validFacilityIds.has(requestedFacilityId)
+      ? requestedFacilityId
+      : firstScopedId(
+          facilityCandidates.filter((candidateId) => validFacilityIds.has(String(candidateId || '').trim()))
+        );
   const selectedFacility =
     facilityId
       ? facilityRows.find((row) => String(row.id || '').trim() === String(facilityId || '').trim()) || null
@@ -1489,7 +1486,6 @@ const createWorker = async (req) => {
     fullName,
     email,
     phone: mobileNumber,
-    password,
     roleCodes: [ROLE_CODES.FIELD_WORKER],
     supervisorUserId: req.user.id,
     status: 'active',
@@ -1531,6 +1527,8 @@ const createWorker = async (req) => {
     gender: worker.metadata?.gender || gender,
     role: 'WORKER',
     status: worker.status || 'active',
+    mustChangePassword: Boolean(worker.mustChangePassword),
+    temporaryPassword: worker.temporaryPassword || null,
   };
 };
 

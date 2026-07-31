@@ -1,4 +1,3 @@
-const bcrypt = require('bcrypt');
 const { Op } = require('sequelize');
 const AppError = require('../../core/errors/AppError');
 const {
@@ -9,12 +8,14 @@ const {
   UserRole,
   Tenant,
   Geography,
+  TenantGeographyAssignment,
   Facility,
   ToiletUnit,
   WorkerAssignment,
 } = require('../../models');
 const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { createAuditLog } = require('../audit/audit.service');
+const { resolveOrCreateTenantGeographyFromGlobal } = require('../geography-master/activation.service');
 const { assertRoleScopeRequirements } = require('../../core/rbac/roleScopeRules');
 const {
   getPersonaFamily,
@@ -27,11 +28,22 @@ const {
   uniqueNormalizedRoleCodes,
 } = require('../../core/rbac/roleDelegationRules');
 const {
+  assertPersonaLocationScope,
+  getPersonaScopeLevel,
+  normalizePersonaLocationNames,
+} = require('../../core/rbac/personaLocationScope');
+const {
   buildAccessContextFromUser,
   applyScopeToQuery,
+  uniqueIds,
   isGeographyInScope,
   isFacilityInScope,
 } = require('../../core/rbac/scopeWhere');
+const {
+  generateTemporaryPassword,
+  hashPassword,
+  assertPasswordPolicy,
+} = require('../auth/passwordLifecycle.service');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
 const SUPERVISOR_ROLE_CODES = new Set([ROLE_CODES.SUPERVISOR]);
@@ -44,8 +56,8 @@ const TENANT_SCOPE_FIELD_MAP = {
   country: ['countryName'],
   state: ['countryName', 'stateName'],
   district: ['countryName', 'stateName', 'districtName'],
-  city: ['countryName', 'stateName', 'cityName'],
-  zone: ['countryName', 'stateName', 'cityName', 'zoneName'],
+  city: ['countryName', 'stateName', 'districtName', 'cityName'],
+  zone: ['countryName', 'stateName', 'districtName', 'cityName', 'zoneName'],
 };
 const LOCATION_NAME_KEYS = [
   'countryName',
@@ -123,6 +135,57 @@ const isSupervisorRole = (roleCodes = []) =>
   (Array.isArray(roleCodes) ? roleCodes : []).some(
     (roleCode) => normalizeRoleCode(roleCode) === ROLE_CODES.SUPERVISOR,
   );
+
+const actorRoleCodesFromRequest = (req = {}) =>
+  uniqueNormalizedRoleCodes([
+    ...(Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : []),
+    ...(Array.isArray(req.user?.allRoleCodes) ? req.user.allRoleCodes : []),
+    req.user?.role,
+  ]).map((roleCode) => normalizeRoleCode(roleCode));
+
+const isDistrictAdminFieldWorkerContext = ({ req, roleCodes = [] }) => {
+  if (req.user?.isSuperAdmin) return false;
+  if (!isWorkerRole(roleCodes)) return false;
+  const actorRoleCodes = actorRoleCodesFromRequest(req);
+  return (
+    String(req.user?.scopeLevel || '').trim().toLowerCase() === 'district' ||
+    actorRoleCodes.includes(ROLE_CODES.DISTRICT_ADMIN)
+  );
+};
+
+const assertDistrictAdminFieldWorkerPayload = ({ req, roleCodes = [], body = {}, phase = 'user' }) => {
+  if (!isDistrictAdminFieldWorkerContext({ req, roleCodes })) return;
+
+  if (body.geographyId) {
+    throw new AppError('District Admin field worker must not submit geography scope', 400, {
+      code: 'ROLE_SCOPE_VALIDATION_FAILED',
+      details: { phase, field: 'geographyId' },
+    });
+  }
+  if (String(body.cityName || '').trim()) {
+    throw new AppError('District Admin field worker must not submit city scope', 400, {
+      code: 'ROLE_SCOPE_VALIDATION_FAILED',
+      details: { phase, field: 'cityName' },
+    });
+  }
+  if (String(body.zoneName || '').trim()) {
+    throw new AppError('District Admin field worker must not submit zone scope', 400, {
+      code: 'ROLE_SCOPE_VALIDATION_FAILED',
+      details: { phase, field: 'zoneName' },
+    });
+  }
+  if (Array.isArray(body.assignments)) {
+    for (const assignment of body.assignments) {
+      if (!assignment || typeof assignment !== 'object') continue;
+      if (assignment.geographyId || assignment.toiletUnitId) {
+        throw new AppError('District Admin field worker must stay facility-scoped', 400, {
+          code: 'ROLE_SCOPE_VALIDATION_FAILED',
+          details: { phase, field: 'assignments' },
+        });
+      }
+    }
+  }
+};
 
 const LOCATION_LEVEL_TO_FIELD = {
   country: 'countryName',
@@ -378,6 +441,7 @@ const toPayload = (user, assignmentsByUserId = new Map()) => {
     zoneName: user.zone_name || null,
     wardName: user.ward_name || null,
     status: user.status,
+    mustChangePassword: Boolean(user.must_change_password),
     lastLoginAt: user.last_login_at,
     createdAt: user.created_at,
     updatedAt: user.updated_at,
@@ -482,12 +546,64 @@ const ensureGeographyScope = async ({ geographyId, tenantId, transaction }) => {
   if (!geographyId) return null;
   assertUuidInput(geographyId, 'geographyId');
   const geography = await Geography.findByPk(geographyId, { transaction });
-  if (!geography || geography.tenant_id !== tenantId) {
+  if (!geography || geography.is_active === false) {
     throw new AppError('geographyId is outside tenant scope', 400, {
       code: 'GEOGRAPHY_SCOPE_INVALID',
     });
   }
-  return geography;
+  if (geography.tenant_id === tenantId) return geography;
+  if (geography.tenant_id !== null) {
+    throw new AppError('geographyId is outside tenant scope', 400, {
+      code: 'GEOGRAPHY_SCOPE_INVALID',
+    });
+  }
+  const [assignment, tenant] = await Promise.all([
+    TenantGeographyAssignment.findOne({
+      where: { tenant_id: tenantId, geography_id: geography.id, is_enabled: true },
+      transaction,
+    }),
+    Tenant.findByPk(tenantId, { attributes: ['root_geography_id'], transaction }),
+  ]);
+  if (assignment) return geography;
+  let cursorId = geography.id;
+  let guard = 0;
+  while (cursorId && guard < 12) {
+    if (String(cursorId) === String(tenant?.root_geography_id || '')) return geography;
+    const cursor = await Geography.findByPk(cursorId, { attributes: ['parent_id'], transaction });
+    cursorId = cursor?.parent_id || null;
+    guard += 1;
+  }
+  throw new AppError('geographyId is outside tenant scope', 400, {
+    code: 'GEOGRAPHY_SCOPE_INVALID',
+  });
+};
+
+const isGeographyInLiveScope = async (req, geography, { transaction = null } = {}) => {
+  if (!geography) return true;
+  if (req.user?.isSuperAdmin) return true;
+  if (isGeographyInScope(req, geography.id)) return true;
+
+  const scopedGeographyIds = uniqueIds(req.user?.scopeGeographyIds || []);
+  if (scopedGeographyIds.length === 0) {
+    return req.user?.scopeLevel === 'organization' || req.user?.scopeLevel === 'facility';
+  }
+
+  const scopedSet = new Set(scopedGeographyIds.map(String));
+  if (geography.global_geography_id && scopedSet.has(String(geography.global_geography_id))) return true;
+  let cursorId = geography.parent_id || null;
+  let guard = 0;
+  while (cursorId && guard < 12) {
+    if (scopedSet.has(String(cursorId))) return true;
+    const parent = await Geography.findByPk(cursorId, {
+      attributes: ['id', 'parent_id', 'global_geography_id', 'master_geography_id'],
+      transaction,
+    });
+    if (!parent) break;
+    if ([parent.global_geography_id, parent.master_geography_id].filter(Boolean).some((id) => scopedSet.has(String(id)))) return true;
+    cursorId = parent.parent_id || null;
+    guard += 1;
+  }
+  return false;
 };
 
 const resolveImplicitGeographyScope = async ({ geographyId, tenantId, transaction }) => {
@@ -559,7 +675,12 @@ const resolveDerivedLocationNames = async ({
     ? await resolveLocationNamesFromGeography({ geographyId, transaction })
     : {};
   const tenantLocationNames = resolveTenantDefaultLocationNames(tenant);
-  return mergeLocationNames(bodyLocationNames, geographyLocationNames, tenantLocationNames);
+  const resolved = mergeLocationNames(
+    geographyLocationNames,
+    bodyLocationNames,
+    tenantLocationNames,
+  );
+  return resolved;
 };
 
 const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
@@ -567,7 +688,9 @@ const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
 
   const tenantLocationNames = resolveTenantDefaultLocationNames(tenant);
   const effectiveLocationNames = mergeLocationNames(locationNames, tenantLocationNames);
-  for (const key of LOCATION_NAME_KEYS) {
+  const scopeLevel = String(tenant.scope_level || '').trim().toLowerCase();
+  const requiredFields = TENANT_SCOPE_FIELD_MAP[scopeLevel] || [];
+  for (const key of requiredFields) {
     const tenantValue = tenantLocationNames[key];
     const userValue = effectiveLocationNames[key];
     if (!tenantValue || !userValue) continue;
@@ -578,8 +701,6 @@ const assertTenantLocationCompatibility = ({ tenant, locationNames = {} }) => {
     }
   }
 
-  const scopeLevel = String(tenant.scope_level || '').trim().toLowerCase();
-  const requiredFields = TENANT_SCOPE_FIELD_MAP[scopeLevel] || [];
   const hasCompleteTenantBaseline =
     requiredFields.length === 0 ||
     requiredFields.every((field) => Boolean(String(tenantLocationNames[field] || '').trim()));
@@ -853,6 +974,13 @@ const normalizeAssignments = ({
   const workerRole = isWorkerRole(roleCodes);
   const supervisorRole = isSupervisorRole(roleCodes);
 
+  // Geography admin scope is carried by platform_users/user_roles. Avoid a
+  // duplicate worker_assignment row, especially when the named hierarchy was
+  // created during this request and is not yet present in the actor's token.
+  if (getPersonaScopeLevel(roleCodes)) {
+    return [];
+  }
+
   if (tenantId && geographyId) {
     return [
       {
@@ -916,7 +1044,7 @@ const replaceAssignments = async ({
       transaction,
     });
 
-    if (geography && !isGeographyInScope(req, geography.id)) {
+    if (geography && !(await isGeographyInLiveScope(req, geography, { transaction }))) {
       throw new AppError('assignment geography is outside actor scope', 403, {
         code: 'SCOPE_FORBIDDEN',
       });
@@ -955,6 +1083,16 @@ const replaceAssignments = async ({
       facility,
       toiletUnit,
     });
+    if (
+      geography &&
+      GEOGRAPHY_LIKE_ASSIGNMENT_LEVELS.has(inferredLevel) &&
+      inferredLevel !== 'geography' &&
+      String(geography.level || '').trim().toLowerCase() !== inferredLevel
+    ) {
+      throw new AppError(`assignment geography must be a ${inferredLevel}`, 400, {
+        code: 'ASSIGNMENT_GEOGRAPHY_LEVEL_INVALID',
+      });
+    }
 
     rows.push({
       tenant_id: tenantId,
@@ -1070,101 +1208,161 @@ const createUser = async (req) => {
     requestedTenantId,
     roleCodes,
   });
+  assertDistrictAdminFieldWorkerPayload({ req, roleCodes, body: req.body, phase: 'create' });
+  const requestedGlobalGeographyId = req.body.globalGeographyId || null;
+  const preActivatedTenantGeography = requestedGlobalGeographyId
+    ? await resolveOrCreateTenantGeographyFromGlobal({
+        tenantId,
+        globalGeographyId: requestedGlobalGeographyId,
+        createdBy: req.user.id,
+        actor: req.user,
+      })
+    : null;
 
-  return sequelize.transaction(async (transaction) => {
-    await resolveRoles(roleCodes, { transaction });
-    const tenant = await ensureTenantExists(tenantId, { transaction });
-    const requestedGeographyId = req.body.geographyId || null;
-    const fallbackTenantGeographyId = tenant?.root_geography_id || null;
-    const geographyId =
-      requestedGeographyId ||
-      (tenantId && hasTenantRole(roleCodes) ? fallbackTenantGeographyId : null);
+  let auditLogPayload = null;
+  const response = await sequelize.transaction(async (transaction) => {
+    let stage = 'resolve_roles';
+    try {
+      await resolveRoles(roleCodes, { transaction });
+      stage = 'load_tenant';
+      const tenant = await ensureTenantExists(tenantId, { transaction });
+      const personaScopeLevel = getPersonaScopeLevel(roleCodes);
+      stage = 'resolve_requested_geography';
+      const requestedGeographyId = preActivatedTenantGeography?.id || req.body.geographyId || null;
+      const fallbackTenantGeographyId = tenant?.root_geography_id || null;
+      const enforceFacilityOnlyWorker = isDistrictAdminFieldWorkerContext({ req, roleCodes });
+      const geographyId =
+        (enforceFacilityOnlyWorker ? null : requestedGeographyId) ||
+        (tenantId && hasTenantRole(roleCodes) ? fallbackTenantGeographyId : null);
 
-    const resolvedGeography = requestedGeographyId
-      ? await ensureGeographyScope({
-          geographyId: requestedGeographyId,
-          tenantId,
-          transaction,
-        })
-      : await resolveImplicitGeographyScope({
-          geographyId,
-          tenantId,
-          transaction,
+      if (personaScopeLevel && !requestedGeographyId) {
+        throw new AppError(`geographyId is required for ${personaScopeLevel} admin`, 400, {
+          code: 'GEOGRAPHY_REQUIRED',
         });
-    if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
-      throw new AppError('geographyId is outside actor scope', 403, {
-        code: 'SCOPE_FORBIDDEN',
+      }
+
+      stage = 'validate_geography_scope';
+      const resolvedGeography = requestedGeographyId
+        ? await ensureGeographyScope({ geographyId: requestedGeographyId, tenantId, transaction })
+        : await resolveImplicitGeographyScope({ geographyId, tenantId, transaction });
+      if (personaScopeLevel && resolvedGeography?.level !== personaScopeLevel) {
+        throw new AppError(`${personaScopeLevel} admin must use a ${personaScopeLevel} geography`, 400, {
+          code: 'GEOGRAPHY_LEVEL_INVALID',
+        });
+      }
+      if (
+        resolvedGeography &&
+        (!personaScopeLevel || requestedGeographyId) &&
+        !(await isGeographyInLiveScope(req, resolvedGeography, { transaction }))
+      ) {
+        throw new AppError('geographyId is outside actor scope', 403, {
+          code: 'SCOPE_FORBIDDEN',
+        });
+      }
+
+      const normalizedEmail = String(req.body.email).trim().toLowerCase();
+      const normalizedPhone = normalizePhone(req.body.phone);
+      const normalizedEmployeeCode = req.body.employeeCode
+        ? sanitizeText(req.body.employeeCode, 64)
+        : null;
+
+      stage = 'resolve_user_code';
+      const userIdCode = await resolveUniqueUserIdCode({
+        providedUserIdCode: req.body.userId || req.body.userIdCode || null,
+        tenantCode: tenant?.code || null,
+        fullName: req.body.fullName,
+        transaction,
       });
-    }
 
-    const normalizedEmail = String(req.body.email).trim().toLowerCase();
-    const normalizedPhone = normalizePhone(req.body.phone);
-    const normalizedEmployeeCode = req.body.employeeCode
-      ? sanitizeText(req.body.employeeCode, 64)
-      : null;
-    const userIdCode = await resolveUniqueUserIdCode({
-      providedUserIdCode: req.body.userId || req.body.userIdCode || null,
-      tenantCode: tenant?.code || null,
-      fullName: req.body.fullName,
-      transaction,
-    });
-
-    await ensureUniqueUserFields({
-      email: normalizedEmail,
-      phone: normalizedPhone,
-      userIdCode,
-      employeeCode: normalizedEmployeeCode,
-      tenantId,
-      transaction,
-    });
-
-    const resolvedLocationNames = await resolveDerivedLocationNames({
-      tenant,
-      geographyId: resolvedGeography?.id || null,
-      body: req.body,
-      transaction,
-    });
-    assertTenantLocationCompatibility({
-      tenant,
-      locationNames: resolvedLocationNames,
-    });
-
-    const explicitSupervisorUserId = req.body.supervisorUserId || null;
-    if (isWorkerRole(roleCodes) && tenantId && !explicitSupervisorUserId) {
-      throw new AppError('supervisorUserId is required for worker role', 400, {
-        code: 'SUPERVISOR_REQUIRED',
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(req.body.password, 10);
-    const user = await PlatformUser.create(
-      {
-        tenant_id: tenantId,
-        geography_id: resolvedGeography?.id || null,
-        full_name: sanitizeText(req.body.fullName, 180),
+      stage = 'ensure_unique_fields';
+      await ensureUniqueUserFields({
         email: normalizedEmail,
         phone: normalizedPhone,
-        employee_code: normalizedEmployeeCode,
-        user_id_code: userIdCode,
-        remarks: req.body.remarks ? sanitizeText(req.body.remarks, 500) : null,
-        country_name: resolvedLocationNames.countryName,
-        state_name: resolvedLocationNames.stateName,
-        district_name: resolvedLocationNames.districtName,
-        city_name: resolvedLocationNames.cityName,
-        zone_name: resolvedLocationNames.zoneName,
-        ward_name: resolvedLocationNames.wardName,
-        password_hash: passwordHash,
-        auth_provider: 'local',
-        status: toStatus(req.body.status),
-        metadata: req.body.metadata || null,
-      },
-      { transaction }
-    );
+        userIdCode,
+        employeeCode: normalizedEmployeeCode,
+        tenantId,
+        transaction,
+      });
 
-    const roles = await resolveRoles(roleCodes, { transaction });
-    await Promise.all(
-      roles.map((role) =>
-        UserRole.create(
+      stage = 'resolve_location_names';
+      const derivedLocationNames = await resolveDerivedLocationNames({
+        tenant,
+        geographyId: resolvedGeography?.id || null,
+        body: req.body,
+        transaction,
+      });
+      const resolvedLocationNames = normalizePersonaLocationNames({
+        roleCodes,
+        locationNames: derivedLocationNames,
+      });
+      assertPersonaLocationScope({
+        actor: req.user,
+        targetRoleCodes: roleCodes,
+        locationNames: resolvedLocationNames,
+        geographyLevel: resolvedGeography?.level || null,
+      });
+      if (!getPersonaScopeLevel(roleCodes)) {
+        assertTenantLocationCompatibility({
+          tenant,
+          locationNames: resolvedLocationNames,
+        });
+      }
+
+      const explicitSupervisorUserId = req.body.supervisorUserId || null;
+      if (isWorkerRole(roleCodes) && tenantId && !explicitSupervisorUserId) {
+        throw new AppError('supervisorUserId is required for worker role', 400, {
+          code: 'SUPERVISOR_REQUIRED',
+        });
+      }
+
+      const workerRole = isWorkerRole(roleCodes);
+      let temporaryPassword = null;
+      let passwordHash = null;
+      let status = toStatus(req.body.status);
+      let mustChangePassword = false;
+
+      stage = 'prepare_password';
+      if (workerRole) {
+        temporaryPassword = generateTemporaryPassword();
+        passwordHash = await hashPassword(temporaryPassword);
+        status = 'active';
+        mustChangePassword = true;
+      } else {
+        assertPasswordPolicy({ password: req.body.password });
+        passwordHash = await hashPassword(req.body.password);
+      }
+
+      stage = 'create_platform_user';
+      const user = await PlatformUser.create(
+        {
+          tenant_id: tenantId,
+          geography_id: resolvedGeography?.id || null,
+          full_name: sanitizeText(req.body.fullName, 180),
+          email: normalizedEmail,
+          phone: normalizedPhone,
+          employee_code: normalizedEmployeeCode,
+          user_id_code: userIdCode,
+          remarks: req.body.remarks ? sanitizeText(req.body.remarks, 500) : null,
+          country_name: resolvedLocationNames.countryName,
+          state_name: resolvedLocationNames.stateName,
+          district_name: resolvedLocationNames.districtName,
+          city_name: resolvedLocationNames.cityName,
+          zone_name: getPersonaScopeLevel(roleCodes) ? null : derivedLocationNames.zoneName,
+          ward_name: getPersonaScopeLevel(roleCodes) ? null : resolvedLocationNames.wardName,
+          password_hash: passwordHash,
+          auth_provider: 'local',
+          status,
+          must_change_password: mustChangePassword,
+          metadata: req.body.metadata || null,
+        },
+        { transaction }
+      );
+
+      stage = 'load_roles_for_membership';
+      const roles = await resolveRoles(roleCodes, { transaction });
+      stage = 'create_user_roles';
+      for (const role of roles) {
+        await UserRole.create(
           {
             user_id: user.id,
             role_id: role.id,
@@ -1172,58 +1370,84 @@ const createUser = async (req) => {
             geography_id: resolvedGeography?.id || null,
           },
           { transaction }
-        )
-      )
-    );
+        );
+      }
 
-    const assignments = normalizeAssignments({
-      req,
-      roleCodes,
-      tenantId,
-      bodyAssignments: req.body.assignments,
-      geographyId: resolvedGeography?.id || null,
-      supervisorUserId: explicitSupervisorUserId,
-    });
-    assertRoleScopeRequirements({
-      roleCodes,
-      geographyId: resolvedGeography?.id || null,
-      assignments,
-    });
+      const assignments = normalizeAssignments({
+        req,
+        roleCodes,
+        tenantId,
+        bodyAssignments: req.body.assignments,
+        geographyId: resolvedGeography?.id || null,
+        supervisorUserId: explicitSupervisorUserId,
+      });
+      assertRoleScopeRequirements({
+        roleCodes,
+        geographyId: resolvedGeography?.id || null,
+        assignments,
+      });
 
-    await replaceAssignments({
-      req,
-      user,
-      tenantId,
-      roleCodes,
-      assignments,
-      actorUserId: req.user.id,
-      transaction,
-    });
+      stage = 'replace_assignments';
+      await replaceAssignments({
+        req,
+        user,
+        tenantId,
+        roleCodes,
+        assignments,
+        actorUserId: req.user.id,
+        transaction,
+      });
 
-    const payload = await PlatformUser.findByPk(user.id, {
-      include: buildUserInclude(),
-      transaction,
-    });
+      stage = 'reload_created_user';
+      const payload = await PlatformUser.findByPk(user.id, {
+        include: buildUserInclude(),
+        transaction,
+      });
 
-    const assignmentsByUserId = await getAssignmentsByUserIds([user.id], {
-      transaction,
-    });
+      stage = 'load_created_assignments';
+      const assignmentsByUserId = await getAssignmentsByUserIds([user.id], {
+        transaction,
+      });
 
+      auditLogPayload = {
+        userId: user.id,
+        tenantId: user.tenant_id,
+        userIdCode,
+        assignmentCount: assignments.length,
+      };
+
+      const nextResponse = toPayload(payload, assignmentsByUserId);
+      if (temporaryPassword) {
+        nextResponse.temporaryPassword = temporaryPassword;
+      }
+      return nextResponse;
+    } catch (error) {
+      if (error && !error.isOperational) {
+        error.details = {
+          ...(error.details || {}),
+          createUserStage: stage,
+        };
+      }
+      throw error;
+    }
+  });
+
+  if (auditLogPayload) {
     await createAuditLog({
       req,
       action: 'users.create',
       entityType: 'platform_user',
-      entityId: user.id,
-      tenantId: user.tenant_id,
+      entityId: auditLogPayload.userId,
+      tenantId: auditLogPayload.tenantId,
       details: {
         roleCodes,
-        assignmentCount: assignments.length,
-        userIdCode,
+        assignmentCount: auditLogPayload.assignmentCount,
+        userIdCode: auditLogPayload.userIdCode,
       },
     });
+  }
 
-    return toPayload(payload, assignmentsByUserId);
-  });
+  return response;
 };
 
 const patchUser = async (req) => {
@@ -1251,6 +1475,18 @@ const patchUser = async (req) => {
 
   return sequelize.transaction(async (transaction) => {
     const tenant = await ensureTenantExists(nextTenantId, { transaction });
+    const existingRoleCodes = unique((user.Roles || []).map((role) => role.code));
+    const prospectiveRoleCodes =
+      Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0
+        ? normalizeRoleCodes(req.body.roleCodes)
+        : existingRoleCodes;
+    assertDistrictAdminFieldWorkerPayload({
+      req,
+      roleCodes: prospectiveRoleCodes,
+      body: req.body,
+      phase: 'patch',
+    });
+    const personaScopeLevel = getPersonaScopeLevel(prospectiveRoleCodes);
     const hasExplicitGeographyInput = req.body.geographyId !== undefined;
     const requestedGeographyId =
       hasExplicitGeographyInput ? req.body.geographyId || null : user.geography_id;
@@ -1259,18 +1495,28 @@ const patchUser = async (req) => {
       (nextTenantId && hasTenantRole(unique((user.Roles || []).map((role) => role.code)))
         ? tenant?.root_geography_id || null
         : null);
+    if (
+      personaScopeLevel &&
+      !requestedGeographyId &&
+      (hasExplicitGeographyInput || Array.isArray(req.body.roleCodes))
+    ) {
+      throw new AppError(`geographyId is required for ${personaScopeLevel} admin`, 400, {
+        code: 'GEOGRAPHY_REQUIRED',
+      });
+    }
     const resolvedGeography = hasExplicitGeographyInput
-      ? await ensureGeographyScope({
-          geographyId: requestedGeographyId,
-          tenantId: nextTenantId,
-          transaction,
-        })
-      : await resolveImplicitGeographyScope({
-          geographyId,
-          tenantId: nextTenantId,
-          transaction,
-        });
-    if (resolvedGeography && !isGeographyInScope(req, resolvedGeography.id)) {
+      ? await ensureGeographyScope({ geographyId: requestedGeographyId, tenantId: nextTenantId, transaction })
+      : await resolveImplicitGeographyScope({ geographyId, tenantId: nextTenantId, transaction });
+    if (personaScopeLevel && resolvedGeography && resolvedGeography.level !== personaScopeLevel) {
+      throw new AppError(`${personaScopeLevel} admin must use a ${personaScopeLevel} geography`, 400, {
+        code: 'GEOGRAPHY_LEVEL_INVALID',
+      });
+    }
+    if (
+      resolvedGeography &&
+      (!personaScopeLevel || requestedGeographyId) &&
+      !(await isGeographyInLiveScope(req, resolvedGeography, { transaction }))
+    ) {
       throw new AppError('geographyId is outside actor scope', 403, {
         code: 'SCOPE_FORBIDDEN',
       });
@@ -1284,7 +1530,9 @@ const patchUser = async (req) => {
     if (req.body.phone !== undefined) updates.phone = normalizePhone(req.body.phone);
     if (req.body.status) updates.status = toStatus(req.body.status, user.status);
     if (req.body.password) {
-      updates.password_hash = await bcrypt.hash(req.body.password, 10);
+      assertPasswordPolicy({ password: req.body.password });
+      updates.password_hash = await hashPassword(req.body.password);
+      updates.must_change_password = false;
     }
     if (req.body.employeeCode !== undefined) {
       updates.employee_code = req.body.employeeCode
@@ -1306,7 +1554,7 @@ const patchUser = async (req) => {
     if (req.body.metadata !== undefined) {
       updates.metadata = req.body.metadata;
     }
-    if (req.body.geographyId !== undefined) {
+    if (req.body.geographyId !== undefined || req.body.roleCodes !== undefined) {
       updates.geography_id = resolvedGeography?.id || null;
     }
     if (req.user.isSuperAdmin && req.body.tenantId !== undefined) {
@@ -1333,24 +1581,41 @@ const patchUser = async (req) => {
     const shouldRefreshLocation =
       req.body.tenantId !== undefined ||
       req.body.geographyId !== undefined ||
+      req.body.roleCodes !== undefined ||
       LOCATION_NAME_KEYS.some((key) => req.body[key] !== undefined);
     if (shouldRefreshLocation) {
-      const resolvedLocationNames = await resolveDerivedLocationNames({
+      const derivedLocationNames = await resolveDerivedLocationNames({
         tenant,
         geographyId: resolvedGeography?.id || null,
         body: req.body,
         transaction,
       });
-      assertTenantLocationCompatibility({
-        tenant,
-        locationNames: resolvedLocationNames,
+      const resolvedLocationNames = normalizePersonaLocationNames({
+        roleCodes: prospectiveRoleCodes,
+        locationNames: derivedLocationNames,
       });
+      assertPersonaLocationScope({
+        actor: req.user,
+        targetRoleCodes: prospectiveRoleCodes,
+        locationNames: resolvedLocationNames,
+        geographyLevel: resolvedGeography?.level || null,
+      });
+      if (!getPersonaScopeLevel(prospectiveRoleCodes)) {
+        assertTenantLocationCompatibility({
+          tenant,
+          locationNames: resolvedLocationNames,
+        });
+      }
       updates.country_name = resolvedLocationNames.countryName;
       updates.state_name = resolvedLocationNames.stateName;
       updates.district_name = resolvedLocationNames.districtName;
       updates.city_name = resolvedLocationNames.cityName;
-      updates.zone_name = resolvedLocationNames.zoneName;
-      updates.ward_name = resolvedLocationNames.wardName;
+      updates.zone_name = getPersonaScopeLevel(prospectiveRoleCodes)
+        ? null
+        : derivedLocationNames.zoneName;
+      updates.ward_name = getPersonaScopeLevel(prospectiveRoleCodes)
+        ? null
+        : resolvedLocationNames.wardName;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -1361,9 +1626,8 @@ const patchUser = async (req) => {
       ? updates.geography_id
       : user.geography_id;
 
-    let roleCodes = unique((user.Roles || []).map((role) => role.code));
+    let roleCodes = prospectiveRoleCodes;
     if (Array.isArray(req.body.roleCodes) && req.body.roleCodes.length > 0) {
-      roleCodes = normalizeRoleCodes(req.body.roleCodes);
       assertSupportedUserRoleCodes(roleCodes);
       if (!req.user.isSuperAdmin && hasGlobalRole(roleCodes)) {
         throw new AppError('Only super admin can assign platform roles', 403, {

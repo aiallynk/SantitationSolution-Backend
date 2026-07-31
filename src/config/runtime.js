@@ -182,8 +182,16 @@ const runtimeConfig = Object.freeze({
     gracefulShutdownTimeoutMs: asNumber(rawEnv.GRACEFUL_SHUTDOWN_TIMEOUT_MS, 25_000, {
       min: 5_000,
     }),
-    dbStartupMaxAttempts: defaults.server.dbStartupMaxAttempts,
-    dbStartupRetryDelayMs: defaults.server.dbStartupRetryDelayMs,
+    dbStartupMaxAttempts: asNumber(
+      rawEnv.DB_STARTUP_MAX_ATTEMPTS,
+      defaults.server.dbStartupMaxAttempts,
+      { min: 1, max: 20 }
+    ),
+    dbStartupRetryDelayMs: asNumber(
+      rawEnv.DB_STARTUP_RETRY_DELAY_MS,
+      defaults.server.dbStartupRetryDelayMs,
+      { min: 500, max: 60_000 }
+    ),
     autoRunMigrations,
     autoRunMigrationsStrict,
     autoBackfillToiletQrOnBoot: defaults.server.autoBackfillToiletQrOnBoot,
@@ -277,6 +285,7 @@ const runtimeConfig = Object.freeze({
     schedulerIntervalMs: asNumber(rawEnv.BACKUP_SCHEDULER_INTERVAL_MS, 30_000, { min: 10_000 }),
     defaultRetentionDays: asNumber(rawEnv.BACKUP_RETENTION_DAYS, 7, { min: 1, max: 365 }),
     exportPageSize: asNumber(rawEnv.BACKUP_EXPORT_PAGE_SIZE, 1000, { min: 100, max: 5000 }),
+    staleActiveJobMs: asNumber(rawEnv.BACKUP_STALE_ACTIVE_JOB_MS, 2 * 60 * 60 * 1000, { min: 5 * 60 * 1000 }),
   },
   redis: {
     enabled: asBool(rawEnv.REDIS_ENABLED, false),

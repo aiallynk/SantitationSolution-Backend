@@ -12,6 +12,7 @@ const buildTokenPayload = (user, options = {}) => ({
   sub: user.id,
   tenantId: options.tenantId ?? user.tenant_id ?? null,
   geographyId: options.geographyId ?? user.geography_id ?? null,
+  ...(options.sessionMode ? { sessionMode: options.sessionMode } : {}),
 });
 
 const signAccessToken = (user, options = {}) =>

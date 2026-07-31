@@ -4,6 +4,7 @@ const {
   protect,
   requirePermissions,
   requireAnyPermissions,
+  requireNotRoles,
   requireAction,
   requireRouteKey,
   requireScope,
@@ -14,6 +15,7 @@ const {
   validateTenantCreate,
   validateGeographyCreate,
   validateFacilityCreate,
+  validateFacilityQrResolve,
   validateBlockCreate,
   validateUnitCreate,
   validateUnitBulkCreate,
@@ -30,6 +32,8 @@ const router = express.Router();
 const PLATFORM_ROUTE_PREFIXES = [
   '/tenants',
   '/geographies',
+  '/global-geographies',
+  '/operational-master-data',
   '/facilities',
   '/toilet-blocks',
   '/toilet-units',
@@ -115,11 +119,87 @@ router.get(
   requirePermissions('dashboard.read'),
   platformController.getGeographyOptions
 );
+router.get(
+  '/global-geographies/options',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.getGlobalGeographyOptions
+);
+router.get(
+  '/global-geographies/sources',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.OPS_SETTINGS),
+  requireScope(COMMON_SCOPE_RULE),
+  requireAnyPermissions('dashboard.read', 'auth.read'),
+  platformController.getGlobalGeographyDataSources
+);
+router.post(
+  '/global-geographies/:id/activate',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('users.manage'),
+  platformController.postGlobalGeographyActivation
+);
+router.get(
+  '/geographies/import-jobs',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(RouteKeys.SA_TENANTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.getGeographyImportJobs
+);
+router.post(
+  '/geographies/import-jobs',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(RouteKeys.SA_TENANTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('tenants.manage'),
+  requireAction('platform.manage'),
+  platformController.postGeographyImportJob
+);
+router.post(
+  '/geographies/request-missing-area',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.postRequestMissingArea
+);
+router.get(
+  '/geographies/migration-reviews',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(RouteKeys.SA_TENANTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.getGeographyMigrationReviews
+);
+router.patch(
+  '/geographies/migration-reviews/:id',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(RouteKeys.SA_TENANTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('tenants.manage'),
+  requireAction('platform.manage'),
+  platformController.patchGeographyMigrationReview
+);
+router.put(
+  '/tenants/:tenantId/geographies/:geographyId',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(RouteKeys.SA_TENANTS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('tenants.manage'),
+  requireAction('platform.manage'),
+  platformController.putTenantGeographyAssignment
+);
 router.post(
   '/geographies',
   requireSurface(...OPS_WEB_SURFACES),
   requireRouteKey(RouteKeys.OPS_ADMINOPS),
   requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
   requireAnyPermissions('tenants.manage', 'task.manage'),
   requireAction('hierarchy.manage'),
   validate(validateGeographyCreate),
@@ -130,6 +210,7 @@ router.patch(
   requireSurface(...OPS_WEB_SURFACES),
   requireRouteKey(RouteKeys.OPS_ADMINOPS),
   requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
   requireAnyPermissions('tenants.manage', 'task.manage'),
   requireAction('hierarchy.manage'),
   platformController.patchGeography
@@ -139,9 +220,56 @@ router.delete(
   requireSurface(...OPS_WEB_SURFACES),
   requireRouteKey(RouteKeys.OPS_ADMINOPS),
   requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
   requireAnyPermissions('tenants.manage', 'task.manage'),
   requireAction('hierarchy.manage'),
   platformController.deleteGeography
+);
+
+router.get(
+  '/operational-master-data',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.SA_PLATFORM_HEALTH),
+  requireScope(COMMON_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
+  requirePermissions('dashboard.read'),
+  platformController.getOperationalMasterData
+);
+router.post(
+  '/operational-master-data',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.SA_PLATFORM_HEALTH),
+  requireScope(COMMON_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
+  requireAnyPermissions('task.manage', 'tenants.manage'),
+  platformController.postOperationalMasterData
+);
+router.patch(
+  '/operational-master-data/:id',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.SA_PLATFORM_HEALTH),
+  requireScope(COMMON_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
+  requireAnyPermissions('task.manage', 'tenants.manage'),
+  platformController.patchOperationalMasterData
+);
+router.post(
+  '/operational-master-data/:id/activate',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.SA_PLATFORM_HEALTH),
+  requireScope(COMMON_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
+  requireAnyPermissions('task.manage', 'tenants.manage'),
+  platformController.postOperationalMasterDataActivate
+);
+router.post(
+  '/operational-master-data/:id/deactivate',
+  requireSurface(...OPS_AND_PLATFORM_WEB_SURFACES),
+  requireRouteKey(...ADMINOPS_ROUTE_KEYS, RouteKeys.SA_PLATFORM_HEALTH),
+  requireScope(COMMON_SCOPE_RULE),
+  requireNotRoles('tenant_admin', 'state_admin'),
+  requireAnyPermissions('task.manage', 'tenants.manage'),
+  platformController.postOperationalMasterDataDeactivate
 );
 
 router.get(
@@ -162,6 +290,15 @@ router.post(
   validate(validateFacilityCreate),
   platformController.postFacility
 );
+router.post(
+  '/facilities/resolve',
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS, ...TOILETS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requireAnyPermissions('dashboard.read', 'inspection.create'),
+  validate(validateFacilityQrResolve),
+  platformController.postFacilityQrResolve
+);
 router.get(
   '/facilities/:id',
   requireSurface(...OPS_AND_MOBILE_SURFACES),
@@ -169,6 +306,39 @@ router.get(
   requireScope(COMMON_SCOPE_RULE),
   requirePermissions('dashboard.read'),
   platformController.getFacilityById
+);
+router.get(
+  '/facilities/:id/qr',
+  requireSurface(...OPS_AND_MOBILE_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS, ...TOILETS_ROUTE_KEYS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.getFacilityQr
+);
+router.post(
+  '/facilities/:id/qr/download',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.postFacilityQrDownload
+);
+router.post(
+  '/facilities/:id/qr/print',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(COMMON_SCOPE_RULE),
+  requirePermissions('dashboard.read'),
+  platformController.postFacilityQrPrint
+);
+router.post(
+  '/facilities/:id/qr/regenerate',
+  requireSurface(...OPS_WEB_SURFACES),
+  requireRouteKey(RouteKeys.OPS_ADMINOPS),
+  requireScope(ADMIN_MANAGEMENT_SCOPE_RULE),
+  requirePermissions('task.manage'),
+  requireAction('facility.manage'),
+  platformController.postFacilityQrRegenerate
 );
 router.patch(
   '/facilities/:id',

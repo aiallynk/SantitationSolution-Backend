@@ -4,6 +4,7 @@ const {
   sequelize,
   Tenant,
   Geography,
+  TenantGeographyAssignment,
   PlatformUser,
   UserRole,
   Facility,
@@ -64,6 +65,143 @@ const assertTenantScopeLocationRequirements = ({ scopeLevel, locationNames = {} 
       );
     }
   }
+};
+
+const loadSelectedGeographyAncestry = async (geographyId, scopeLevel, transaction) => {
+  if (!geographyId) {
+    if (['country', 'state', 'district', 'city'].includes(scopeLevel)) {
+      throw new AppError('rootGeographyId is required for official tenant scopes', 400, {
+        code: 'ROOT_GEOGRAPHY_REQUIRED',
+      });
+    }
+    return [];
+  }
+  const ancestry = [];
+  const seen = new Set();
+  let currentId = geographyId;
+  while (currentId) {
+    if (seen.has(String(currentId))) {
+      throw new AppError('Geography hierarchy contains a cycle', 409);
+    }
+    seen.add(String(currentId));
+    const row = await Geography.findByPk(currentId, { transaction });
+    if (!row || row.is_active === false) {
+      throw new AppError('Selected geography is missing or inactive', 400);
+    }
+    ancestry.unshift(row);
+    currentId = row.parent_id || null;
+  }
+  if (ancestry[ancestry.length - 1]?.level !== scopeLevel) {
+    throw new AppError(`rootGeographyId must reference an active ${scopeLevel}`, 400);
+  }
+  return ancestry;
+};
+
+const toFiniteNumber = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseBounds = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const north = toFiniteNumber(value.north);
+  const south = toFiniteNumber(value.south);
+  const east = toFiniteNumber(value.east);
+  const west = toFiniteNumber(value.west);
+  if ([north, south, east, west].some((item) => item === null)) return null;
+  return { north, south, east, west };
+};
+
+const normalizeConfirmedMapSelection = (value = {}, { scopeLevel } = {}) => {
+  const latitude = toFiniteNumber(value.latitude ?? value.lat ?? value.centroidLatitude);
+  const longitude = toFiniteNumber(value.longitude ?? value.lng ?? value.centroidLongitude);
+  if (
+    latitude === null ||
+    longitude === null ||
+    latitude < -90 ||
+    latitude > 90 ||
+    longitude < -180 ||
+    longitude > 180
+  ) {
+    throw new AppError(`${scopeLevel || 'scope'} map location must be selected`, 400, {
+      code: 'GEOGRAPHY_MAP_SELECTION_REQUIRED',
+    });
+  }
+  return {
+    latitude,
+    longitude,
+    placeId: sanitizeText(value.placeId || value.mapPlaceId || '', 220) || null,
+    displayAddress: sanitizeText(value.displayAddress || value.mapDisplayAddress || '', 500) || null,
+    source: sanitizeText(value.source || value.mapSource || '', 80) || null,
+    bounds: parseBounds(value.bounds),
+  };
+};
+
+const scopeNameFieldForLevel = (scopeLevel) => `${String(scopeLevel || '').toLowerCase()}Name`;
+
+const createRootGeographyForTenant = async ({
+  tenant,
+  scopeLevel,
+  locationNames,
+  mapSelection,
+  transaction,
+}) => {
+  const name = sanitizeText(locationNames?.[scopeNameFieldForLevel(scopeLevel)] || '', 200);
+  if (!name) return null;
+  const selected = normalizeConfirmedMapSelection(mapSelection, { scopeLevel });
+  if (selected.placeId) {
+    const duplicate = await Geography.findOne({
+      where: {
+        tenant_id: tenant.id,
+        parent_id: null,
+        level: scopeLevel,
+        [Op.or]: [
+          { map_place_id: selected.placeId },
+          { place_id: selected.placeId },
+        ],
+      },
+      transaction,
+    });
+    if (duplicate) return duplicate;
+  }
+  const byName = await Geography.findOne({
+    where: {
+      tenant_id: tenant.id,
+      parent_id: null,
+      level: scopeLevel,
+      name: { [Op.iLike]: name },
+    },
+    transaction,
+  });
+  if (byName) return byName;
+  return await Geography.create(
+    {
+      tenant_id: tenant.id,
+      parent_id: null,
+      level: scopeLevel,
+      code: `ROOT-${scopeLevel.toUpperCase()}-${tenant.code}`.slice(0, 120),
+      name,
+      latitude: selected.latitude,
+      longitude: selected.longitude,
+      centroid_latitude: selected.latitude,
+      centroid_longitude: selected.longitude,
+      bounds: selected.bounds,
+      bounds_north: selected.bounds?.north ?? null,
+      bounds_south: selected.bounds?.south ?? null,
+      bounds_east: selected.bounds?.east ?? null,
+      bounds_west: selected.bounds?.west ?? null,
+      map_place_id: selected.placeId,
+      map_display_address: selected.displayAddress,
+      map_source: selected.source || 'google_geocoding',
+      place_id: selected.placeId,
+      formatted_address: selected.displayAddress,
+      scope_type: scopeLevel,
+      scope_name: name,
+      is_operational_zone: scopeLevel === 'zone',
+    },
+    { transaction }
+  );
 };
 
 const resolveLimit = (value, fallback = 50, max = 500) => {
@@ -555,11 +693,17 @@ const postTenantProvision = async (req) => {
     const tenantName = sanitizeText(req.body.name, 200);
     const scopeLevelRaw = String(req.body.scopeLevel || 'city').trim().toLowerCase();
     const scopeLevel = TENANT_SCOPE_LEVELS.has(scopeLevelRaw) ? scopeLevelRaw : 'city';
-    const countryName = req.body.countryName ? sanitizeText(req.body.countryName, 120) : null;
-    const stateName = req.body.stateName ? sanitizeText(req.body.stateName, 120) : null;
-    const districtName = req.body.districtName ? sanitizeText(req.body.districtName, 120) : null;
-    const cityName = req.body.cityName ? sanitizeText(req.body.cityName, 120) : null;
-    const zoneName = req.body.zoneName ? sanitizeText(req.body.zoneName, 120) : null;
+    const selectedAncestry = await loadSelectedGeographyAncestry(
+      req.body.rootGeographyId,
+      scopeLevel,
+      transaction
+    );
+    const selectedByLevel = new Map(selectedAncestry.map((row) => [row.level, row]));
+    const countryName = selectedByLevel.get('country')?.name || (req.body.countryName ? sanitizeText(req.body.countryName, 120) : null);
+    const stateName = selectedByLevel.get('state')?.name || (req.body.stateName ? sanitizeText(req.body.stateName, 120) : null);
+    const districtName = selectedByLevel.get('district')?.name || (req.body.districtName ? sanitizeText(req.body.districtName, 120) : null);
+    const cityName = selectedByLevel.get('city')?.name || (req.body.cityName ? sanitizeText(req.body.cityName, 120) : null);
+    const zoneName = selectedByLevel.get('zone')?.name || (req.body.zoneName ? sanitizeText(req.body.zoneName, 120) : null);
     assertTenantScopeLocationRequirements({
       scopeLevel,
       locationNames: {
@@ -591,7 +735,7 @@ const postTenantProvision = async (req) => {
         name: tenantName,
         code: tenantCode,
         status: req.body.status || 'active',
-        country_code: req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null,
+        country_code: selectedByLevel.get('country')?.country_code || (req.body.countryCode ? sanitizeText(req.body.countryCode, 10).toUpperCase() : null),
         contact_name: req.body.contactName ? sanitizeText(req.body.contactName, 180) : null,
         contact_email: req.body.contactEmail ? sanitizeText(req.body.contactEmail, 180).toLowerCase() : null,
         contact_mobile: req.body.contactMobile ? sanitizeText(req.body.contactMobile, 32) : null,
@@ -608,12 +752,42 @@ const postTenantProvision = async (req) => {
       { transaction }
     );
 
+    let rootGeography = null;
+    if (!req.body.rootGeographyId) {
+      rootGeography = await createRootGeographyForTenant({
+        tenant,
+        scopeLevel,
+        locationNames: { countryName, stateName, districtName, cityName, zoneName },
+        mapSelection: req.body.geographyMapSelection || req.body.mapSelection || req.body,
+        transaction,
+      });
+      if (rootGeography?.id) {
+        await tenant.update({ root_geography_id: rootGeography.id }, { transaction });
+      }
+    } else {
+      rootGeography = await Geography.findByPk(req.body.rootGeographyId, { transaction });
+      for (const geography of selectedAncestry) {
+        const canonicalId = geography.master_geography_id || geography.id;
+        const canonical = geography.master_geography_id
+          ? await Geography.findByPk(canonicalId, { transaction })
+          : geography;
+        if (!canonical || canonical.tenant_id !== null) continue;
+        await TenantGeographyAssignment.upsert({
+          tenant_id: tenant.id,
+          geography_id: canonicalId,
+          is_enabled: true,
+          created_by_user_id: req.user.id,
+          updated_at: new Date(),
+        }, { transaction });
+      }
+    }
+
     let onboardedAdmin = null;
     if (req.body.admin) {
       onboardedAdmin = await createTenantAdminUser({
         req,
         tenant,
-        admin: req.body.admin,
+        admin: { ...req.body.admin, geographyId: req.body.admin.geographyId || rootGeography?.id || null },
         transaction,
       });
     }

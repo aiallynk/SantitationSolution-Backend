@@ -86,9 +86,45 @@ const sensorIngestionRateLimit = rateLimit({
   },
 });
 
+const authSensitiveRateLimit = rateLimit({
+  windowMs: Number(runtimeConfig.security.authRateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.authRateLimitMax || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = req.user?.id || req.user?.userId || null;
+    if (userId) return `authuid:${userId}`;
+    const identifier = String(req.body?.identifier || req.body?.email || req.body?.token || '').trim().toLowerCase();
+    return identifier ? `authid:${identifier}` : `authip:${ipKeyGenerator(req.ip || '')}`;
+  },
+  message: {
+    success: false,
+    code: 'AUTH_RATE_LIMIT_EXCEEDED',
+    message: 'Too many authentication attempts, please retry shortly',
+  },
+});
+
+const uploadRateLimit = rateLimit({
+  windowMs: Number(runtimeConfig.security.uploadRateLimitWindowMs || 60_000),
+  max: Number(runtimeConfig.security.uploadRateLimitMax || 25),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = req.user?.id || req.user?.userId || null;
+    return userId ? `uploaduid:${userId}` : `uploadip:${ipKeyGenerator(req.ip || '')}`;
+  },
+  message: {
+    success: false,
+    code: 'UPLOAD_RATE_LIMIT_EXCEEDED',
+    message: 'Upload traffic is high, please retry shortly',
+  },
+});
+
 module.exports = {
   apiRateLimit,
   ingestionRateLimit,
   sensorIngestionRateLimit,
   supervisorApiRateLimit,
+  authSensitiveRateLimit,
+  uploadRateLimit,
 };

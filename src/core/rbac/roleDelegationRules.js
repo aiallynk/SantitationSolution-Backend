@@ -48,7 +48,7 @@ const collectRoleDelegationErrors = ({
     if (GLOBAL_ROLE_CODES.has(targetCode)) return true;
     const targetRank = ROLE_DELEGATION_RANK.get(targetCode);
     if (!Number.isFinite(targetRank)) return true;
-    return targetRank < actorMinRank;
+    return targetRank <= actorMinRank;
   });
 
   if (blockedRoleCodes.length === 0) {

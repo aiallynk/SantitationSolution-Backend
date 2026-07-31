@@ -29,6 +29,15 @@ const getHeatmap = async (req, res, next) => {
   }
 };
 
+const getOverviewMapScope = async (req, res, next) => {
+  try {
+    const data = await dashboardService.getOverviewMapScope(req);
+    return sendSuccess(res, { message: 'Overview map scope fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getFacility = async (req, res, next) => {
   try {
     const data = await dashboardService.getFacilityDashboard(req);
@@ -105,6 +114,7 @@ module.exports = {
   getOverview,
   getMap,
   getHeatmap,
+  getOverviewMapScope,
   getFacility,
   getTrends,
   getAlerts,

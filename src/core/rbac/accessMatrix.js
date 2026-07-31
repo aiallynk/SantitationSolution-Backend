@@ -291,6 +291,10 @@ const TENANT_ADMIN_PERMISSION_CODES = [
   'reports.read',
   'reports.export',
   'audit.read',
+  'worker.bulk_import.template',
+  'worker.bulk_import.validate',
+  'worker.bulk_import.confirm',
+  'worker.bulk_import.history',
 ];
 
 const FACILITY_MANAGER_PERMISSION_CODES = [

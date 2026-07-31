@@ -4,7 +4,7 @@ const { Op } = require('sequelize');
 
 const { ScopeLevels } = require('../src/core/rbac/accessProfiles');
 const { resolveEffectiveScope } = require('../src/core/rbac/scopeResolver');
-const { Geography, Facility, InspectionTask } = require('../src/models');
+const { Geography, Facility, InspectionTask, Tenant } = require('../src/models');
 
 test('resolveEffectiveScope keeps assignment-based facility scope when assignments exist', async (t) => {
   const originalFindAll = InspectionTask.findAll;
@@ -174,4 +174,51 @@ test('resolveEffectiveScope geography facility lookup matches geography, zone, a
   assert.equal(capturedWhere.tenant_id, 'tenant-1');
   assert.ok(Array.isArray(capturedWhere[Op.or]), 'facility lookup should use OR geography mapping');
   assert.equal(capturedWhere[Op.or].length, 3);
+});
+
+test('named state scope safely reaches legacy tenant facilities without a parent hierarchy', async (t) => {
+  const originalGeographyFindAll = Geography.findAll;
+  const originalFacilityFindAll = Facility.findAll;
+  const originalTenantFindByPk = Tenant.findByPk;
+  let facilityLookupCount = 0;
+
+  Geography.findAll = async () => [{ id: 'geo-state-1', parent_id: null }];
+  Facility.findAll = async () => {
+    facilityLookupCount += 1;
+    return facilityLookupCount === 1 ? [] : [{ id: 'legacy-facility-1' }];
+  };
+  Tenant.findByPk = async () => ({
+    country_name: 'India',
+    state_name: 'Maharashtra',
+    district_name: 'Nashik',
+    city_name: 'Nashik',
+  });
+
+  t.after(() => {
+    Geography.findAll = originalGeographyFindAll;
+    Facility.findAll = originalFacilityFindAll;
+    Tenant.findByPk = originalTenantFindByPk;
+  });
+
+  const scope = await resolveEffectiveScope({
+    roleCode: 'state_admin',
+    roleProfile: { scopeLevel: ScopeLevels.STATE },
+    memberships: [
+      {
+        roleCode: 'state_admin',
+        tenantId: 'tenant-1',
+        geographyId: 'geo-state-1',
+      },
+    ],
+    assignments: [],
+    activeTenantId: 'tenant-1',
+    userId: 'state-admin-1',
+    scopeLocationNames: {
+      countryName: 'India',
+      stateName: 'Maharashtra',
+    },
+  });
+
+  assert.equal(scope.scopeLevel, ScopeLevels.STATE);
+  assert.deepEqual(scope.scopeFacilityIds, ['legacy-facility-1']);
 });

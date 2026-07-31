@@ -246,6 +246,57 @@ const createInspectionAttachmentDiskUpload = ({
   });
 };
 
+const createCsvDiskUpload = ({
+  filenamePrefix = 'csv',
+  tempSubdir = '',
+  maxFileSize = MEDIA_MAX_FILE_SIZE,
+} = {}) => {
+  const tempDir = ensureDir(
+    path.join(process.cwd(), 'uploads', 'temp', String(tempSubdir || '').trim())
+  );
+
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, tempDir),
+    filename: (req, file, cb) => {
+      const extension = path.extname(file.originalname || '') || '.csv';
+      cb(
+        null,
+        `${filenamePrefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`
+      );
+    },
+  });
+
+  return multer({
+    storage,
+    limits: {
+      fileSize: Number.isFinite(Number(maxFileSize))
+        ? Number(maxFileSize)
+        : MEDIA_MAX_FILE_SIZE,
+      files: 1,
+    },
+    fileFilter: (req, file, cb) => {
+      const result = isAllowedInspectionAttachmentFile({
+        mimetype: file?.mimetype,
+        originalName: file?.originalname,
+      });
+      if (!result.allowed || result.kind !== 'csv') {
+        return cb(
+          new AppError('Only CSV uploads are supported', 400, {
+            code: 'INVALID_MEDIA_TYPE',
+            details: {
+              mimetype: result.normalizedMime || null,
+              originalName: String(file?.originalname || '') || null,
+              extension: result.extension,
+            },
+          })
+        );
+      }
+      req.uploadFileKind = 'csv';
+      return cb(null, true);
+    },
+  });
+};
+
 module.exports = {
   ALLOWED_CONTENT_TYPES,
   ALLOWED_VIDEO_CONTENT_TYPES,
@@ -258,6 +309,7 @@ module.exports = {
   normalizeContentType,
   createImageDiskUpload,
   createInspectionAttachmentDiskUpload,
+  createCsvDiskUpload,
   isAllowedImageFile,
   isAllowedInspectionAttachmentFile,
 };

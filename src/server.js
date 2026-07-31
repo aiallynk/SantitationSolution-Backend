@@ -125,6 +125,12 @@ const collectErrorDetails = (error) => {
   return details;
 };
 
+const summarizeDatabaseError = (error) => ({
+  message: error?.message || 'Unknown database error',
+  code: error?.code || error?.parent?.code || error?.original?.code || null,
+  name: error?.name || error?.parent?.name || error?.original?.name || null,
+});
+
 const isTransientDatabaseError = (error) => {
   if (!error) {
     return false;
@@ -177,7 +183,7 @@ const runWithTransientDbRetry = async (label, operation) => {
         operation: label,
         attempt,
         attempts,
-        error: error.message,
+        ...summarizeDatabaseError(error),
         retryInMs: delayMs,
       });
       await sleep(delayMs);
@@ -461,7 +467,10 @@ const bootstrap = async () => {
         code: error.code,
       });
     }
-    logger.error('Server bootstrap failed', { error });
+    logger.error('Server bootstrap failed', {
+      error,
+      db: summarizeDatabaseError(error),
+    });
     markNotReady('bootstrap_failed');
     process.exit(1);
   }
