@@ -44,6 +44,7 @@ const VALID_TRIGGERS = new Set(['manual', 'scheduled']);
 const BACKUP_TABLE_SKIP = new Set(['backup_jobs', 'backup_files', 'backup_audit_logs']);
 const VALID_STORAGE_PROVIDERS = new Set(['local', 's3']);
 const STORAGE_USAGE_CACHE_MS = 30_000;
+const ACTIVE_BACKUP_STATUSES = ['queued', 'running'];
 let storageUsageCache = null;
 
 const getActorId = (req) => req.user?.id || null;
@@ -153,6 +154,64 @@ const mapJob = (row) => ({
   rowCounts: row.metadata?.rowCounts || {},
   createdAt: row.created_at,
 });
+
+const activeBackupHeartbeatAt = (job) => {
+  const progressUpdatedAt = job?.metadata?.progress?.updatedAt
+    ? new Date(job.metadata.progress.updatedAt)
+    : null;
+  if (progressUpdatedAt && Number.isFinite(progressUpdatedAt.getTime())) return progressUpdatedAt;
+  const startedAt = job?.started_at ? new Date(job.started_at) : null;
+  if (startedAt && Number.isFinite(startedAt.getTime())) return startedAt;
+  const createdAt = job?.created_at ? new Date(job.created_at) : null;
+  return createdAt && Number.isFinite(createdAt.getTime()) ? createdAt : null;
+};
+
+const isStaleActiveBackupJob = (job, now = new Date(), staleMs = runtimeConfig.backup.staleActiveJobMs) => {
+  if (!ACTIVE_BACKUP_STATUSES.includes(String(job?.status || '').toLowerCase())) return false;
+  const heartbeatAt = activeBackupHeartbeatAt(job);
+  if (!heartbeatAt) return false;
+  return now.getTime() - heartbeatAt.getTime() > staleMs;
+};
+
+const failStaleActiveBackupJobs = async ({ now = new Date(), staleMs = runtimeConfig.backup.staleActiveJobMs } = {}) => {
+  const oldestActiveCandidate = new Date(now.getTime() - staleMs);
+  const candidates = await BackupJob.findAll({
+    where: {
+      status: { [Op.in]: ACTIVE_BACKUP_STATUSES },
+      created_at: { [Op.lt]: oldestActiveCandidate },
+    },
+    order: [['created_at', 'ASC']],
+  });
+  let failed = 0;
+  for (const job of candidates) {
+    if (!isStaleActiveBackupJob(job, now, staleMs)) continue;
+    const heartbeatAt = activeBackupHeartbeatAt(job);
+    const completedAt = now;
+    await job.update({
+      status: 'failed',
+      completed_at: completedAt,
+      duration_ms: job.started_at ? completedAt.getTime() - new Date(job.started_at).getTime() : null,
+      error_message: `Backup job marked failed because it had no progress heartbeat since ${heartbeatAt.toISOString()}`,
+      metadata: {
+        ...(job.metadata || {}),
+        staleRecovery: {
+          markedFailedAt: completedAt.toISOString(),
+          staleAfterMs: staleMs,
+          lastHeartbeatAt: heartbeatAt.toISOString(),
+          previousStatus: job.status,
+        },
+        progress: {
+          ...(job.metadata?.progress || {}),
+          stage: 'failed',
+          label: 'Backup failed: stale job recovered',
+          updatedAt: completedAt.toISOString(),
+        },
+      },
+    });
+    failed += 1;
+  }
+  return { checkedAt: now, failed };
+};
 
 const mapSchedule = (row) => ({
   id: row.id,
@@ -744,6 +803,7 @@ const getBackupStorageUsage = async ({ databaseTotal, successCount }) => {
 
 const getStats = async (req) => {
   ensureSuperAdmin(req);
+  await failStaleActiveBackupJobs();
   const [totalBackupCount, successCount, activeSchedules, lastSuccessfulBackup, nextScheduledBackup, storageTotal] =
     await Promise.all([
       BackupJob.count(),
@@ -771,6 +831,7 @@ const getStats = async (req) => {
 
 const listJobs = async (req) => {
   ensureSuperAdmin(req);
+  await failStaleActiveBackupJobs();
   const page = toInt(req.query.page, 1, { min: 1, max: 100000 });
   const limit = toInt(req.query.limit, 25, { min: 1, max: 100 });
   const where = whereForJobList(req.query || {});
@@ -794,6 +855,7 @@ const triggerManualBackup = async (req) => {
 
 const getJobDetails = async (req) => {
   ensureSuperAdmin(req);
+  await failStaleActiveBackupJobs();
   const job = await BackupJob.findByPk(req.params.id);
   if (!job) throw new AppError('Backup job not found', 404, { code: 'BACKUP_JOB_NOT_FOUND' });
   const logs = await BackupAuditLog.findAll({
@@ -1017,6 +1079,7 @@ const claimDueSchedule = async (schedule, now) => {
 
 const runBackupScheduleSweep = async (req = {}) => {
   const now = new Date();
+  await failStaleActiveBackupJobs({ now });
   const schedules = await BackupSchedule.findAll({
     where: {
       enabled: true,
@@ -1170,6 +1233,9 @@ module.exports = {
   listSchedules,
   upsertSchedule,
   deleteSchedule,
+  activeBackupHeartbeatAt,
+  isStaleActiveBackupJob,
+  failStaleActiveBackupJobs,
   reconcileBackupScheduleTimes,
   runBackupScheduleSweep,
   runScheduledBackups,

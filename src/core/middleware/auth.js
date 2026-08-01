@@ -11,6 +11,12 @@ const JWT_ALGORITHM = runtimeConfig.auth.jwtAlgorithm;
 // `platform_ops` remains global-scoped here for backward compatibility only.
 // Do not elevate or auto-migrate it to `super_admin` without an explicit migration plan.
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
+const PASSWORD_CHANGE_ALLOWED_PATHS = new Set([
+  '/api/v1/auth/me',
+  '/api/v1/auth/logout',
+  '/api/v1/auth/refresh',
+  '/api/v1/auth/change-temporary-password',
+]);
 
 const parseBearer = (req) => {
   const auth = req.headers.authorization;
@@ -151,6 +157,8 @@ const buildAuthContext = async ({ req, user }) => {
     fullName: user.full_name,
     employeeCode: user.employee_code || null,
     status: user.status,
+    mustChangePassword: Boolean(user.must_change_password),
+    lockedUntil: user.locked_until || null,
     role: roleProfile.role || null,
     allRoleCodes,
     roleCodes,
@@ -214,7 +222,11 @@ const getAuthContextFromToken = async ({ token, tenantId = null } = {}) => {
     query: preferredTenantId ? { tenantId: preferredTenantId } : {},
   };
 
-  return buildAuthContext({ req: requestLike, user });
+  const authContext = await buildAuthContext({ req: requestLike, user });
+  return {
+    ...authContext,
+    tokenSessionMode: decoded.sessionMode || null,
+  };
 };
 
 const protect = async (req, res, next) => {
@@ -226,6 +238,20 @@ const protect = async (req, res, next) => {
       token,
       tenantId: requestedTenantId,
     });
+    const normalizedPath = String(req.originalUrl || req.path || '').split('?')[0];
+    if (
+      req.user?.tokenSessionMode === 'password_change_required' &&
+      !req.user?.mustChangePassword
+    ) {
+      throw new AppError('Temporary authentication token is no longer valid', 401, {
+        code: 'STALE_TEMPORARY_TOKEN',
+      });
+    }
+    if (req.user?.mustChangePassword && !PASSWORD_CHANGE_ALLOWED_PATHS.has(normalizedPath)) {
+      throw new AppError('Password change is required before accessing this resource', 403, {
+        code: 'PASSWORD_CHANGE_REQUIRED',
+      });
+    }
     return next();
   } catch (error) {
     return next(error);
@@ -242,6 +268,23 @@ const requireRoles = (...roleCodes) => {
     }
     const hasRole = req.user.roleCodes.some((roleCode) => roleCodes.includes(roleCode));
     if (!hasRole) {
+      return next(new AppError('Insufficient role permissions', 403, { code: 'ROLE_FORBIDDEN' }));
+    }
+    return next();
+  };
+};
+
+const requireNotRoles = (...roleCodes) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return next(new AppError('Authentication required', 401, { code: 'AUTH_REQUIRED' }));
+    }
+    if (req.user.isSuperAdmin) {
+      return next();
+    }
+    const blockedRoles = new Set(roleCodes.map((roleCode) => String(roleCode || '').trim()).filter(Boolean));
+    const hasBlockedRole = (req.user.roleCodes || []).some((roleCode) => blockedRoles.has(roleCode));
+    if (hasBlockedRole) {
       return next(new AppError('Insufficient role permissions', 403, { code: 'ROLE_FORBIDDEN' }));
     }
     return next();
@@ -416,6 +459,7 @@ const tenantScoped = () => {
 module.exports = {
   protect,
   requireRoles,
+  requireNotRoles,
   requirePermissions,
   requireAnyPermissions,
   requireAction,

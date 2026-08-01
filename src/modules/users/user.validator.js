@@ -1,5 +1,6 @@
 const { isBlank, isUuid, parsePositiveInteger } = require('../../utils/validators');
 const { collectRoleScopeValidationErrors } = require('../../core/rbac/roleScopeRules');
+const { ROLE_CODES, normalizeRoleCode } = require('../../core/rbac/personaFamilies');
 
 const ALLOWED_USER_STATUSES = new Set(['active', 'inactive', 'locked']);
 const DISALLOWED_USER_ROLE_CODES = new Set(['viewer', 'zone_admin', 'facility_manager']);
@@ -16,6 +17,26 @@ const ALLOWED_ASSIGNMENT_LEVELS = new Set([
   'toilet_unit',
 ]);
 const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(String(value || '').trim());
+const uniqueNormalizedRoleCodes = (roleCodes = []) =>
+  [...new Set((Array.isArray(roleCodes) ? roleCodes : []).map((code) => normalizeRoleCode(code)).filter(Boolean))];
+
+const getActorRoleCodes = (req = {}) =>
+  uniqueNormalizedRoleCodes([
+    ...(Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : []),
+    ...(Array.isArray(req.user?.allRoleCodes) ? req.user.allRoleCodes : []),
+    req.user?.role,
+  ]);
+
+const isDistrictAdminFieldWorkerRequest = (req = {}) => {
+  const targetRoleCodes = uniqueNormalizedRoleCodes(req.body?.roleCodes || []);
+  if (!targetRoleCodes.includes(ROLE_CODES.FIELD_WORKER)) return false;
+  if (req.user?.isSuperAdmin) return false;
+  const actorRoleCodes = getActorRoleCodes(req);
+  return (
+    String(req.user?.scopeLevel || '').trim().toLowerCase() === 'district' ||
+    actorRoleCodes.includes(ROLE_CODES.DISTRICT_ADMIN)
+  );
+};
 
 const validateUuidField = (value, field, errors) => {
   if (value === undefined || value === null || value === '') return;
@@ -99,12 +120,16 @@ const validateUserListQuery = (req) => {
 
 const validateCreateUser = (req) => {
   const errors = [];
+  const roleCodes = Array.isArray(req.body.roleCodes)
+    ? req.body.roleCodes.map((code) => String(code || '').trim().toLowerCase())
+    : [];
+  const requiresManualPassword = !roleCodes.includes('field_worker');
   if (isBlank(req.body.fullName)) errors.push('fullName is required');
   if (isBlank(req.body.email)) errors.push('email is required');
   if (!isBlank(req.body.email) && !isLikelyEmail(req.body.email)) {
     errors.push('email must be a valid email address');
   }
-  if (isBlank(req.body.password)) errors.push('password is required');
+  if (requiresManualPassword && isBlank(req.body.password)) errors.push('password is required');
   if (!isBlank(req.body.password) && String(req.body.password).length < 8) {
     errors.push('password must be at least 8 characters');
   }
@@ -150,8 +175,31 @@ const validateCreateUser = (req) => {
         roleCodes: req.body.roleCodes,
         geographyId: req.body.geographyId || null,
         assignments: req.body.assignments || [],
+        locationNames: req.body,
       })
     );
+  }
+  if (isDistrictAdminFieldWorkerRequest(req)) {
+    if (!isBlank(req.body.geographyId)) {
+      errors.push('District Admin field_worker must not submit geographyId');
+    }
+    if (!isBlank(req.body.cityName)) {
+      errors.push('District Admin field_worker must not submit cityName');
+    }
+    if (!isBlank(req.body.zoneName)) {
+      errors.push('District Admin field_worker must not submit zoneName');
+    }
+    if (Array.isArray(req.body.assignments)) {
+      req.body.assignments.forEach((assignment, index) => {
+        if (!assignment || typeof assignment !== 'object') return;
+        if (!isBlank(assignment.geographyId)) {
+          errors.push(`assignments[${index}].geographyId is not allowed for District Admin field_worker`);
+        }
+        if (!isBlank(assignment.toiletUnitId)) {
+          errors.push(`assignments[${index}].toiletUnitId is not allowed for District Admin field_worker`);
+        }
+      });
+    }
   }
   return errors;
 };
@@ -218,8 +266,31 @@ const validatePatchUser = (req) => {
         roleCodes: req.body.roleCodes,
         geographyId: req.body.geographyId || null,
         assignments: req.body.assignments || [],
+        locationNames: req.body,
       })
     );
+  }
+  if (isDistrictAdminFieldWorkerRequest(req)) {
+    if (!isBlank(req.body.geographyId)) {
+      errors.push('District Admin field_worker must not submit geographyId');
+    }
+    if (!isBlank(req.body.cityName)) {
+      errors.push('District Admin field_worker must not submit cityName');
+    }
+    if (!isBlank(req.body.zoneName)) {
+      errors.push('District Admin field_worker must not submit zoneName');
+    }
+    if (Array.isArray(req.body.assignments)) {
+      req.body.assignments.forEach((assignment, index) => {
+        if (!assignment || typeof assignment !== 'object') return;
+        if (!isBlank(assignment.geographyId)) {
+          errors.push(`assignments[${index}].geographyId is not allowed for District Admin field_worker`);
+        }
+        if (!isBlank(assignment.toiletUnitId)) {
+          errors.push(`assignments[${index}].toiletUnitId is not allowed for District Admin field_worker`);
+        }
+      });
+    }
   }
   return errors;
 };

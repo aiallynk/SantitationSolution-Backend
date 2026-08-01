@@ -1,6 +1,6 @@
 const sendSuccess = (
   res,
-  { statusCode = 200, message = 'Request successful', data = null, meta } = {}
+  { statusCode = 200, message = 'Request successful', data = null, meta, ...extra } = {}
 ) => {
   const payload = {
     success: true,
@@ -12,6 +12,8 @@ const sendSuccess = (
   if (meta) {
     payload.meta = meta;
   }
+
+  Object.assign(payload, extra);
 
   return res.status(statusCode).json(payload);
 };

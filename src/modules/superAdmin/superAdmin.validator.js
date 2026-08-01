@@ -23,12 +23,14 @@ const validateTenantProvision = (req) => {
     errors.push('scopeLevel is invalid');
   }
   const scopeLevel = String(req.body.scopeLevel || 'city').trim().toLowerCase();
-  const requiredFields = SCOPE_REQUIRED_FIELDS[scopeLevel] || [];
+  const requiredFields = req.body.rootGeographyId ? [] : SCOPE_REQUIRED_FIELDS[scopeLevel] || [];
   requiredFields.forEach((field) => {
-    if (isBlank(req.body[field])) {
-      errors.push(`${field} is required for ${scopeLevel} scope`);
-    }
+    if (isBlank(req.body[field])) errors.push(`${field} is required for ${scopeLevel} scope`);
   });
+  const scopeRequiresMap = ['country', 'state', 'district', 'city'].includes(scopeLevel);
+  if (scopeRequiresMap && !req.body.rootGeographyId) {
+    errors.push(`rootGeographyId is required for ${scopeLevel} scope`);
+  }
   if (req.body.metadata !== undefined && (typeof req.body.metadata !== 'object' || Array.isArray(req.body.metadata))) {
     errors.push('metadata must be an object when provided');
   }

@@ -11,6 +11,7 @@ uploads/
 /backups/
 db-backups/
 tmp/backfills/
+data/geography/
 
 # Firebase admin credentials (never commit)
 *-firebase-adminsdk-*.json

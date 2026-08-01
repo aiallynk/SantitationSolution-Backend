@@ -1,5 +1,5 @@
 const { Op } = require('sequelize');
-const { Geography, Facility, InspectionTask } = require('../../models');
+const { Geography, Facility, InspectionTask, Tenant } = require('../../models');
 const { ScopeLevels, resolveScopedRoleLevel, resolveSeedScopeFromMemberships } = require('./accessProfiles');
 
 const uniqueIds = (values = []) =>
@@ -87,6 +87,47 @@ const resolveFacilitiesFromAssignedTasks = async ({ tenantId, userId }) => {
   return uniqueIds(rows.map((row) => row.facility_id));
 };
 
+const resolveLegacyFacilitiesFromNamedTenantScope = async ({
+  tenantId,
+  scopeLevel,
+  scopeLocationNames = {},
+}) => {
+  const requiredFieldsByLevel = {
+    country: ['countryName'],
+    state: ['countryName', 'stateName'],
+    district: ['countryName', 'stateName', 'districtName'],
+    city: ['countryName', 'stateName', 'districtName', 'cityName'],
+  };
+  const requiredFields = requiredFieldsByLevel[String(scopeLevel || '').toLowerCase()] || [];
+  if (!tenantId || requiredFields.length === 0) return [];
+
+  const tenant = await Tenant.findByPk(tenantId, {
+    attributes: ['country_name', 'state_name', 'district_name', 'city_name'],
+    raw: true,
+  });
+  if (!tenant) return [];
+
+  const tenantNames = {
+    countryName: tenant.country_name,
+    stateName: tenant.state_name,
+    districtName: tenant.district_name,
+    cityName: tenant.city_name,
+  };
+  const matchesTenantBaseline = requiredFields.every((field) => {
+    const expected = String(scopeLocationNames[field] || '').trim().toLowerCase();
+    const actual = String(tenantNames[field] || '').trim().toLowerCase();
+    return expected && actual && expected === actual;
+  });
+  if (!matchesTenantBaseline) return [];
+
+  const facilities = await Facility.findAll({
+    where: { tenant_id: tenantId },
+    attributes: ['id'],
+    raw: true,
+  });
+  return uniqueIds(facilities.map((row) => row.id));
+};
+
 const resolveEffectiveScope = async ({
   roleCode,
   roleProfile,
@@ -95,6 +136,7 @@ const resolveEffectiveScope = async ({
   activeTenantId = null,
   userId = null,
   fallbackGeographyId = null,
+  scopeLocationNames = {},
 }) => {
   const profileScopeLevel = roleProfile?.scopeLevel || ScopeLevels.ORGANIZATION;
   const fixedRoleScopeLevel = resolveScopedRoleLevel(roleCode);
@@ -242,10 +284,17 @@ const resolveEffectiveScope = async ({
     tenantId: activeTenantId,
     seedGeographyIds: [geographySeed],
   });
-  const derivedFacilityIds = await resolveFacilitiesFromGeographyScope({
+  let derivedFacilityIds = await resolveFacilitiesFromGeographyScope({
     tenantId: activeTenantId,
     geographyIds: expandedGeographyIds,
   });
+  if (derivedFacilityIds.length === 0) {
+    derivedFacilityIds = await resolveLegacyFacilitiesFromNamedTenantScope({
+      tenantId: activeTenantId,
+      scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
+      scopeLocationNames,
+    });
+  }
 
   return {
     scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
@@ -262,4 +311,5 @@ module.exports = {
   expandDescendantGeographies,
   resolveFacilitiesFromGeographyScope,
   resolveFacilitiesFromAssignedTasks,
+  resolveLegacyFacilitiesFromNamedTenantScope,
 };

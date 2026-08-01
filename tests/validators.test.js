@@ -20,6 +20,8 @@ const {
   validateIngestion,
 } = require('../src/modules/sensors/sensor.validator');
 const {
+  validateTenantCreate,
+  validateGeographyCreate,
   validateQrResolve,
 } = require('../src/modules/platform/platform.validator');
 const {
@@ -147,6 +149,50 @@ test('validateQrResolve accepts supported request payload', () => {
       tenantId: 'tenant-1',
       siteId: 'site-1',
       scannedAt: '2026-04-08T12:30:00.000Z',
+    },
+  });
+  assert.deepEqual(errors, []);
+});
+
+test('validateTenantCreate requires canonical geography ID for city scope', () => {
+  const errors = validateTenantCreate({
+    body: {
+      name: 'Nashik Municipal Corporation',
+      scopeLevel: 'city',
+      countryName: 'India',
+      stateName: 'Maharashtra',
+      cityName: 'Nashik',
+      geographyMapSelection: {
+        latitude: 19.9975,
+        longitude: 73.7898,
+      },
+    },
+  });
+  assert.deepEqual(errors, ['rootGeographyId is required for city scope']);
+});
+
+test('validateGeographyCreate requires Google map selection for city geographies', () => {
+  const errors = validateGeographyCreate({
+    body: {
+      tenantId: 'tenant-1',
+      level: 'city',
+      name: 'Nashik',
+      centroidLatitude: 19.9975,
+      centroidLongitude: 73.7898,
+      mapSource: 'manual_pin',
+    },
+  });
+  assert.deepEqual(errors, [
+    'city must use a Google Maps selection with valid coordinates and bounds',
+  ]);
+});
+
+test('validateGeographyCreate allows zone without exact Google map selection', () => {
+  const errors = validateGeographyCreate({
+    body: {
+      tenantId: 'tenant-1',
+      level: 'zone',
+      name: 'Zone 1',
     },
   });
   assert.deepEqual(errors, []);

@@ -1,4 +1,3 @@
-const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const { Op } = require('sequelize');
 const AppError = require('../../core/errors/AppError');
@@ -25,8 +24,15 @@ const { createAuditLog } = require('../audit/audit.service');
 const { runtimeConfig } = require('../../config/runtime');
 const { isValidIanaTimezone } = require('../../utils/timezone');
 const { nextDailyRun } = require('../backups/backupSchedule');
+const {
+  hashPassword,
+  verifyPassword,
+  assertPasswordPolicy,
+} = require('./passwordLifecycle.service');
 
 const GLOBAL_ROLE_CODES = new Set(['super_admin', 'platform_ops']);
+const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+const ACCOUNT_LOCK_WINDOW_MS = 15 * 60 * 1000;
 
 const includeRolePermission = [
   {
@@ -188,6 +194,12 @@ const mapUser = async ({ user, activeTenantId }) => {
     activeTenantId,
     userId: user.id,
     fallbackGeographyId: user.geography_id || null,
+    scopeLocationNames: {
+      countryName: user.country_name || null,
+      stateName: user.state_name || null,
+      districtName: user.district_name || null,
+      cityName: user.city_name || null,
+    },
   });
   const assignmentFacilityIds = uniqueIds(
     activeAssignments.map((assignment) => assignment.facility_id || assignment.facilityId || null),
@@ -212,6 +224,8 @@ const mapUser = async ({ user, activeTenantId }) => {
     wardName: user.ward_name || null,
     lastLoginAt: user.last_login_at || null,
     metadata: user.metadata || {},
+    mustChangePassword: Boolean(user.must_change_password),
+    lockedUntil: user.locked_until || null,
     createdAt: user.created_at || null,
     updatedAt: user.updated_at || null,
     tenantId: activeTenantId,
@@ -261,13 +275,29 @@ const mapUser = async ({ user, activeTenantId }) => {
   };
 };
 
-const fetchUserForAuth = (identifier) =>
-  PlatformUser.findOne({
+const fetchUserForAuth = (identifier, tenantId = null) => {
+  const normalized = String(identifier || '').trim();
+  const normalizedLower = normalized.toLowerCase();
+  return PlatformUser.findOne({
     where: {
-      [Op.or]: [{ email: identifier.toLowerCase() }, { phone: identifier }],
+      ...(tenantId ? { tenant_id: tenantId } : {}),
+      [Op.or]: [
+        { email: normalizedLower },
+        { phone: normalized },
+        { user_id_code: normalized },
+        { employee_code: normalized },
+      ],
     },
     include: includeRolePermission,
   });
+};
+
+const buildTokenQuery = ({ token, purpose = 'password_reset' }) => ({
+  token_hash: hashToken(token),
+  purpose,
+  used_at: null,
+  expires_at: { [Op.gt]: new Date() },
+});
 
 const createSession = async (user, refreshToken, req) => {
   const sessionId = crypto.randomUUID();
@@ -281,6 +311,23 @@ const createSession = async (user, refreshToken, req) => {
   });
 
   return sessionId;
+};
+
+const createAuthenticatedSessionPayload = async ({ user, req, activeTenantId }) => {
+  const accessToken = signAccessToken(user, { tenantId: activeTenantId });
+  const refreshDraft = signRefreshToken(user, crypto.randomUUID(), { tenantId: activeTenantId });
+  const sessionId = await createSession(user, refreshDraft, req);
+  const refreshToken = signRefreshToken(user, sessionId, { tenantId: activeTenantId });
+
+  await LoginSession.update(
+    {
+      refresh_token_hash: hashToken(refreshToken),
+      expires_at: decodeTokenExpiry(refreshToken),
+    },
+    { where: { id: sessionId } }
+  );
+
+  return buildAuthPayload({ user, accessToken, refreshToken, activeTenantId });
 };
 
 const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantId }) => {
@@ -318,6 +365,8 @@ const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantI
     mobileOnly: mapped.mobileOnly,
     canAccessWeb: mapped.canAccessWeb,
     canAccessMobile: mapped.canAccessMobile,
+    mustChangePassword: mapped.mustChangePassword,
+    lockedUntil: mapped.lockedUntil,
     tenantMemberships: mapped.tenantMemberships,
     activeMemberships: mapped.activeMemberships,
     activeTenantId,
@@ -327,36 +376,75 @@ const buildAuthPayload = async ({ user, accessToken, refreshToken, activeTenantI
 
 const login = async ({ identifier, password, tenantId, req }) => {
   const normalizedIdentifier = String(identifier || '').trim().toLowerCase();
-  const user = await fetchUserForAuth(normalizedIdentifier);
+  const user = await fetchUserForAuth(normalizedIdentifier, tenantId || null);
 
   if (!user || !user.password_hash) {
     throw new AppError('Invalid credentials', 401, { code: 'INVALID_CREDENTIALS' });
   }
 
-  const isMatch = await bcrypt.compare(password, user.password_hash);
+  if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    throw new AppError('Account is temporarily locked due to failed login attempts', 423, {
+      code: 'ACCOUNT_LOCKED',
+      details: {
+        lockedUntil: user.locked_until,
+      },
+    });
+  }
+
+  const isMatch = await verifyPassword({
+    plainTextPassword: password,
+    passwordHash: user.password_hash,
+  });
   if (!isMatch) {
+    const nextFailedAttempts = Number(user.failed_login_attempts || 0) + 1;
+    const shouldLock = nextFailedAttempts >= MAX_FAILED_LOGIN_ATTEMPTS;
+    await user.update({
+      failed_login_attempts: nextFailedAttempts,
+      locked_until: shouldLock ? new Date(Date.now() + ACCOUNT_LOCK_WINDOW_MS) : null,
+      status: shouldLock ? 'locked' : user.status,
+      updated_at: new Date(),
+    });
     throw new AppError('Invalid credentials', 401, { code: 'INVALID_CREDENTIALS' });
   }
-  if (user.status !== 'active') {
+  if (user.status === 'pending_activation') {
+    throw new AppError('User account is pending activation', 403, { code: 'USER_PENDING_ACTIVATION' });
+  }
+  if (!['active', 'locked'].includes(user.status)) {
     throw new AppError('User account is not active', 403, { code: 'USER_NOT_ACTIVE' });
   }
 
   const activeTenantId = resolveActiveTenantId({ user, requestedTenantId: tenantId || null });
 
-  const accessToken = signAccessToken(user, { tenantId: activeTenantId });
-  const refreshDraft = signRefreshToken(user, crypto.randomUUID(), { tenantId: activeTenantId });
-  const sessionId = await createSession(user, refreshDraft, req);
-  const refreshToken = signRefreshToken(user, sessionId, { tenantId: activeTenantId });
+  await user.update({
+    last_login_at: new Date(),
+    failed_login_attempts: 0,
+    locked_until: null,
+    status: 'active',
+    updated_at: new Date(),
+  });
 
-  await LoginSession.update(
-    {
-      refresh_token_hash: hashToken(refreshToken),
-      expires_at: decodeTokenExpiry(refreshToken),
-    },
-    { where: { id: sessionId } }
-  );
+  if (user.must_change_password) {
+    const accessToken = signAccessToken(user, {
+      tenantId: activeTenantId,
+      sessionMode: 'password_change_required',
+    });
+    await createAuditLog({
+      req,
+      actorUserId: user.id,
+      tenantId: activeTenantId,
+      action: 'auth.login_temporary_password',
+      entityType: 'platform_user',
+      entityId: user.id,
+      details: { activeTenantId },
+    });
+    return buildAuthPayload({
+      user,
+      accessToken,
+      refreshToken: null,
+      activeTenantId,
+    });
+  }
 
-  await user.update({ last_login_at: new Date() });
   await createAuditLog({
     req,
     actorUserId: user.id,
@@ -364,10 +452,10 @@ const login = async ({ identifier, password, tenantId, req }) => {
     action: 'auth.login',
     entityType: 'platform_user',
     entityId: user.id,
-    details: { email: user.email, activeTenantId },
+    details: { activeTenantId, mustChangePassword: Boolean(user.must_change_password) },
   });
 
-  return buildAuthPayload({ user, accessToken, refreshToken, activeTenantId });
+  return createAuthenticatedSessionPayload({ user, req, activeTenantId });
 };
 
 const refresh = async ({ refreshToken, req }) => {
@@ -473,6 +561,7 @@ const forgotPassword = async ({ email, req }) => {
   await PasswordResetToken.create({
     user_id: user.id,
     token_hash: hashToken(resetToken),
+    purpose: 'password_reset',
     expires_at: new Date(Date.now() + runtimeConfig.auth.passwordResetTtlMs),
   });
 
@@ -494,13 +583,8 @@ const forgotPassword = async ({ email, req }) => {
 };
 
 const resetPassword = async ({ token, newPassword, req }) => {
-  const tokenHash = hashToken(token);
   const tokenRow = await PasswordResetToken.findOne({
-    where: {
-      token_hash: tokenHash,
-      used_at: null,
-      expires_at: { [Op.gt]: new Date() },
-    },
+    where: buildTokenQuery({ token, purpose: 'password_reset' }),
   });
   if (!tokenRow) {
     throw new AppError('Reset token is invalid or expired', 400, { code: 'RESET_TOKEN_INVALID' });
@@ -511,8 +595,15 @@ const resetPassword = async ({ token, newPassword, req }) => {
     throw new AppError('User not found for reset token', 404, { code: 'USER_NOT_FOUND' });
   }
 
-  const passwordHash = await bcrypt.hash(newPassword, 10);
-  await user.update({ password_hash: passwordHash, updated_at: new Date() });
+  assertPasswordPolicy({ password: newPassword });
+  const passwordHash = await hashPassword(newPassword);
+  await user.update({
+    password_hash: passwordHash,
+    must_change_password: false,
+    failed_login_attempts: 0,
+    locked_until: null,
+    updated_at: new Date(),
+  });
   await tokenRow.update({ used_at: new Date(), updated_at: new Date() });
 
   await LoginSession.update(
@@ -533,18 +624,145 @@ const resetPassword = async ({ token, newPassword, req }) => {
 };
 
 const verifyResetToken = async ({ token }) => {
-  const tokenHash = hashToken(token);
   const tokenRow = await PasswordResetToken.findOne({
-    where: {
-      token_hash: tokenHash,
-      used_at: null,
-      expires_at: { [Op.gt]: new Date() },
-    },
+    where: buildTokenQuery({ token, purpose: 'password_reset' }),
   });
   if (!tokenRow) {
     throw new AppError('Reset token is invalid or expired', 400, { code: 'RESET_TOKEN_INVALID' });
   }
   return { valid: true };
+};
+
+const verifyActivationToken = async ({ token }) => {
+  const tokenRow = await PasswordResetToken.findOne({
+    where: buildTokenQuery({ token, purpose: 'activation' }),
+  });
+  if (!tokenRow) {
+    throw new AppError('Activation token is invalid or expired', 400, { code: 'ACTIVATION_TOKEN_INVALID' });
+  }
+  return {
+    valid: true,
+    expiresAt: tokenRow.expires_at,
+    deliveryChannel: tokenRow.delivery_channel || null,
+  };
+};
+
+const activateAccount = async ({ token, newPassword, req }) => {
+  const tokenRow = await PasswordResetToken.findOne({
+    where: buildTokenQuery({ token, purpose: 'activation' }),
+  });
+  if (!tokenRow) {
+    throw new AppError('Activation token is invalid or expired', 400, { code: 'ACTIVATION_TOKEN_INVALID' });
+  }
+
+  const user = await PlatformUser.findByPk(tokenRow.user_id);
+  if (!user) {
+    throw new AppError('User not found for activation token', 404, { code: 'USER_NOT_FOUND' });
+  }
+
+  assertPasswordPolicy({ password: newPassword });
+  const passwordHash = await hashPassword(newPassword);
+  const metadata = user.metadata && typeof user.metadata === 'object' ? { ...user.metadata } : {};
+  metadata.activation = {
+    ...(metadata.activation || {}),
+    activatedAt: new Date().toISOString(),
+    mustSetPassword: false,
+  };
+
+  await user.update({
+    password_hash: passwordHash,
+    status: 'active',
+    must_change_password: false,
+    failed_login_attempts: 0,
+    locked_until: null,
+    metadata,
+    updated_at: new Date(),
+  });
+  await tokenRow.update({ used_at: new Date(), updated_at: new Date() });
+
+  await LoginSession.update(
+    { revoked_at: new Date(), updated_at: new Date() },
+    { where: { user_id: user.id, revoked_at: null } }
+  );
+
+  await createAuditLog({
+    req,
+    actorUserId: user.id,
+    tenantId: user.tenant_id,
+    action: 'auth.activate_account',
+    entityType: 'platform_user',
+    entityId: user.id,
+    details: {
+      deliveryChannel: tokenRow.delivery_channel || null,
+    },
+  });
+
+  return { activated: true };
+};
+
+const changeTemporaryPassword = async ({ userId, activeTenantId, newPassword, req }) => {
+  const user = await PlatformUser.findByPk(userId, {
+    include: includeRolePermission,
+  });
+  if (!user) {
+    throw new AppError('User not found', 404, { code: 'USER_NOT_FOUND' });
+  }
+  if (!user.must_change_password) {
+    throw new AppError('Temporary password change is not required', 409, {
+      code: 'PASSWORD_CHANGE_NOT_REQUIRED',
+    });
+  }
+
+  assertPasswordPolicy({ password: newPassword });
+
+  const reusesCurrentPassword = await verifyPassword({
+    plainTextPassword: newPassword,
+    passwordHash: user.password_hash,
+  });
+  if (reusesCurrentPassword) {
+    throw new AppError('New password must be different from the temporary password', 400, {
+      code: 'PASSWORD_REUSE_FORBIDDEN',
+    });
+  }
+
+  const passwordHash = await hashPassword(newPassword);
+  const metadata = user.metadata && typeof user.metadata === 'object' ? { ...user.metadata } : {};
+  metadata.activation = {
+    ...(metadata.activation || {}),
+    activatedAt: new Date().toISOString(),
+    mustSetPassword: false,
+    temporaryPasswordChangedAt: new Date().toISOString(),
+  };
+
+  await LoginSession.update(
+    { revoked_at: new Date(), updated_at: new Date() },
+    { where: { user_id: user.id, revoked_at: null } }
+  );
+
+  await user.update({
+    password_hash: passwordHash,
+    must_change_password: false,
+    failed_login_attempts: 0,
+    locked_until: null,
+    status: 'active',
+    metadata,
+    updated_at: new Date(),
+  });
+
+  await createAuditLog({
+    req,
+    actorUserId: user.id,
+    tenantId: activeTenantId || user.tenant_id || null,
+    action: 'auth.change_temporary_password',
+    entityType: 'platform_user',
+    entityId: user.id,
+  });
+
+  return createAuthenticatedSessionPayload({
+    user,
+    req,
+    activeTenantId: activeTenantId || user.tenant_id || null,
+  });
 };
 
 const getMe = async ({ userId, activeTenantId }) => {
@@ -659,6 +877,9 @@ module.exports = {
   logout,
   forgotPassword,
   verifyResetToken,
+  verifyActivationToken,
+  activateAccount,
+  changeTemporaryPassword,
   resetPassword,
   getMe,
   updateMe,

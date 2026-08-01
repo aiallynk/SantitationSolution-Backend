@@ -1,4 +1,5 @@
 const { Op } = require('sequelize');
+const AppError = require('../core/errors/AppError');
 const { getDefaultTimezone, normalizeTimezone } = require('./timezone');
 
 const DEFAULT_TIME_ZONE = getDefaultTimezone();
@@ -100,14 +101,13 @@ const normalizeDateRange = (value) => {
   return DATE_RANGE_ALIASES[raw.replace(/[\s-]+/g, '_').toLowerCase()] || null;
 };
 
-const parseDate = (value, { endOfDay = false, timeZone = DEFAULT_TIME_ZONE } = {}) => {
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+const parseDate = (value, { endExclusive = false, timeZone = DEFAULT_TIME_ZONE } = {}) => {
   if (!value) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(String(value).trim())) {
+  if (DATE_KEY_RE.test(String(value).trim())) {
     const [year, month, day] = String(value).split('-').map(Number);
-    if (endOfDay) {
-      const nextDayStart = zonedDateTimeToUtcDate({ year, month, day: day + 1, timeZone });
-      return new Date(nextDayStart.getTime() - 1);
-    }
+    if (endExclusive) return zonedDateTimeToUtcDate({ year, month, day: day + 1, timeZone });
     return zonedDateTimeToUtcDate({ year, month, day, timeZone });
   }
   const parsed = new Date(value);
@@ -127,6 +127,8 @@ const calculateDays = (start, end, fallback) => {
   return Math.max(1, Math.ceil(diffMs / 86_400_000));
 };
 
+const isDateOnlyKey = (value) => DATE_KEY_RE.test(String(value || '').trim());
+
 const resolveDateRange = (query = {}, options = {}) => {
   const source = query || {};
   const maxDays = Number.isFinite(Number(options.maxDays)) ? Number(options.maxDays) : 90;
@@ -134,16 +136,41 @@ const resolveDateRange = (query = {}, options = {}) => {
   const now = options.now instanceof Date ? options.now : new Date();
   const timeZone = normalizeTimezone(options.timeZone || DEFAULT_TIME_ZONE);
 
-  const from = parseDate(source.from || source.start || source.startDate || source.dateFrom, { timeZone });
-  const to = parseDate(source.to || source.end || source.endDate || source.dateTo, { endOfDay: true, timeZone });
-  if (from || to) {
-    const start = from || null;
+  const startInput = source.from || source.start || source.startDate || source.dateFrom || null;
+  const endInput = source.to || source.end || source.endDate || source.dateTo || null;
+  const hasStartInput = startInput !== null && startInput !== undefined && String(startInput).trim() !== '';
+  const hasEndInput = endInput !== null && endInput !== undefined && String(endInput).trim() !== '';
+  const from = parseDate(startInput, { timeZone });
+  const to = parseDate(endInput, { endExclusive: true, timeZone });
+  if (hasStartInput || hasEndInput) {
+    if (!hasStartInput || !hasEndInput) {
+      throw new AppError('startDate and endDate are both required for a custom range', 400, {
+        code: 'INVALID_DATE_RANGE',
+      });
+    }
+    if (!from || !to || (isDateOnlyKey(startInput) && !isDateOnlyKey(endInput))) {
+      throw new AppError('Date filters must use valid YYYY-MM-DD values', 400, {
+        code: 'INVALID_DATE_RANGE',
+      });
+    }
+    if (to <= from) {
+      throw new AppError('endDate must be the same as or after startDate', 400, {
+        code: 'INVALID_DATE_RANGE',
+      });
+    }
+    const days = calculateDays(from, to, 1);
+    if (days > maxDays) {
+      throw new AppError(`Custom date range cannot exceed ${maxDays} days`, 400, {
+        code: 'INVALID_DATE_RANGE',
+      });
+    }
+      const start = from || null;
     const end = to || now;
     return {
       provided: true,
       range: 'custom',
       label: 'Custom range',
-      days: calculateDays(start, end, 1),
+      days,
       start,
       end,
     };
@@ -192,7 +219,7 @@ const applyDateRangeToWhere = (where = {}, field, range) => {
   const existing = where[field] && typeof where[field] === 'object' ? where[field] : {};
   const dateFilter = { ...existing };
   if (range.start) dateFilter[Op.gte] = range.start;
-  if (range.end) dateFilter[Op.lte] = range.end;
+  if (range.end) dateFilter[Op.lt] = range.end;
   return {
     ...where,
     [field]: dateFilter,

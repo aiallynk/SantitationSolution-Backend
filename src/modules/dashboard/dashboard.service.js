@@ -18,6 +18,7 @@ const {
   Role,
   ToiletUnit,
   Geography,
+  Tenant,
 } = require('../../models');
 const storageUsageService = require('../superAdmin/storageUsage.service');
 const {
@@ -97,8 +98,24 @@ const buildTimestampFilter = ({ start = null, end = null } = {}) => {
 };
 
 const toNumber = (value, fallback = 0) => {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string' && value.trim() === '') return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const GEO_LEVEL_SEQUENCE = ['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'];
+const GEO_LEVEL_RANK = new Map(GEO_LEVEL_SEQUENCE.map((level, index) => [level, index]));
+const SCOPE_ZOOM = {
+  country: 5,
+  state: 7,
+  district: 10,
+  city: 12,
+  zone: 14,
+  ward: 15,
+  cluster: 16,
+  organization: 11,
+  platform: 4,
 };
 
 const toBoundedNumber = (value, { fallback = 0, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) => {
@@ -298,6 +315,412 @@ const getMap = async (req) => {
   });
 };
 
+const parseBounds = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const north = toNumber(value.north, null);
+  const south = toNumber(value.south, null);
+  const east = toNumber(value.east, null);
+  const west = toNumber(value.west, null);
+  if ([north, south, east, west].some((item) => item === null)) return null;
+  return { north, south, east, west };
+};
+
+const parseSplitBounds = (row) => {
+  if (!row) return null;
+  const north = toNumber(row.bounds_north, null);
+  const south = toNumber(row.bounds_south, null);
+  const east = toNumber(row.bounds_east, null);
+  const west = toNumber(row.bounds_west, null);
+  if ([north, south, east, west].some((item) => item === null)) return null;
+  return { north, south, east, west };
+};
+
+const pointsToBounds = (points = []) => {
+  const valid = points
+    .map((point) => ({
+      lat: toNumber(point?.lat ?? point?.latitude, null),
+      lng: toNumber(point?.lng ?? point?.longitude, null),
+    }))
+    .filter((point) => point.lat !== null && point.lng !== null);
+  if (valid.length === 0) return null;
+  return {
+    north: Math.max(...valid.map((point) => point.lat)),
+    south: Math.min(...valid.map((point) => point.lat)),
+    east: Math.max(...valid.map((point) => point.lng)),
+    west: Math.min(...valid.map((point) => point.lng)),
+  };
+};
+
+const mergeBounds = (left, right) => {
+  const a = parseBounds(left);
+  const b = parseBounds(right);
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    north: Math.max(a.north, b.north),
+    south: Math.min(a.south, b.south),
+    east: Math.max(a.east, b.east),
+    west: Math.min(a.west, b.west),
+  };
+};
+
+const polygonPointsFromGeoJson = (geojson) => {
+  if (!geojson || typeof geojson !== 'object') return [];
+  if (String(geojson.type || '').toLowerCase() !== 'polygon') return [];
+  const ring = Array.isArray(geojson.coordinates?.[0]) ? geojson.coordinates[0] : [];
+  return ring
+    .map((tuple) => {
+      if (!Array.isArray(tuple) || tuple.length < 2) return null;
+      const lng = toNumber(tuple[0], null);
+      const lat = toNumber(tuple[1], null);
+      return lat !== null && lng !== null ? { lat, lng } : null;
+    })
+    .filter(Boolean);
+};
+
+const mapGeographyScopeRow = (row) => {
+  if (!row) return null;
+  const lat = toNumber(row.latitude ?? row.centroid_latitude ?? row.boundary_center_latitude, null);
+  const lng = toNumber(row.longitude ?? row.centroid_longitude ?? row.boundary_center_longitude, null);
+  const polygonPoints = polygonPointsFromGeoJson(row.geojson);
+  const bounds = parseBounds(row.bounds) || parseSplitBounds(row) || pointsToBounds(polygonPoints);
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    parentId: row.parent_id || null,
+    level: row.level,
+    code: row.code,
+    name: row.name,
+    latitude: lat,
+    longitude: lng,
+    centroidLatitude: lat,
+    centroidLongitude: lng,
+    geometryType: row.geometry_type || null,
+    geojson: row.simplified_geojson || row.geojson || null,
+    bounds,
+    boundaryCenterLatitude: row.boundary_center_latitude !== null ? Number(row.boundary_center_latitude) : null,
+    boundaryCenterLongitude: row.boundary_center_longitude !== null ? Number(row.boundary_center_longitude) : null,
+    boundaryRadiusMeters: row.boundary_radius_meters !== null ? Number(row.boundary_radius_meters) : null,
+    displayAddress: row.formatted_address || row.map_display_address || row.boundary_label || null,
+    placeId: row.place_id || row.map_place_id || null,
+    source: row.map_source || null,
+    scopeType: row.scope_type || row.level || null,
+    scopeName: row.scope_name || row.name || null,
+  };
+};
+
+const getDescendantIds = (rootId, childrenByParent) => {
+  if (!rootId) return [];
+  const result = [];
+  const queue = [String(rootId)];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const parentId = queue.shift();
+    if (!parentId || seen.has(parentId)) continue;
+    seen.add(parentId);
+    for (const child of childrenByParent.get(parentId) || []) {
+      result.push(String(child.id));
+      queue.push(String(child.id));
+    }
+  }
+  return result;
+};
+
+const resolveScopeGeography = async ({ req, tenantId }) => {
+  const explicitScopeId = req.user?.geographyId || req.user?.scopeId || null;
+  if (explicitScopeId) {
+    const row = await Geography.findOne({
+      where: {
+        id: explicitScopeId,
+        ...(tenantId ? { [Op.or]: [{ tenant_id: tenantId }, { tenant_id: null }] } : {}),
+        is_active: true,
+      },
+    });
+    if (row) return row;
+  }
+
+  const scopedIds = uniqueIds(req.user?.scopeGeographyIds || []);
+  if (scopedIds.length > 0) {
+    const rows = await Geography.findAll({
+      where: {
+        id: { [Op.in]: scopedIds },
+        ...(tenantId ? { [Op.or]: [{ tenant_id: tenantId }, { tenant_id: null }] } : {}),
+        is_active: true,
+      },
+    });
+    const scopeLevel = String(req.user?.scopeLevel || '').toLowerCase();
+    const exact = rows.find((row) => row.level === scopeLevel);
+    if (exact) return exact;
+    return rows
+      .slice()
+      .sort((left, right) => (GEO_LEVEL_RANK.get(left.level) ?? 99) - (GEO_LEVEL_RANK.get(right.level) ?? 99))[0] || null;
+  }
+
+  if (tenantId) {
+    const tenant = await Tenant.findByPk(tenantId);
+    if (tenant?.root_geography_id) {
+      const root = await Geography.findByPk(tenant.root_geography_id);
+      if (root) return root;
+    }
+    return await Geography.findOne({
+      where: { tenant_id: tenantId },
+      order: [
+        ['level', 'ASC'],
+        ['name', 'ASC'],
+      ],
+    });
+  }
+
+  return null;
+};
+
+const markerFromGeography = ({ row, children = [], toilets = [], assets = [] }) => {
+  const mapped = mapGeographyScopeRow(row);
+  if (!mapped || mapped.latitude === null || mapped.longitude === null) return null;
+  return {
+    id: mapped.id,
+    type: 'geography',
+    level: mapped.level,
+    name: mapped.name,
+    latitude: mapped.latitude,
+    longitude: mapped.longitude,
+    bounds: mapped.bounds,
+    geojson: mapped.geojson,
+    geometryType: mapped.geometryType,
+    boundaryCenterLatitude: mapped.boundaryCenterLatitude,
+    boundaryCenterLongitude: mapped.boundaryCenterLongitude,
+    boundaryRadiusMeters: mapped.boundaryRadiusMeters,
+    displayAddress: mapped.displayAddress,
+    drilldown: {
+      scopeGeographyId: mapped.id,
+      childMarkers: children,
+      toilets,
+      assets,
+      counts: {
+        children: children.length,
+        toilets: toilets.length,
+        assets: assets.length,
+      },
+    },
+  };
+};
+
+const getOverviewMapScope = async (req) => {
+  const tenantId = req.user?.isSuperAdmin
+    ? req.query.tenantId || req.user?.tenantId || null
+    : req.user?.tenantId || null;
+  const scopeRow = await resolveScopeGeography({ req, tenantId });
+  let geographyIds = [];
+  if (scopeRow) {
+    const descendants = await sequelize.query(
+      `WITH RECURSIVE scoped_geographies AS (
+         SELECT id, parent_id
+         FROM geographies
+         WHERE id = :scopeId AND is_active = TRUE
+         UNION ALL
+         SELECT child.id, child.parent_id
+         FROM geographies child
+         INNER JOIN scoped_geographies parent ON child.parent_id = parent.id
+         WHERE child.is_active = TRUE
+           AND (child.tenant_id IS NULL OR child.tenant_id = :tenantId)
+       )
+       SELECT id FROM scoped_geographies`,
+      {
+        replacements: { scopeId: scopeRow.id, tenantId },
+        type: QueryTypes.SELECT,
+      }
+    );
+    geographyIds = descendants.map((row) => row.id);
+  }
+  const geographyWhere = scopeRow
+    ? { id: { [Op.in]: geographyIds.length > 0 ? geographyIds : [scopeRow.id] } }
+    : tenantId
+      ? { tenant_id: tenantId, is_active: true }
+      : { id: '00000000-0000-0000-0000-000000000000' };
+  const geographies = await Geography.findAll({
+    where: geographyWhere,
+    order: [
+      ['level', 'ASC'],
+      ['name', 'ASC'],
+    ],
+  });
+  const childrenByParent = new Map();
+  for (const row of geographies) {
+    const parentId = row.parent_id ? String(row.parent_id) : null;
+    if (!parentId) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(row);
+  }
+
+  const globalScopeRow = scopeRow?.global_geography_id || scopeRow?.master_geography_id
+    ? await Geography.findOne({
+        where: {
+          id: scopeRow.global_geography_id || scopeRow.master_geography_id,
+          tenant_id: null,
+          is_active: true,
+        },
+      })
+    : null;
+  const tenantScope = mapGeographyScopeRow(scopeRow);
+  const globalScope = mapGeographyScopeRow(globalScopeRow);
+  const scope = tenantScope
+    ? {
+        ...globalScope,
+        ...tenantScope,
+        latitude: tenantScope.latitude ?? globalScope?.latitude ?? null,
+        longitude: tenantScope.longitude ?? globalScope?.longitude ?? null,
+        centroidLatitude: tenantScope.centroidLatitude ?? globalScope?.centroidLatitude ?? null,
+        centroidLongitude: tenantScope.centroidLongitude ?? globalScope?.centroidLongitude ?? null,
+        geojson: tenantScope.geojson || globalScope?.geojson || null,
+        geometryType: tenantScope.geometryType || globalScope?.geometryType || null,
+        bounds: tenantScope.bounds || globalScope?.bounds || null,
+      }
+    : globalScope;
+  const scopedGeoIds = scopeRow
+    ? [String(scopeRow.id), ...getDescendantIds(scopeRow.id, childrenByParent)]
+    : geographies.map((row) => String(row.id));
+  const scopedGeoSet = new Set(scopedGeoIds);
+
+  const facilities = await Facility.findAll({
+    where: scopedFacilityEntityWhere(req),
+    include: [
+      { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
+      { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
+    ],
+    order: [['name', 'ASC']],
+  });
+  const facilityIds = facilities.map((facility) => facility.id);
+  const toilets = facilityIds.length > 0
+    ? await ToiletUnit.findAll({
+        where: {
+          facility_id: { [Op.in]: facilityIds },
+          deleted_at: { [Op.is]: null },
+        },
+        include: [{ model: Facility, attributes: ['id', 'name', 'geography_id', 'zone_geography_id', 'ward_geography_id'], required: true }],
+        order: [['code', 'ASC']],
+      })
+    : [];
+
+  const assetMarkers = facilities
+    .map((facility) => {
+      const lat = toNumber(facility.latitude, null);
+      const lng = toNumber(facility.longitude, null);
+      if (lat === null || lng === null) return null;
+      return {
+        id: facility.id,
+        type: 'asset',
+        level: 'asset',
+        name: facility.name,
+        code: facility.code,
+        latitude: lat,
+        longitude: lng,
+        geographyId: facility.geography_id || null,
+        zoneGeographyId: facility.zone_geography_id || null,
+        wardGeographyId: facility.ward_geography_id || null,
+        displayAddress: facility.map_display_address || facility.address_line || null,
+      };
+    })
+    .filter(Boolean);
+
+  const toiletMarkers = toilets
+    .map((toilet) => {
+      const lat = toNumber(toilet.latitude, null);
+      const lng = toNumber(toilet.longitude, null);
+      if (lat === null || lng === null) return null;
+      return {
+        id: toilet.id,
+        type: 'toilet',
+        level: 'toilet',
+        name: toilet.location_label || toilet.code,
+        code: toilet.code,
+        latitude: lat,
+        longitude: lng,
+        facilityId: toilet.facility_id,
+        geographyId: toilet.Facility?.geography_id || null,
+        zoneGeographyId: toilet.Facility?.zone_geography_id || null,
+        wardGeographyId: toilet.Facility?.ward_geography_id || null,
+        displayAddress: toilet.map_display_address || toilet.location_label || null,
+        status: toilet.status || null,
+      };
+    })
+    .filter(Boolean);
+
+  const markersForGeography = (geoId) => {
+    const descendantIds = new Set([String(geoId), ...getDescendantIds(geoId, childrenByParent)]);
+    return {
+      children: geographies
+        .filter((row) => String(row.parent_id || '') === String(geoId))
+        .map((row) => markerFromGeography({ row }))
+        .filter(Boolean),
+      toilets: toiletMarkers.filter((marker) =>
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => descendantIds.has(String(id || '')))
+      ),
+      assets: assetMarkers.filter((marker) =>
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => descendantIds.has(String(id || '')))
+      ),
+    };
+  };
+
+  const scopeLevel = String(scope?.level || req.user?.scopeLevel || '').toLowerCase();
+  const childGeographies = scopeRow
+    ? geographies.filter((row) => String(row.parent_id || '') === String(scopeRow.id))
+    : geographies.filter((row) => !row.parent_id);
+  const includeNestedGeographiesDirectly = ['district', 'city'].includes(scopeLevel);
+  const geographyMarkers = (includeNestedGeographiesDirectly && scopeRow
+    ? geographies.filter((row) => scopedGeoSet.has(String(row.id)) && String(row.id) !== String(scopeRow.id))
+    : childGeographies)
+    .map((row) => {
+      const nested = markersForGeography(row.id);
+      return markerFromGeography({
+        row,
+        children: nested.children,
+        toilets: nested.toilets,
+        assets: nested.assets,
+      });
+    })
+    .filter(Boolean);
+
+  const directToiletMarkers = scopeRow
+    ? toiletMarkers.filter((marker) =>
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || '')))
+      )
+    : toiletMarkers;
+  const directAssetMarkers = scopeRow
+    ? assetMarkers.filter((marker) =>
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || '')))
+      )
+    : assetMarkers;
+
+  const markers = [
+    ...geographyMarkers,
+    ...(['district', 'city', 'zone', 'ward'].includes(scopeLevel) ? directAssetMarkers : []),
+    ...(['district', 'city', 'zone', 'ward'].includes(scopeLevel) ? directToiletMarkers : []),
+  ];
+  const allPoints = [
+    ...(scope ? [{ lat: scope.latitude, lng: scope.longitude }] : []),
+    ...markers.map((marker) => ({ lat: marker.latitude, lng: marker.longitude })),
+  ].filter((point) => point.lat !== null && point.lng !== null);
+  const fallbackBounds = pointsToBounds(allPoints);
+  const mapBounds = scope?.bounds || pointsToBounds(polygonPointsFromGeoJson(scope?.geojson)) || fallbackBounds;
+
+  return {
+    tenantId,
+    scope,
+    center: scope?.latitude !== null && scope?.longitude !== null
+      ? { lat: scope.latitude, lng: scope.longitude }
+      : allPoints[0] || null,
+    zoom: SCOPE_ZOOM[scopeLevel] || SCOPE_ZOOM.organization,
+    bounds: mapBounds,
+    boundary: scope?.geojson || null,
+    markers,
+    counts: {
+      geographies: geographyMarkers.length,
+      assets: directAssetMarkers.length,
+      toilets: directToiletMarkers.length,
+    },
+  };
+};
+
 const getHeatmap = async (req) => {
   const dateRange = resolveDateRange(req.query, { maxDays: 90 });
   const deletedToiletIds = await loadDeletedToiletIdsForScope(req);
@@ -433,9 +856,12 @@ const getTrends = async (req) => {
   const dateRange = resolveDateRange(req.query, { defaultDays: 14, maxDays: 90 });
   const days = dateRange.days || 14;
   const start = dateRange.start || new Date();
+  const end = dateRange.end || new Date();
+  const timezone = getDefaultTimezone();
 
   const replacements = {
     start,
+    end,
     displayTimezone: getDefaultTimezone(),
   };
   let tenantClause = '';
@@ -466,6 +892,7 @@ const getTrends = async (req) => {
       LEFT JOIN ai_analysis_results a ON a.inspection_id = i.id
       LEFT JOIN toilet_units tu ON tu.id = i.toilet_unit_id
       WHERE i.captured_at >= :start
+        AND i.captured_at < :end
         AND (i.toilet_unit_id IS NULL OR tu.deleted_at IS NULL)
         ${tenantClause}
         ${facilityClause}
@@ -482,15 +909,27 @@ const getTrends = async (req) => {
   const points = [];
   for (let i = 0; i < days; i += 1) {
     const current = new Date(start.getTime() + i * 86_400_000);
-    const label = toIstDateKey(current);
-    const row = map.get(label);
+    const date = toIstDateKey(current);
+    const row = map.get(date);
+    const avgCleanliness = row?.avgCleanliness;
     points.push({
-      label,
+      date,
+      label: date,
       inspectionCount: Number(row?.inspectionCount || 0),
-      cleanlinessAverage: Number(toNumber(row?.avgCleanliness, 0).toFixed(2)),
+      cleanlinessAverage:
+        avgCleanliness === null || avgCleanliness === undefined
+          ? null
+          : Number(toNumber(avgCleanliness, 0).toFixed(2)),
     });
   }
-  return points;
+  return {
+    requestedRange: {
+      startDate: toIstDateKey(start),
+      endDate: toIstDateKey(new Date(end.getTime() - 1)),
+      timezone,
+    },
+    series: points,
+  };
 };
 
 const getWorkforce = async (req) => {
@@ -1138,6 +1577,7 @@ const getContractorPerformance = async (req) => {
 
 module.exports = {
   getOverview,
+  getOverviewMapScope,
   getMap,
   getHeatmap,
   getFacilityDashboard,

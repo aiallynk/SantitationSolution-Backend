@@ -40,7 +40,14 @@ const PlatformUser = sequelize.define(
     ward_name: { type: DataTypes.STRING(120), allowNull: true },
     password_hash: { type: DataTypes.STRING(255), allowNull: true },
     auth_provider: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'local' },
-    status: { type: DataTypes.ENUM('active', 'inactive', 'locked'), allowNull: false, defaultValue: 'active' },
+    must_change_password: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    failed_login_attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    locked_until: { type: DataTypes.DATE, allowNull: true },
+    status: {
+      type: DataTypes.ENUM('active', 'inactive', 'locked', 'pending_activation'),
+      allowNull: false,
+      defaultValue: 'active',
+    },
     last_login_at: { type: DataTypes.DATE, allowNull: true },
     metadata: { type: DataTypes.JSONB, allowNull: true },
     ...commonTimestamps,
@@ -159,32 +166,270 @@ const Tenant = sequelize.define(
   { tableName: 'tenants', timestamps: false }
 );
 
+const OperationalMasterData = sequelize.define(
+  'OperationalMasterData',
+  {
+    id: defineUuidId(),
+    master_type: { type: DataTypes.STRING(80), allowNull: false },
+    code: { type: DataTypes.STRING(120), allowNull: false },
+    name: { type: DataTypes.STRING(200), allowNull: false },
+    description: { type: DataTypes.STRING(600), allowNull: true },
+    status: { type: DataTypes.ENUM('active', 'inactive'), allowNull: false, defaultValue: 'active' },
+    source_scope: { type: DataTypes.ENUM('PLATFORM', 'STATE', 'TENANT'), allowNull: false },
+    state_id: { type: DataTypes.UUID, allowNull: true },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    is_mandatory: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    allow_tenant_override: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    parent_id: { type: DataTypes.UUID, allowNull: true },
+    sort_order: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    metadata: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    created_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    updated_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'operational_master_data', timestamps: false }
+);
+
 const Geography = sequelize.define(
   'Geography',
   {
     id: defineUuidId(),
-    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
     parent_id: { type: DataTypes.UUID, allowNull: true },
+    master_geography_id: { type: DataTypes.UUID, allowNull: true },
+    global_geography_id: { type: DataTypes.UUID, allowNull: true },
     level: {
       type: DataTypes.ENUM('country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'),
       allowNull: false,
     },
     code: { type: DataTypes.STRING(120), allowNull: false },
     name: { type: DataTypes.STRING(200), allowNull: false },
+    ascii_name: { type: DataTypes.STRING(220), allowNull: true },
+    local_name: { type: DataTypes.STRING(220), allowNull: true },
+    normalized_name: { type: DataTypes.STRING(220), allowNull: true },
+    alternate_names: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    external_source: { type: DataTypes.STRING(80), allowNull: true },
+    external_code: { type: DataTypes.STRING(160), allowNull: true },
+    external_place_id: { type: DataTypes.STRING(220), allowNull: true },
+    country_code: { type: DataTypes.STRING(10), allowNull: true },
+    country_iso2: { type: DataTypes.STRING(2), allowNull: true },
+    country_iso3: { type: DataTypes.STRING(3), allowNull: true },
+    admin1_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin2_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin3_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin4_code: { type: DataTypes.STRING(40), allowNull: true },
+    administrative_type: { type: DataTypes.STRING(80), allowNull: true },
+    source_administrative_level: { type: DataTypes.STRING(80), allowNull: true },
+    latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     centroid_latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     centroid_longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    place_id: { type: DataTypes.STRING(220), allowNull: true },
+    formatted_address: { type: DataTypes.STRING(500), allowNull: true },
     geometry_type: { type: DataTypes.STRING(20), allowNull: true },
     geojson: { type: DataTypes.JSONB, allowNull: true },
+    simplified_geojson: { type: DataTypes.JSONB, allowNull: true },
     boundary_center_latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     boundary_center_longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     boundary_radius_meters: { type: DataTypes.DECIMAL(12, 2), allowNull: true },
     bounds: { type: DataTypes.JSONB, allowNull: true },
+    bounds_north: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    bounds_south: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    bounds_east: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    bounds_west: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     area_sq_km: { type: DataTypes.DECIMAL(14, 4), allowNull: true },
     boundary_label: { type: DataTypes.STRING(220), allowNull: true },
+    description: { type: DataTypes.STRING(600), allowNull: true },
+    scope_type: { type: DataTypes.STRING(40), allowNull: true },
+    scope_name: { type: DataTypes.STRING(200), allowNull: true },
+    location_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'mapped' },
+    map_display_address: { type: DataTypes.STRING(500), allowNull: true },
+    map_place_id: { type: DataTypes.STRING(220), allowNull: true },
+    map_source: { type: DataTypes.STRING(80), allowNull: true },
+    population: { type: DataTypes.BIGINT, allowNull: true },
+    timezone: { type: DataTypes.STRING(80), allowNull: true },
+    preferred_source: { type: DataTypes.STRING(40), allowNull: true },
+    preferred_external_code: { type: DataTypes.STRING(160), allowNull: true },
+    source_modified_at: { type: DataTypes.DATEONLY, allowNull: true },
+    quality_status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'imported' },
+    import_batch_id: { type: DataTypes.UUID, allowNull: true },
+    is_active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    is_official_source: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    is_platform_managed: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    is_verified_local_government: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     is_operational_zone: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     ...commonTimestamps,
   },
   { tableName: 'geographies', timestamps: false }
+);
+
+const GeographyImportJob = sequelize.define(
+  'GeographyImportJob',
+  {
+    id: defineUuidId(),
+    source: { type: DataTypes.STRING(80), allowNull: false },
+    country_code: { type: DataTypes.STRING(10), allowNull: true },
+    level: { type: DataTypes.STRING(20), allowNull: true },
+    status: {
+      type: DataTypes.ENUM('queued', 'running', 'completed', 'failed'),
+      allowNull: false,
+      defaultValue: 'queued',
+    },
+    requested_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    idempotency_key: { type: DataTypes.STRING(160), allowNull: false },
+    input_hash: { type: DataTypes.STRING(128), allowNull: true },
+    summary: { type: DataTypes.JSONB, allowNull: true },
+    payload: { type: DataTypes.JSONB, allowNull: true },
+    started_at: { type: DataTypes.DATE, allowNull: true },
+    completed_at: { type: DataTypes.DATE, allowNull: true },
+    error_message: { type: DataTypes.TEXT, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'geography_import_jobs', timestamps: false }
+);
+
+const TenantGeographyAssignment = sequelize.define(
+  'TenantGeographyAssignment',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    geography_id: { type: DataTypes.UUID, allowNull: false },
+    is_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    created_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'tenant_geography_assignments', timestamps: false }
+);
+
+const GeographyExternalIdentifier = sequelize.define(
+  'GeographyExternalIdentifier',
+  {
+    id: defineUuidId(),
+    geography_id: { type: DataTypes.UUID, allowNull: false },
+    external_source: { type: DataTypes.STRING(80), allowNull: false },
+    external_code: { type: DataTypes.STRING(160), allowNull: false },
+    is_primary: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    ...commonTimestamps,
+  },
+  { tableName: 'geography_external_identifiers', timestamps: false }
+);
+
+const GeographyMigrationReview = sequelize.define(
+  'GeographyMigrationReview',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    legacy_geography_id: { type: DataTypes.UUID, allowNull: false },
+    candidate_master_geography_ids: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
+    match_method: { type: DataTypes.STRING(40), allowNull: true },
+    status: {
+      type: DataTypes.ENUM('pending', 'matched', 'ignored'),
+      allowNull: false,
+      defaultValue: 'pending',
+    },
+    notes: { type: DataTypes.TEXT, allowNull: true },
+    reviewed_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    reviewed_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'geography_migration_reviews', timestamps: false }
+);
+
+const GlobalGeographyImportBatch = sequelize.define(
+  'GlobalGeographyImportBatch',
+  {
+    id: defineUuidId(),
+    source: { type: DataTypes.STRING(40), allowNull: false },
+    input_scope: { type: DataTypes.STRING(120), allowNull: false, defaultValue: 'all' },
+    source_version: { type: DataTypes.STRING(120), allowNull: true },
+    source_file: { type: DataTypes.STRING(500), allowNull: true },
+    checksum: { type: DataTypes.STRING(128), allowNull: true },
+    checkpoint: { type: DataTypes.JSONB, allowNull: true },
+    started_at: { type: DataTypes.DATE, allowNull: true },
+    completed_at: { type: DataTypes.DATE, allowNull: true },
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'queued' },
+    total_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    inserted_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    updated_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    unchanged_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    skipped_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    failed_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    ambiguous_records: { type: DataTypes.BIGINT, allowNull: false, defaultValue: 0 },
+    error_summary: { type: DataTypes.JSONB, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'global_geography_import_batches', timestamps: false }
+);
+
+const GlobalGeographySource = sequelize.define(
+  'GlobalGeographySource',
+  {
+    id: defineUuidId(),
+    global_geography_id: { type: DataTypes.UUID, allowNull: false },
+    source: { type: DataTypes.STRING(40), allowNull: false },
+    external_code: { type: DataTypes.STRING(160), allowNull: false },
+    source_name: { type: DataTypes.STRING(220), allowNull: true },
+    source_level: { type: DataTypes.STRING(80), allowNull: true },
+    source_parent_code: { type: DataTypes.STRING(160), allowNull: true },
+    source_latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    source_longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    source_payload: { type: DataTypes.JSONB, allowNull: true },
+    boundary_id: { type: DataTypes.STRING(180), allowNull: true },
+    source_licence: { type: DataTypes.STRING(220), allowNull: true },
+    source_attribution: { type: DataTypes.TEXT, allowNull: true },
+    source_reference: { type: DataTypes.STRING(1000), allowNull: true },
+    source_modified_at: { type: DataTypes.DATEONLY, allowNull: true },
+    is_preferred: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    ...commonTimestamps,
+  },
+  { tableName: 'global_geography_sources', timestamps: false }
+);
+
+const GlobalGeographyAlias = sequelize.define(
+  'GlobalGeographyAlias',
+  {
+    id: defineUuidId(),
+    global_geography_id: { type: DataTypes.UUID, allowNull: false },
+    name: { type: DataTypes.STRING(300), allowNull: false },
+    normalized_name: { type: DataTypes.STRING(320), allowNull: false },
+    language_code: { type: DataTypes.STRING(20), allowNull: true },
+    is_preferred: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    is_short_name: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    is_historic: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    source: { type: DataTypes.STRING(40), allowNull: false },
+    external_code: { type: DataTypes.STRING(160), allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'global_geography_aliases', timestamps: false }
+);
+
+const GlobalGeographyImportStaging = sequelize.define(
+  'GlobalGeographyImportStaging',
+  {
+    id: defineUuidId(),
+    import_batch_id: { type: DataTypes.UUID, allowNull: false },
+    source: { type: DataTypes.STRING(40), allowNull: false },
+    external_code: { type: DataTypes.STRING(160), allowNull: false },
+    parent_external_code: { type: DataTypes.STRING(160), allowNull: true },
+    raw_name: { type: DataTypes.STRING(300), allowNull: true },
+    normalized_name: { type: DataTypes.STRING(320), allowNull: true },
+    raw_level: { type: DataTypes.STRING(80), allowNull: true },
+    normalized_level: { type: DataTypes.STRING(20), allowNull: true },
+    country_iso2: { type: DataTypes.STRING(2), allowNull: true },
+    country_iso3: { type: DataTypes.STRING(3), allowNull: true },
+    admin1_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin2_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin3_code: { type: DataTypes.STRING(40), allowNull: true },
+    admin4_code: { type: DataTypes.STRING(40), allowNull: true },
+    latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    raw_payload: { type: DataTypes.JSONB, allowNull: true },
+    validation_status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'pending' },
+    validation_error: { type: DataTypes.TEXT, allowNull: true },
+    processed_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'global_geography_import_staging', timestamps: false }
 );
 
 const Facility = sequelize.define(
@@ -200,11 +445,18 @@ const Facility = sequelize.define(
     name: { type: DataTypes.STRING(220), allowNull: false },
     facility_type: { type: DataTypes.STRING(80), allowNull: false },
     address_line: { type: DataTypes.STRING(300), allowNull: true },
+    contact_name: { type: DataTypes.STRING(180), allowNull: true },
+    contact_phone: { type: DataTypes.STRING(32), allowNull: true },
+    contact_email: { type: DataTypes.STRING(180), allowNull: true },
     latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    map_display_address: { type: DataTypes.STRING(500), allowNull: true },
+    map_place_id: { type: DataTypes.STRING(220), allowNull: true },
+    map_source: { type: DataTypes.STRING(80), allowNull: true },
+    location_status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'mapped' },
     timezone: { type: DataTypes.STRING(64), allowNull: true },
     status: {
-      type: DataTypes.ENUM('active', 'inactive', 'maintenance'),
+      type: DataTypes.ENUM('active', 'inactive', 'maintenance', 'location_pending'),
       allowNull: false,
       defaultValue: 'active',
     },
@@ -212,6 +464,26 @@ const Facility = sequelize.define(
     ...commonTimestamps,
   },
   { tableName: 'facilities', timestamps: false }
+);
+
+const FacilityQrCode = sequelize.define(
+  'FacilityQrCode',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: true },
+    facility_id: { type: DataTypes.UUID, allowNull: false },
+    qr_token_hash: { type: DataTypes.STRING(128), allowNull: false },
+    schema_version: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'facility_qr_v1' },
+    qr_payload: { type: DataTypes.JSONB, allowNull: true },
+    status: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'active' },
+    is_primary: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    compromised_reason: { type: DataTypes.STRING(600), allowNull: true },
+    last_scanned_at: { type: DataTypes.DATE, allowNull: true },
+    created_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    updated_by_user_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'facility_qr_codes', timestamps: false }
 );
 
 const ToiletBlock = sequelize.define(
@@ -243,6 +515,9 @@ const ToiletUnit = sequelize.define(
     location_label: { type: DataTypes.STRING(300), allowNull: true },
     latitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
     longitude: { type: DataTypes.DECIMAL(10, 7), allowNull: true },
+    map_display_address: { type: DataTypes.STRING(500), allowNull: true },
+    map_place_id: { type: DataTypes.STRING(220), allowNull: true },
+    map_source: { type: DataTypes.STRING(80), allowNull: true },
     location: { type: DataTypes.JSONB, allowNull: true },
     latest_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
     latest_before_score: { type: DataTypes.DECIMAL(6, 2), allowNull: true },
@@ -933,6 +1208,49 @@ const LoginSession = sequelize.define(
   { tableName: 'login_sessions', timestamps: false }
 );
 
+const WorkerImportJob = sequelize.define(
+  'WorkerImportJob',
+  {
+    id: defineUuidId(),
+    tenant_id: { type: DataTypes.UUID, allowNull: false },
+    uploaded_by: { type: DataTypes.UUID, allowNull: false },
+    uploader_scope_type: { type: DataTypes.STRING(40), allowNull: true },
+    uploader_scope_id: { type: DataTypes.UUID, allowNull: true },
+    original_file_name: { type: DataTypes.STRING(255), allowNull: false },
+    file_checksum: { type: DataTypes.STRING(128), allowNull: false },
+    total_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    valid_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    invalid_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    duplicate_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    warning_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    created_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    failed_rows: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'UPLOADED' },
+    summary: { type: DataTypes.JSONB, allowNull: true },
+    started_at: { type: DataTypes.DATE, allowNull: true },
+    completed_at: { type: DataTypes.DATE, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'worker_import_jobs', timestamps: false }
+);
+
+const WorkerImportRow = sequelize.define(
+  'WorkerImportRow',
+  {
+    id: defineUuidId(),
+    import_job_id: { type: DataTypes.UUID, allowNull: false },
+    row_number: { type: DataTypes.INTEGER, allowNull: false },
+    employee_code: { type: DataTypes.STRING(64), allowNull: true },
+    normalized_payload: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+    status: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'PENDING' },
+    validation_errors: { type: DataTypes.JSONB, allowNull: true },
+    created_worker_id: { type: DataTypes.UUID, allowNull: true },
+    created_user_id: { type: DataTypes.UUID, allowNull: true },
+    ...commonTimestamps,
+  },
+  { tableName: 'worker_import_rows', timestamps: false }
+);
+
 const DashboardAggregate = sequelize.define(
   'DashboardAggregate',
   {
@@ -1479,6 +1797,9 @@ const PasswordResetToken = sequelize.define(
     id: defineUuidId(),
     user_id: { type: DataTypes.UUID, allowNull: false },
     token_hash: { type: DataTypes.STRING(255), allowNull: false },
+    purpose: { type: DataTypes.STRING(40), allowNull: false, defaultValue: 'password_reset' },
+    delivery_channel: { type: DataTypes.STRING(40), allowNull: true },
+    metadata: { type: DataTypes.JSONB, allowNull: true },
     expires_at: { type: DataTypes.DATE, allowNull: false },
     used_at: { type: DataTypes.DATE, allowNull: true },
     ...commonTimestamps,
@@ -1505,6 +1826,30 @@ Tenant.hasMany(PlatformUser, { foreignKey: 'tenant_id' });
 PlatformUser.belongsTo(Tenant, { foreignKey: 'tenant_id' });
 Tenant.hasMany(Geography, { foreignKey: 'tenant_id' });
 Geography.belongsTo(Tenant, { foreignKey: 'tenant_id' });
+Geography.belongsTo(Geography, { foreignKey: 'master_geography_id', as: 'masterGeography' });
+Geography.hasMany(Geography, { foreignKey: 'master_geography_id', as: 'legacyGeographies' });
+Geography.belongsTo(Geography, { foreignKey: 'global_geography_id', as: 'globalGeography' });
+Geography.hasMany(Geography, { foreignKey: 'global_geography_id', as: 'tenantGeographies' });
+Geography.hasMany(GlobalGeographySource, { foreignKey: 'global_geography_id', as: 'globalSources' });
+GlobalGeographySource.belongsTo(Geography, { foreignKey: 'global_geography_id', as: 'globalGeography' });
+Geography.hasMany(GlobalGeographyAlias, { foreignKey: 'global_geography_id', as: 'globalAliases' });
+GlobalGeographyAlias.belongsTo(Geography, { foreignKey: 'global_geography_id', as: 'globalGeography' });
+GlobalGeographyImportBatch.hasMany(GlobalGeographyImportStaging, { foreignKey: 'import_batch_id', as: 'stagedRows' });
+GlobalGeographyImportStaging.belongsTo(GlobalGeographyImportBatch, { foreignKey: 'import_batch_id', as: 'batch' });
+PlatformUser.hasMany(GeographyImportJob, { foreignKey: 'requested_by_user_id', as: 'requestedGeographyImportJobs' });
+GeographyImportJob.belongsTo(PlatformUser, { foreignKey: 'requested_by_user_id', as: 'requestedBy' });
+Tenant.hasMany(TenantGeographyAssignment, { foreignKey: 'tenant_id', as: 'geographyAssignments' });
+TenantGeographyAssignment.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Geography.hasMany(TenantGeographyAssignment, { foreignKey: 'geography_id', as: 'tenantAssignments' });
+TenantGeographyAssignment.belongsTo(Geography, { foreignKey: 'geography_id', as: 'geography' });
+Geography.hasMany(GeographyExternalIdentifier, { foreignKey: 'geography_id', as: 'externalIdentifiers' });
+GeographyExternalIdentifier.belongsTo(Geography, { foreignKey: 'geography_id', as: 'geography' });
+PlatformUser.hasMany(TenantGeographyAssignment, { foreignKey: 'created_by_user_id', as: 'createdGeographyAssignments' });
+TenantGeographyAssignment.belongsTo(PlatformUser, { foreignKey: 'created_by_user_id', as: 'createdBy' });
+Geography.hasMany(GeographyMigrationReview, { foreignKey: 'legacy_geography_id', as: 'migrationReviews' });
+GeographyMigrationReview.belongsTo(Geography, { foreignKey: 'legacy_geography_id', as: 'legacyGeography' });
+Tenant.hasMany(GeographyMigrationReview, { foreignKey: 'tenant_id', as: 'geographyMigrationReviews' });
+GeographyMigrationReview.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.belongsTo(Geography, { foreignKey: 'root_geography_id', as: 'rootGeography' });
 Geography.hasMany(Tenant, { foreignKey: 'root_geography_id', as: 'scopedTenants' });
 Tenant.hasMany(Facility, { foreignKey: 'tenant_id' });
@@ -1517,6 +1862,14 @@ Facility.belongsTo(Geography, { foreignKey: 'ward_geography_id', as: 'ward' });
 Geography.hasMany(Facility, { foreignKey: 'ward_geography_id', as: 'wardFacilities' });
 Facility.belongsTo(PlatformUser, { foreignKey: 'supervisor_user_id', as: 'supervisor' });
 PlatformUser.hasMany(Facility, { foreignKey: 'supervisor_user_id', as: 'supervisedFacilities' });
+Tenant.hasMany(FacilityQrCode, { foreignKey: 'tenant_id', as: 'facilityQrCodes' });
+FacilityQrCode.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Facility.hasMany(FacilityQrCode, { foreignKey: 'facility_id', as: 'qrCodes' });
+FacilityQrCode.belongsTo(Facility, { foreignKey: 'facility_id', as: 'facility' });
+PlatformUser.hasMany(FacilityQrCode, { foreignKey: 'created_by_user_id', as: 'createdFacilityQrCodes' });
+FacilityQrCode.belongsTo(PlatformUser, { foreignKey: 'created_by_user_id', as: 'createdBy' });
+PlatformUser.hasMany(FacilityQrCode, { foreignKey: 'updated_by_user_id', as: 'updatedFacilityQrCodes' });
+FacilityQrCode.belongsTo(PlatformUser, { foreignKey: 'updated_by_user_id', as: 'updatedBy' });
 
 Facility.hasMany(ToiletBlock, { foreignKey: 'facility_id' });
 ToiletBlock.belongsTo(Facility, { foreignKey: 'facility_id' });
@@ -1676,6 +2029,14 @@ WorkerHeartbeat.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.hasMany(WorkerHeartbeat, { foreignKey: 'tenant_id', as: 'workerHeartbeats' });
 WorkerHeartbeat.belongsTo(PlatformUser, { foreignKey: 'worker_id', as: 'worker' });
 PlatformUser.hasMany(WorkerHeartbeat, { foreignKey: 'worker_id', as: 'heartbeats' });
+Tenant.hasMany(WorkerImportJob, { foreignKey: 'tenant_id', as: 'workerImportJobs' });
+WorkerImportJob.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+PlatformUser.hasMany(WorkerImportJob, { foreignKey: 'uploaded_by', as: 'uploadedWorkerImportJobs' });
+WorkerImportJob.belongsTo(PlatformUser, { foreignKey: 'uploaded_by', as: 'uploader' });
+WorkerImportJob.hasMany(WorkerImportRow, { foreignKey: 'import_job_id', as: 'rows' });
+WorkerImportRow.belongsTo(WorkerImportJob, { foreignKey: 'import_job_id', as: 'job' });
+WorkerImportRow.belongsTo(PlatformUser, { foreignKey: 'created_worker_id', as: 'createdWorker' });
+WorkerImportRow.belongsTo(PlatformUser, { foreignKey: 'created_user_id', as: 'createdUser' });
 
 TaskAssignmentLog.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
 Tenant.hasMany(TaskAssignmentLog, { foreignKey: 'tenant_id', as: 'taskAssignmentLogs' });
@@ -1764,6 +2125,10 @@ ApiKey.hasMany(ApiKeyEvent, { foreignKey: 'api_key_id', as: 'events' });
 ApiKeyEvent.belongsTo(ApiProject, { foreignKey: 'api_project_id', as: 'project' });
 ApiKeyEvent.belongsTo(ApiKey, { foreignKey: 'api_key_id', as: 'apiKey' });
 ApiKeyEvent.belongsTo(PlatformUser, { foreignKey: 'actor_user_id', as: 'actor' });
+OperationalMasterData.belongsTo(Tenant, { foreignKey: 'tenant_id', as: 'tenant' });
+Tenant.hasMany(OperationalMasterData, { foreignKey: 'tenant_id', as: 'operationalMasterDataRecords' });
+OperationalMasterData.belongsTo(Geography, { foreignKey: 'state_id', as: 'state' });
+OperationalMasterData.belongsTo(OperationalMasterData, { foreignKey: 'parent_id', as: 'parent' });
 
 module.exports = {
   sequelize,
@@ -1774,8 +2139,18 @@ module.exports = {
   UserRole,
   WorkerAssignment,
   Tenant,
+  OperationalMasterData,
   Geography,
+  GeographyImportJob,
+  TenantGeographyAssignment,
+  GeographyExternalIdentifier,
+  GeographyMigrationReview,
+  GlobalGeographyImportBatch,
+  GlobalGeographyImportStaging,
+  GlobalGeographySource,
+  GlobalGeographyAlias,
   Facility,
+  FacilityQrCode,
   ToiletBlock,
   ToiletUnit,
   ToiletQrCode,
@@ -1803,6 +2178,8 @@ module.exports = {
   NotificationDeliveryLog,
   AuditLog,
   LoginSession,
+  WorkerImportJob,
+  WorkerImportRow,
   DashboardAggregate,
   StorageUsageMetric,
   IntegrationConfig,

@@ -12,7 +12,7 @@ const { RouteKeys, ScopeTypes, SurfaceTypes } = require('../../core/rbac/accessM
 const router = express.Router();
 
 router.use(
-  '/dashboard',
+  ['/dashboard', '/overview'],
   protect,
   requireSurface(
     SurfaceTypes.OPS_WEB,
@@ -32,6 +32,8 @@ router.use(
 );
 
 router.get('/dashboard/overview', dashboardController.getOverview);
+router.get('/dashboard/overview/map-scope', dashboardController.getOverviewMapScope);
+router.get('/overview/map-scope', dashboardController.getOverviewMapScope);
 router.get('/dashboard/map', dashboardController.getMap);
 router.get('/dashboard/heatmap', dashboardController.getHeatmap);
 router.get('/dashboard/facility/:id', dashboardController.getFacility);

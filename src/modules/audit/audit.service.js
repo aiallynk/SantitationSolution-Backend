@@ -58,11 +58,18 @@ const ACTION_LABELS = {
   'super_admin.approval_update': 'Approval Updated',
   'super_admin.feature_flags_update': 'Feature Flags Updated',
   'user.update_me': 'Profile Updated',
+  'auth.activate_account': 'Account Activated',
+  'worker.import.template_downloaded': 'Worker Import Template Downloaded',
+  'worker.import.validation_completed': 'Worker Import Validation Completed',
+  'worker.import.confirmed': 'Worker Import Confirmed',
+  'worker.import.worker_created': 'Imported Worker Created',
+  'worker.import.activation_generated': 'Worker Activation Generated',
 };
 
 const ENTITY_LABELS = {
   tenant: 'Tenant',
   platform_user: 'User',
+  worker_import_job: 'Worker Import Job',
   geography: 'Geography',
   facility: 'Facility',
   toilet_block: 'Toilet Block',

@@ -29,6 +29,14 @@ const validateRefresh = (req) => {
   return errors;
 };
 
+const validateLogout = (req) => {
+  const errors = [];
+  if (req.body.refreshToken !== undefined && isBlank(req.body.refreshToken)) {
+    errors.push('refreshToken cannot be blank when provided');
+  }
+  return errors;
+};
+
 const validateForgotPassword = (req) => {
   const errors = [];
   if (isBlank(req.body.email)) {
@@ -54,6 +62,27 @@ const validateVerifyResetToken = (req) => {
   const errors = [];
   if (isBlank(req.body.token)) {
     errors.push('token is required');
+  }
+  return errors;
+};
+
+const validateVerifyActivationToken = (req) => {
+  const errors = [];
+  if (isBlank(req.body.token)) {
+    errors.push('token is required');
+  }
+  return errors;
+};
+
+const validateActivateAccount = (req) => {
+  const errors = [];
+  if (isBlank(req.body.token)) {
+    errors.push('token is required');
+  }
+  if (isBlank(req.body.newPassword)) {
+    errors.push('newPassword is required');
+  } else if (String(req.body.newPassword).length < 8) {
+    errors.push('newPassword must be at least 8 characters');
   }
   return errors;
 };
@@ -103,11 +132,25 @@ const validateUpdateMe = (req) => {
   return errors;
 };
 
+const validateChangeTemporaryPassword = (req) => {
+  const errors = [];
+  if (isBlank(req.body.newPassword)) {
+    errors.push('newPassword is required');
+  } else if (String(req.body.newPassword).length < 8) {
+    errors.push('newPassword must be at least 8 characters');
+  }
+  return errors;
+};
+
 module.exports = {
   validateLogin,
   validateRefresh,
+  validateLogout,
   validateForgotPassword,
   validateResetPassword,
   validateVerifyResetToken,
+  validateVerifyActivationToken,
+  validateActivateAccount,
+  validateChangeTemporaryPassword,
   validateUpdateMe,
 };
