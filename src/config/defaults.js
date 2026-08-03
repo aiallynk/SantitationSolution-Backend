@@ -1,3 +1,5 @@
+const { PPM_ALERT_THRESHOLDS } = require('../modules/sensors/ppmOdorTier.service');
+
 const defaults = Object.freeze({
   app: {
     ingestRateLimitMax: 5000,
@@ -87,15 +89,12 @@ const defaults = Object.freeze({
     tempFileJanitorMaxDeletePerRun: 500,
   },
   alerts: {
-    // BLE wand environmental thresholds. Physically-meaningful metrics
-    // (temperature °C, humidity %) ship with sane defaults. The PPM gas
-    // channel (TGS sensor) has no finally-confirmed calibration yet, so its
-    // thresholds default to null (disabled) — operators must set calibrated
-    // values before any PPM alert fires. `null` => metric disabled.
+    // BLE wand environmental thresholds. PPM follows the approved odor-tier
+    // policy: 76 starts the Bad tier and readings above 120 are critical.
     sensor: {
       temperature: { highWarningC: 35, highCriticalC: 40, lowWarningC: null, lowCriticalC: null },
       humidity: { highWarningPct: 80, highCriticalPct: 90, lowWarningPct: 15, lowCriticalPct: 8 },
-      ppm: { warning: null, critical: null },
+      ppm: PPM_ALERT_THRESHOLDS,
       battery: { lowWarningPct: 20, lowCriticalPct: 10 },
       offline: { warningMinutes: 30, criticalMinutes: 180 },
     },

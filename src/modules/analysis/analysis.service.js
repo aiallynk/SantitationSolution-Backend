@@ -42,6 +42,7 @@ const {
   resolveAiScoringMode,
   scoreInspectionFindings,
 } = require('./aiInspectionScoring.service');
+const { resolvePpmOdorTier } = require('../sensors/ppmOdorTier.service');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -62,10 +63,6 @@ const toSensorNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
-// Gas concentration (ppm) above which the TGS sensor reading counts as a risk
-// signal for the sensor-impact penalty. Mirrors the operator-calibrated
-// SENSOR_PPM_WARNING bound used by the live threshold/alert engine.
-const PPM_RISK_THRESHOLD = runtimeConfig.alerts.sensor.ppm.warning ?? 400;
 const parseSensorContext = (snapshot = null) => {
   if (!snapshot || typeof snapshot !== 'object') return null;
   const readingTime = snapshot.readingTime || snapshot.timestamp || snapshot.linkedAt || null;
@@ -87,41 +84,59 @@ const parseSensorContext = (snapshot = null) => {
   return hasMetric ? context : null;
 };
 const computeSensorImpact = (context = null) => {
-  if (!context) return { sensorImpact: 0, environmentalScore: null, reasons: [] };
-  let impact = 0;
+  if (!context) {
+    return {
+      sensorImpact: 0,
+      nonPpmSensorImpact: 0,
+      ppmImpact: 0,
+      environmentalScore: null,
+      ppmOdorTier: null,
+      reasons: [],
+    };
+  }
+  let nonPpmSensorImpact = 0;
   const reasons = [];
   if (context.sensorStatus === 'OFFLINE') {
-    impact -= 6;
+    nonPpmSensorImpact -= 6;
     reasons.push('sensor_offline');
   }
   if (context.readingAgeMinutes !== null && context.readingAgeMinutes > 15) {
-    impact -= Math.min(6, Math.floor((context.readingAgeMinutes - 15) / 15) + 1);
+    nonPpmSensorImpact -= Math.min(6, Math.floor((context.readingAgeMinutes - 15) / 15) + 1);
     reasons.push('stale_sensor_reading');
   }
   if (context.humidity !== null && context.humidity >= 90) {
-    impact -= 7;
+    nonPpmSensorImpact -= 7;
     reasons.push('very_high_humidity');
   } else if (context.humidity !== null && context.humidity >= 80) {
-    impact -= 4;
+    nonPpmSensorImpact -= 4;
     reasons.push('high_humidity');
   } else if (context.humidity !== null && context.humidity <= 10) {
-    impact -= 3;
+    nonPpmSensorImpact -= 3;
     reasons.push('very_low_humidity');
   }
   if (context.temperature !== null && context.temperature >= 40) {
-    impact -= 6;
+    nonPpmSensorImpact -= 6;
     reasons.push('very_high_temperature');
   } else if (context.temperature !== null && context.temperature >= 35) {
-    impact -= 3;
+    nonPpmSensorImpact -= 3;
     reasons.push('high_temperature');
   }
-  if (context.ppm !== null && context.ppm > PPM_RISK_THRESHOLD) {
-    impact -= 2;
-    reasons.push('ppm_risk_signal');
+  const ppmOdorTier = resolvePpmOdorTier(context.ppm);
+  const ppmImpact = ppmOdorTier?.scoreAdjustment || 0;
+  if (ppmOdorTier) {
+    reasons.push(`ppm_${ppmOdorTier.key}_odor_tier`);
   }
-  const sensorImpact = clamp(Math.round(impact), -25, 0);
+  nonPpmSensorImpact = clamp(Math.round(nonPpmSensorImpact), -25, 0);
+  const sensorImpact = clamp(nonPpmSensorImpact + ppmImpact, -25, 20);
   const environmentalScore = clamp(100 + sensorImpact, 0, 100);
-  return { sensorImpact, environmentalScore, reasons };
+  return {
+    sensorImpact,
+    nonPpmSensorImpact,
+    ppmImpact,
+    environmentalScore,
+    ppmOdorTier,
+    reasons,
+  };
 };
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
 const FRAUD_SIMILARITY_THRESHOLD = runtimeConfig.analysis.fraudSimilarityThreshold;
@@ -1066,6 +1081,10 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
     typeof aggregate.pipelineCounters.ai_comparison_result === 'object'
       ? aggregate.pipelineCounters.ai_comparison_result
       : null;
+  const sensorImpact = Number(base?.sensorImpact ?? base?.strictJson?.sensor_impact ?? 0) || 0;
+  const environmentalScore =
+    base?.environmentalScore ?? base?.strictJson?.environmental_score ?? null;
+  const ppmOdorTier = base?.strictJson?.ppm_odor_tier ?? null;
 
   return {
     overallStatus: deriveStatus(overviewScore),
@@ -1082,6 +1101,9 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
       base?.severityLabel ||
       (aggregate?.reviewRequired ? 'high' : severityLevelFromRisk),
     reviewRequired: Boolean(aggregate?.reviewRequired || base?.reviewRequired),
+    sensorImpact,
+    environmentalScore,
+    ppmOdorTier,
     explanationText:
       base?.explanationText ||
       (issueTags.length > 0 ? `Detected issues: ${issueTags.slice(0, 6).join(', ')}` : 'No major issues detected'),
@@ -1122,6 +1144,9 @@ const buildResultSummaryFromImages = ({ imageResults, aggregate }) => {
         cleanliness_level: null,
         critical_findings: aggregateCriticalFindings,
         requires_retake: requiresRetakeAny,
+        sensor_impact: sensorImpact,
+        environmental_score: environmentalScore,
+        ppm_odor_tier: ppmOdorTier,
       },
       imageCount: effective.length,
       aggregate: aggregate || null,
@@ -1307,12 +1332,21 @@ const runInspectionAnalysis = async ({
         throw validationError;
       }
 
-      if (!forceReprocess) {
+      // A cached image score belongs to the source inspection's environment.
+      // PPM is captured per inspection, so reusing a hash would apply the
+      // wrong odor tier when the current inspection has a real PPM reading.
+      const currentPpmTier = resolvePpmOdorTier(
+        inspection.sensor_snapshot?.ppm ??
+          inspection.sensor_snapshot?.field1 ??
+          inspection.sensor_snapshot?.field_1
+      );
+      if (!forceReprocess && !currentPpmTier) {
         const reusableMedia = await findReusableScoredMediaByHash({
           mediaRow,
           inspection,
         });
-        if (reusableMedia) {
+        // Do not use a source image scored with another inspection's PPM.
+        if (reusableMedia && !readAiScoringMetadata(reusableMedia)?.ppm_odor_tier) {
           const cachedResult = await reuseScoringFromMedia({
             targetMediaRow: mediaRow,
             sourceMediaRow: reusableMedia,
@@ -1368,7 +1402,18 @@ const runInspectionAnalysis = async ({
       const inspectionSensorContext = parseSensorContext(inspection.sensor_snapshot || null);
       const localSensorFusion = computeSensorImpact(inspectionSensorContext);
       const modelSensorImpact = Number.isFinite(Number(result.sensorImpact)) ? Number(result.sensorImpact) : 0;
-      const appliedSensorImpact = Math.min(0, Math.max(modelSensorImpact, localSensorFusion.sensorImpact));
+      // The model may still contribute non-PPM environmental evidence, but
+      // PPM itself is server-enforced from the documented odor policy. Keeping
+      // it separate prevents a model response from double-counting PPM.
+      const appliedNonPpmSensorImpact = Math.min(
+        0,
+        Math.max(modelSensorImpact, localSensorFusion.nonPpmSensorImpact)
+      );
+      const appliedSensorImpact = clamp(
+        appliedNonPpmSensorImpact + localSensorFusion.ppmImpact,
+        -25,
+        20
+      );
       if (!strictJson || typeof strictJson !== 'object') {
         const parsingError = new Error('Scoring response is missing strict JSON payload');
         parsingError.code = 'SCORING_PARSE_FAILED';
@@ -1525,15 +1570,15 @@ const runInspectionAnalysis = async ({
         ...strictJson,
         ...singleImagePost,
         overall_cleanliness_score: overallScore,
+        score_0_100: overallScore,
+        star_rating_0_5: Number((overallScore / 20).toFixed(1)),
         visual_score: visualScore,
-        environmental_score:
-          result.environmentalScore !== null && result.environmentalScore !== undefined
-            ? Number(result.environmentalScore)
-            : localSensorFusion.environmentalScore,
+        environmental_score: clamp(100 + appliedSensorImpact, 0, 100),
         sensor_impact: appliedSensorImpact,
         sensor_context: inspectionSensorContext,
         sensor_reasons:
           localSensorFusion.reasons.length > 0 ? localSensorFusion.reasons : undefined,
+        ppm_odor_tier: localSensorFusion.ppmOdorTier || undefined,
         confidence_score: finalConfidence,
         critical_findings: singleImagePost.critical_findings,
         detected_issues: issues,
@@ -1559,6 +1604,7 @@ const runInspectionAnalysis = async ({
         scoring_version: result.scoringVersion || SCORING_VERSION,
         tenant_scoring_policy_version: AI_SCORING_POLICY_VERSION,
         tenant_scoring_mode: appliedScoringPolicy.mode,
+        ppm_odor_tier: localSensorFusion.ppmOdorTier || null,
         supervisor_flags: supervisorFlags,
       };
       const metadata = {
@@ -1748,7 +1794,14 @@ const runInspectionAnalysis = async ({
           visibility_score: visibilityScore,
           image_quality_status: qualityResult?.imageQualityStatus || 'unknown',
         });
-        const fallbackFinalScore = Number(fallbackSinglePost.score_0_100 || 0);
+        const fallbackVisualScore = Number(fallbackSinglePost.score_0_100 || 0);
+        const fallbackSensorContext = parseSensorContext(inspection.sensor_snapshot || null);
+        const fallbackSensorFusion = computeSensorImpact(fallbackSensorContext);
+        const fallbackFinalScore = clamp(
+          fallbackVisualScore + fallbackSensorFusion.sensorImpact,
+          0,
+          100
+        );
         const fallbackFinalConfidence = Number(fallbackSinglePost.confidence || fallbackConfidence);
         const fallbackSeverity =
           severityFromHygieneRisk(fallbackSinglePost.hygiene_risk) ||
@@ -1758,6 +1811,15 @@ const runInspectionAnalysis = async ({
           ...fallbackStrictJson,
           ...fallbackSinglePost,
           overall_cleanliness_score: Math.round(fallbackFinalScore),
+          score_0_100: Math.round(fallbackFinalScore),
+          star_rating_0_5: Number((fallbackFinalScore / 20).toFixed(1)),
+          visual_score: fallbackVisualScore,
+          environmental_score: fallbackSensorFusion.environmentalScore,
+          sensor_impact: fallbackSensorFusion.sensorImpact,
+          sensor_context: fallbackSensorContext,
+          sensor_reasons:
+            fallbackSensorFusion.reasons.length > 0 ? fallbackSensorFusion.reasons : undefined,
+          ppm_odor_tier: fallbackSensorFusion.ppmOdorTier || undefined,
           confidence_score: Number(fallbackFinalConfidence.toFixed(4)),
           detected_issues: fallbackIssues,
           severity_level: fallbackSeverity,
@@ -1842,6 +1904,7 @@ const runInspectionAnalysis = async ({
               : {}),
             ai_scoring: {
               ...fallbackSinglePost,
+              ppm_odor_tier: fallbackSensorFusion.ppmOdorTier || null,
               applied_at: new Date().toISOString(),
               prompt_version: PROMPT_VERSION,
               scoring_version: SCORING_VERSION,
@@ -1871,6 +1934,8 @@ const runInspectionAnalysis = async ({
           provider: 'fallback',
           promptVersion: PROMPT_VERSION,
           scoringVersion: SCORING_VERSION,
+          sensorImpact: fallbackSensorFusion.sensorImpact,
+          environmentalScore: fallbackSensorFusion.environmentalScore,
           rawResult: {
             strictJson: fallbackStrictWithCalibrated,
             fallback: true,
@@ -2598,4 +2663,7 @@ module.exports = {
   getAnalysisResult,
   getInspectionAnalysisTrend,
   getFacilityMetrics,
+  __testUtils: {
+    computeSensorImpact,
+  },
 };

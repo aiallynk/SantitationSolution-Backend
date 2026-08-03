@@ -37,6 +37,7 @@ const {
   getQrImageUrl,
   getFeedbackQrImageUrl,
   getPublicFeedbackUrl,
+  ensureQrImageForToilet,
   ensureAllQrImagesForToilet,
   ensureQrImagesForToilets,
 } = require('./toiletQr.service');
@@ -53,15 +54,12 @@ const { haversineMeters } = require('../publicApi/toiletPublicFilters');
 const { runtimeConfig } = require('../../config/runtime');
 const { computeToiletRiskWeight } = require('./toiletMapRisk.helper');
 const { getDefaultTimezone, isValidIanaTimezone, normalizeTimezone } = require('../../utils/timezone');
-<<<<<<< HEAD
 const { resolveOrCreateTenantGeographyFromGlobal } = require('../geography-master/activation.service');
-=======
 const {
   AI_SCORING_POLICY_VERSION,
   AI_SCORING_MODES,
   resolveAiScoringMode,
 } = require('../analysis/aiInspectionScoring.service');
->>>>>>> beddd57f62b9c570ea8cfe3d2b492da90c1e890d
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -232,16 +230,31 @@ const resolveLiveScopedGeographyIds = async ({ req, tenantId = null }) => {
     : 'child.tenant_id IS NULL';
   const rows = await sequelize.query(
     `WITH RECURSIVE scoped_geographies AS (
-       SELECT id
+       SELECT id, parent_id, global_geography_id, master_geography_id
        FROM geographies
        WHERE id IN (:seedIds) AND is_active = TRUE
        UNION
-       SELECT child.id
+       SELECT child.id, child.parent_id, child.global_geography_id, child.master_geography_id
        FROM geographies child
        INNER JOIN scoped_geographies parent ON child.parent_id = parent.id
+          -- A tenant activation copy and its global/master row are the same
+          -- geographic context. Traverse that identity edge in both directions
+          -- as well as normal parent-child edges, but only within this tenant.
+          OR child.id = parent.global_geography_id
+          OR child.id = parent.master_geography_id
+          OR child.global_geography_id = parent.id
+          OR child.master_geography_id = parent.id
+          OR (
+            child.global_geography_id IS NOT NULL
+            AND child.global_geography_id = parent.global_geography_id
+          )
+          OR (
+            child.master_geography_id IS NOT NULL
+            AND child.master_geography_id = parent.master_geography_id
+          )
        WHERE child.is_active = TRUE AND ${tenantFilter}
      )
-     SELECT id FROM scoped_geographies`,
+     SELECT DISTINCT id FROM scoped_geographies`,
     {
       replacements: { seedIds, tenantId },
       type: QueryTypes.SELECT,
@@ -360,15 +373,63 @@ const withFacilityScope = (req, where = {}, facilityKey = 'facility_id') => {
   });
 };
 
+const appendWhereAnd = (where = {}, clause = {}) => {
+  const existingAnd = Array.isArray(where[Op.and]) ? where[Op.and] : [];
+  return {
+    ...where,
+    [Op.and]: [...existingAnd, clause],
+  };
+};
+
 const buildFacilityIncludeScopeWhere = async (req) => {
+  const accessContext = buildAccessContextFromUser(req?.user || {});
   let where = {};
   where = withTenantScope(req, where);
-  where = await withLiveGeographyScope(req, where, {
-    tenantId: tenantScope(req, req.query?.tenantId),
-    geographyKey: 'geography_id',
-  });
-  where = withFacilityScope(req, where, 'id');
-  return where;
+
+  if (accessContext.isSuperAdmin) return where;
+
+  const scopeLevel = String(accessContext.scopeLevel || '').trim().toLowerCase();
+  const geographyIds = uniqueIds(accessContext.geographyIds || []);
+  const facilityIds = uniqueIds(accessContext.facilityIds || []);
+  const hasGeographyRestriction =
+    geographyIds.length > 0 ||
+    (scopeLevel && scopeLevel !== 'organization' && scopeLevel !== 'facility');
+
+  // Preserve the pre-geography-master contract for tenant-wide users: a legacy
+  // facility legitimately has no geography_id, so it must remain visible inside
+  // its tenant. Geography-scoped users still require an unambiguous geography;
+  // facility-scoped users may access an explicitly assigned legacy facility.
+  if (!hasGeographyRestriction) {
+    return withFacilityScope(req, where, 'id');
+  }
+
+  const tenantId = tenantScope(req, req.query?.tenantId);
+  const scopedGeographyIds = await resolveLiveScopedGeographyIds({ req, tenantId });
+  const geographyClause = {
+    geography_id:
+      scopedGeographyIds && scopedGeographyIds.length > 0
+        ? { [Op.in]: scopedGeographyIds }
+        : EMPTY_SCOPE_UUID,
+  };
+
+  if (scopeLevel === 'facility' && facilityIds.length > 0) {
+    // The geography branch keeps a mapped assigned facility readable, and the
+    // explicit-id branch keeps an assigned legacy facility readable. Reapply
+    // the facility scope around the OR so neither branch can reveal a second
+    // facility merely because it shares a geography with an assignment.
+    return withFacilityScope(
+      req,
+      appendWhereAnd(where, {
+        [Op.or]: [
+          geographyClause,
+          { id: { [Op.in]: facilityIds } },
+        ],
+      }),
+      'id',
+    );
+  }
+
+  return withFacilityScope(req, appendWhereAnd(where, geographyClause), 'id');
 };
 
 const GEO_LEVEL_SEQUENCE = ['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'];
@@ -5036,13 +5097,8 @@ const mapFacilityRow = (row) => ({
 
 const listFacilities = async (req) => {
   const { page, limit, offset } = normalizePagination(req.query);
-  let where = {};
+  let where = await buildFacilityIncludeScopeWhere(req);
   const tenantId = tenantScope(req, req.query.tenantId);
-  if (tenantId) {
-    where.tenant_id = tenantId;
-  }
-  where = await withLiveGeographyScope(req, where, { tenantId, geographyKey: 'geography_id' });
-  where = withFacilityScope(req, where, 'id');
   if (req.query.geographyId) {
     if (!(await isGeographyInLiveScope(req, req.query.geographyId, { tenantId }))) {
       throw new AppError('geographyId is outside scope', 403, { code: 'SCOPE_FORBIDDEN' });
@@ -6622,6 +6678,9 @@ module.exports = {
     resolveCanonicalPlatformParentId,
     resolvePlatformSeedIdFromLocationNames,
     resolveLiveScopeSeedIds,
+    resolveLiveScopedGeographyIds,
+    buildFacilityIncludeScopeWhere,
+    activeToiletWhere,
     resolveComparableScopeAncestryIds,
     circleGeoJsonFromCenterRadius,
     deriveGeometryPayload,

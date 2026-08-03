@@ -10,8 +10,8 @@ const {
 
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANALYSIS_SCHEMA_VERSION = 'analysis.v5';
-const PROMPT_VERSION = 'sanitation-detection-v4-strict';
-const SCORING_VERSION = 'sanitation-rubric-v1';
+const PROMPT_VERSION = 'sanitation-detection-v5-ppm-odor';
+const SCORING_VERSION = 'sanitation-rubric-v2-ppm-odor';
 const SENSOR_CONTEXT_VERSION = 'sensor-context-v1';
 
 const DETECTION_PROMPT = `
@@ -143,7 +143,8 @@ Sensor-context addendum:
 - You may receive optional "Sensor context" metadata (temperature, humidity, gas concentration in ppm, sensor status, reading age minutes).
 - Visual evidence remains PRIMARY. Sensor values are SECONDARY supporting evidence.
 - Never replace visual score with sensor score.
-- If sensor context indicates abnormal environment (very high humidity, elevated gas concentration (ppm), stale/offline reading), reduce confidence and apply a moderate score penalty.
+- If sensor context indicates abnormal environment (very high humidity, stale/offline reading), reduce confidence and apply a moderate score penalty.
+- Do not include gas concentration (ppm) in sensorImpact or environmentalScore. The backend applies the approved PPM odor tier deterministically after visual scoring.
 - If image and sensor context disagree, explicitly mention this disagreement in reasoning.
 - Return "sensorImpact" as an integer in range [-25, 0] indicating score reduction from sensor context (0 if no impact).
 - Return "environmentalScore" in range [0,100] when sensor context is present, otherwise null.

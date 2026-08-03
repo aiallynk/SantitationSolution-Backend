@@ -48,6 +48,15 @@ const applyFacilityScope = (where = {}, req, facilityKey = 'facility_id') => {
 };
 
 const FIELD_INSPECTION_ROLE_CODES = new Set(['field_worker']);
+const GEOGRAPHY_SCOPE_LEVELS = new Set([
+  'country',
+  'state',
+  'district',
+  'city',
+  'zone',
+  'ward',
+  'cluster',
+]);
 
 const hasFieldInspectionRole = (req) => {
   const roleCodes = Array.isArray(req.user?.roleCodes) ? req.user.roleCodes : [];
@@ -60,7 +69,11 @@ const isFacilityInScope = (req, facilityId) => {
   if (req.user?.isSuperAdmin) return true;
   const scopedFacilityIds = uniqueIds(req.user?.scopeFacilityIds || []);
   if (scopedFacilityIds.length === 0) {
-    return req.user?.scopeLevel !== 'facility';
+    const scopeLevel = String(req.user?.scopeLevel || '').trim().toLowerCase();
+    // An empty geography-derived facility scope must deny access. Returning
+    // true here would let a geography-scoped actor retrieve any same-tenant
+    // facility by ID, including a geography-less legacy facility.
+    return scopeLevel !== 'facility' && !GEOGRAPHY_SCOPE_LEVELS.has(scopeLevel);
   }
   return scopedFacilityIds.includes(String(facilityId || ''));
 };

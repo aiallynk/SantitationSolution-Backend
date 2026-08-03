@@ -762,7 +762,25 @@ const assertToiletScope = async (toiletId, req) => {
   const unit = await ToiletUnit.findByPk(toiletId, {
     include: [{
       model: Facility,
-      attributes: ['id', 'tenant_id', 'name', 'code', 'metadata', 'address_line', 'latitude', 'longitude', 'timezone'],
+      attributes: [
+        'id',
+        'tenant_id',
+        'geography_id',
+        'zone_geography_id',
+        'ward_geography_id',
+        'name',
+        'code',
+        'metadata',
+        'address_line',
+        'latitude',
+        'longitude',
+        'timezone',
+        'status',
+      ],
+    }, {
+      model: ToiletBlock,
+      attributes: ['id', 'facility_id', 'code', 'name', 'gender_type', 'status'],
+      required: false,
     }],
   });
   if (!unit) {
@@ -2735,17 +2753,72 @@ const getToiletDetails = async (toiletId, req) => {
     payload: event.payload || null,
   }));
 
+  const latitude =
+    unit.latitude !== null && unit.latitude !== undefined
+      ? Number(unit.latitude)
+      : unit.Facility?.latitude !== null && unit.Facility?.latitude !== undefined
+        ? Number(unit.Facility.latitude)
+        : null;
+  const longitude =
+    unit.longitude !== null && unit.longitude !== undefined
+      ? Number(unit.longitude)
+      : unit.Facility?.longitude !== null && unit.Facility?.longitude !== undefined
+        ? Number(unit.Facility.longitude)
+        : null;
+  const facility = unit.Facility || null;
+  const toiletBlock = unit.ToiletBlock || null;
+  const isActive =
+    !unit.deleted_at &&
+    String(unit.status || '').trim().toLowerCase() !== 'out_of_service' &&
+    (!facility || String(facility.status || '').trim().toLowerCase() === 'active');
+
   return {
     toilet: {
       id: unit.id,
       code: unit.code,
       name: unit.code,
+      tenantId: facility?.tenant_id || null,
+      facilityId: unit.facility_id || facility?.id || null,
+      facility: facility
+        ? {
+            id: facility.id,
+            tenantId: facility.tenant_id || null,
+            code: facility.code || null,
+            name: facility.name || null,
+            geographyId: facility.geography_id || null,
+            zoneGeographyId: facility.zone_geography_id || null,
+            wardGeographyId: facility.ward_geography_id || null,
+          }
+        : null,
+      toiletBlockId: unit.toilet_block_id || null,
+      toiletBlock: toiletBlock
+        ? {
+            id: toiletBlock.id,
+            facilityId: toiletBlock.facility_id || null,
+            code: toiletBlock.code || null,
+            name: toiletBlock.name || null,
+            genderType: toiletBlock.gender_type || null,
+            status: toiletBlock.status || null,
+          }
+        : null,
+      geography: {
+        id: facility?.geography_id || null,
+        zoneGeographyId: facility?.zone_geography_id || null,
+        wardGeographyId: facility?.ward_geography_id || null,
+      },
       qrCode: unit.qr_code || unit.code,
       appQrCode: unit.qr_code || unit.code,
       qrImageUrl: getQrImageUrl(unit.id),
       appQrImageUrl: getQrImageUrl(unit.id),
       feedbackQrImageUrl: getFeedbackQrImageUrl(unit.id),
       publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: unit.id }),
+      qr: {
+        code: unit.qr_code || unit.code,
+        appQrCode: unit.qr_code || unit.code,
+        imageUrl: getQrImageUrl(unit.id),
+        feedbackImageUrl: getFeedbackQrImageUrl(unit.id),
+        publicFeedbackUrl: getPublicFeedbackUrl({ toiletUnitId: unit.id }),
+      },
       sector:
         unit.sector_code ||
         unit.Facility?.metadata?.sector ||
@@ -2757,24 +2830,17 @@ const getToiletDetails = async (toiletId, req) => {
         unit.Facility?.name ||
         unit.Facility?.code ||
         null,
-      latitude:
-        unit.latitude !== null && unit.latitude !== undefined
-          ? Number(unit.latitude)
-          : unit.Facility?.latitude !== null && unit.Facility?.latitude !== undefined
-            ? Number(unit.Facility.latitude)
-            : null,
-      longitude:
-        unit.longitude !== null && unit.longitude !== undefined
-          ? Number(unit.longitude)
-          : unit.Facility?.longitude !== null && unit.Facility?.longitude !== undefined
-            ? Number(unit.Facility.longitude)
-            : null,
+      latitude,
+      longitude,
+      coordinates: { latitude, longitude },
       contractor: unit.Facility?.metadata?.contractor || null,
       timezone: display.timezone,
       timezoneSource: display.source,
       facilityTimezone: unit.Facility?.timezone || unit.Facility?.metadata?.timezone || null,
       toiletTimezone: unit.timezone || null,
       status: unit.status,
+      active: isActive,
+      isActive,
       latestScore,
       latestScoreLabel: scoreLabel(latestScore),
       baselineScore,
@@ -2799,6 +2865,7 @@ const getToiletDetails = async (toiletId, req) => {
       validationFailedCount,
       currentCleanlinessStatus: scoreLabel(latestScore),
       lastWorker: latestInspection?.worker || null,
+      createdAt: unit.created_at || null,
     },
     latestInspection,
     history: history.items,

@@ -426,6 +426,134 @@ const getDescendantIds = (rootId, childrenByParent) => {
   return result;
 };
 
+const hasGeographyRestriction = (accessContext = {}) => {
+  const scopeLevel = String(accessContext.scopeLevel || '').trim().toLowerCase();
+  const geographyIds = uniqueIds(accessContext.geographyIds || []);
+  return (
+    geographyIds.length > 0 ||
+    (scopeLevel && scopeLevel !== 'organization' && scopeLevel !== 'facility')
+  );
+};
+
+const hasFacilityGeographyMapping = (facility = {}) =>
+  uniqueIds([
+    facility.geography_id,
+    facility.zone_geography_id,
+    facility.ward_geography_id,
+  ]).length > 0;
+
+const haversineMeters = (left, right) => {
+  const radiusMeters = 6_371_000;
+  const toRadians = (value) => (Number(value) * Math.PI) / 180;
+  const latitudeDelta = toRadians(right.latitude - left.latitude);
+  const longitudeDelta = toRadians(right.longitude - left.longitude);
+  const latitudeA = toRadians(left.latitude);
+  const latitudeB = toRadians(right.latitude);
+  const a =
+    Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(latitudeA) * Math.cos(latitudeB) * Math.sin(longitudeDelta / 2) ** 2;
+  return 2 * radiusMeters * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const pointInsidePolygon = (point, polygon = []) => {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const currentPoint = polygon[index];
+    const previousPoint = polygon[previous];
+    const intersects =
+      (currentPoint.lat > point.latitude) !== (previousPoint.lat > point.latitude) &&
+      point.longitude <
+        ((previousPoint.lng - currentPoint.lng) * (point.latitude - currentPoint.lat)) /
+          (previousPoint.lat - currentPoint.lat) +
+          currentPoint.lng;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+};
+
+const isPointInsideOverviewScope = ({ latitude, longitude, scope = null }) => {
+  const point = {
+    latitude: toNumber(latitude, null),
+    longitude: toNumber(longitude, null),
+  };
+  if (!scope || point.latitude === null || point.longitude === null) return false;
+
+  const center = {
+    latitude: toNumber(scope.boundaryCenterLatitude ?? scope.centroidLatitude ?? scope.latitude, null),
+    longitude: toNumber(scope.boundaryCenterLongitude ?? scope.centroidLongitude ?? scope.longitude, null),
+  };
+  const radiusMeters = toNumber(scope.boundaryRadiusMeters, null);
+  if (center.latitude !== null && center.longitude !== null && radiusMeters !== null && radiusMeters > 0) {
+    return haversineMeters(point, center) <= radiusMeters;
+  }
+
+  const polygon = polygonPointsFromGeoJson(scope.geojson);
+  if (polygon.length >= 3) return pointInsidePolygon(point, polygon);
+
+  const bounds = parseBounds(scope.bounds);
+  if (!bounds) return false;
+  return (
+    point.latitude >= bounds.south &&
+    point.latitude <= bounds.north &&
+    point.longitude >= bounds.west &&
+    point.longitude <= bounds.east
+  );
+};
+
+const isFacilityVisibleOnOverviewMap = ({ facility, scopedGeographyIds, accessContext, tenantId = null, scope = null }) => {
+  if (!facility) return false;
+  if (tenantId && String(facility.tenant_id || '') !== String(tenantId)) return false;
+  if (accessContext?.isSuperAdmin) return true;
+
+  const facilityId = String(facility.id || '').trim();
+  const allowedFacilityIds = new Set(uniqueIds(accessContext?.facilityIds || []));
+  // Explicit facility assignment is authoritative, including legacy facilities
+  // that were created before geography IDs were required.
+  if (allowedFacilityIds.has(facilityId)) return true;
+
+  // A facility-scoped user must never receive a second facility through the
+  // tenant-wide legacy fallback or a geography branch.
+  if (String(accessContext?.scopeLevel || '').trim().toLowerCase() === 'facility') return false;
+
+  const scopedIds = scopedGeographyIds instanceof Set
+    ? scopedGeographyIds
+    : new Set(uniqueIds(scopedGeographyIds || []));
+  const facilityGeographyIds = uniqueIds([
+    facility.geography_id,
+    facility.zone_geography_id,
+    facility.ward_geography_id,
+  ]);
+  if (facilityGeographyIds.some((id) => scopedIds.has(id))) return true;
+
+  // Tenant-wide users retain access to same-tenant geography-less facilities.
+  if (!hasGeographyRestriction(accessContext)) return true;
+
+  // Geography-scoped legacy facilities have no mapping to resolve. They may be
+  // shown only when their saved physical location is inside the assigned map
+  // circle/polygon/bounds. This is read-only compatibility, never a remap.
+  return !hasFacilityGeographyMapping(facility) && isPointInsideOverviewScope({
+    latitude: facility.latitude,
+    longitude: facility.longitude,
+    scope,
+  });
+};
+
+const resolveToiletMarkerCoordinates = (toilet = {}) => {
+  const toiletLatitude = toNumber(toilet.latitude, null);
+  const toiletLongitude = toNumber(toilet.longitude, null);
+  if (toiletLatitude !== null && toiletLongitude !== null) {
+    return { latitude: toiletLatitude, longitude: toiletLongitude, source: 'toilet' };
+  }
+
+  const facilityLatitude = toNumber(toilet.Facility?.latitude, null);
+  const facilityLongitude = toNumber(toilet.Facility?.longitude, null);
+  if (facilityLatitude !== null && facilityLongitude !== null) {
+    return { latitude: facilityLatitude, longitude: facilityLongitude, source: 'facility' };
+  }
+
+  return null;
+};
+
 const resolveScopeGeography = async ({ req, tenantId }) => {
   const explicitScopeId = req.user?.geographyId || req.user?.scopeId || null;
   if (explicitScopeId) {
@@ -509,22 +637,35 @@ const getOverviewMapScope = async (req) => {
   const tenantId = req.user?.isSuperAdmin
     ? req.query.tenantId || req.user?.tenantId || null
     : req.user?.tenantId || null;
+  const accessContext = buildAccessContextFromUser(req?.user || {});
   const scopeRow = await resolveScopeGeography({ req, tenantId });
   let geographyIds = [];
   if (scopeRow) {
     const descendants = await sequelize.query(
       `WITH RECURSIVE scoped_geographies AS (
-         SELECT id, parent_id
+         SELECT id, parent_id, global_geography_id, master_geography_id
          FROM geographies
          WHERE id = :scopeId AND is_active = TRUE
-         UNION ALL
-         SELECT child.id, child.parent_id
+         UNION
+         SELECT child.id, child.parent_id, child.global_geography_id, child.master_geography_id
          FROM geographies child
          INNER JOIN scoped_geographies parent ON child.parent_id = parent.id
+           OR child.id = parent.global_geography_id
+           OR child.id = parent.master_geography_id
+           OR child.global_geography_id = parent.id
+           OR child.master_geography_id = parent.id
+           OR (
+             child.global_geography_id IS NOT NULL
+             AND child.global_geography_id = parent.global_geography_id
+           )
+           OR (
+             child.master_geography_id IS NOT NULL
+             AND child.master_geography_id = parent.master_geography_id
+           )
          WHERE child.is_active = TRUE
            AND (child.tenant_id IS NULL OR child.tenant_id = :tenantId)
        )
-       SELECT id FROM scoped_geographies`,
+       SELECT DISTINCT id FROM scoped_geographies`,
       {
         replacements: { scopeId: scopeRow.id, tenantId },
         type: QueryTypes.SELECT,
@@ -577,18 +718,29 @@ const getOverviewMapScope = async (req) => {
       }
     : globalScope;
   const scopedGeoIds = scopeRow
-    ? [String(scopeRow.id), ...getDescendantIds(scopeRow.id, childrenByParent)]
+    ? uniqueIds([scopeRow.id, ...geographyIds, ...getDescendantIds(scopeRow.id, childrenByParent)])
     : geographies.map((row) => String(row.id));
   const scopedGeoSet = new Set(scopedGeoIds);
 
-  const facilities = await Facility.findAll({
-    where: scopedFacilityEntityWhere(req),
+  const facilityWhere = scopedFacilityEntityWhere(req);
+  if (tenantId) facilityWhere.tenant_id = tenantId;
+  const candidateFacilities = await Facility.findAll({
+    where: facilityWhere,
     include: [
       { model: Geography, as: 'zone', attributes: ['id', 'name', 'level'], required: false },
       { model: Geography, as: 'ward', attributes: ['id', 'name', 'level'], required: false },
     ],
     order: [['name', 'ASC']],
   });
+  const facilities = candidateFacilities.filter((facility) =>
+    isFacilityVisibleOnOverviewMap({
+      facility,
+      scopedGeographyIds: scopedGeoSet,
+      accessContext,
+      tenantId,
+      scope,
+    })
+  );
   const facilityIds = facilities.map((facility) => facility.id);
   const toilets = facilityIds.length > 0
     ? await ToiletUnit.findAll({
@@ -596,7 +748,22 @@ const getOverviewMapScope = async (req) => {
           facility_id: { [Op.in]: facilityIds },
           deleted_at: { [Op.is]: null },
         },
-        include: [{ model: Facility, attributes: ['id', 'name', 'geography_id', 'zone_geography_id', 'ward_geography_id'], required: true }],
+        include: [{
+          model: Facility,
+          attributes: [
+            'id',
+            'name',
+            'code',
+            'latitude',
+            'longitude',
+            'address_line',
+            'map_display_address',
+            'geography_id',
+            'zone_geography_id',
+            'ward_geography_id',
+          ],
+          required: true,
+        }],
         order: [['code', 'ASC']],
       })
     : [];
@@ -624,23 +791,27 @@ const getOverviewMapScope = async (req) => {
 
   const toiletMarkers = toilets
     .map((toilet) => {
-      const lat = toNumber(toilet.latitude, null);
-      const lng = toNumber(toilet.longitude, null);
-      if (lat === null || lng === null) return null;
+      const coordinates = resolveToiletMarkerCoordinates(toilet);
+      if (!coordinates) return null;
       return {
         id: toilet.id,
         type: 'toilet',
         level: 'toilet',
-        name: toilet.location_label || toilet.code,
+        name: toilet.location_label || toilet.code || toilet.Facility?.name,
         code: toilet.code,
-        latitude: lat,
-        longitude: lng,
+        latitude: coordinates.latitude,
+        longitude: coordinates.longitude,
+        coordinateSource: coordinates.source,
         facilityId: toilet.facility_id,
         geographyId: toilet.Facility?.geography_id || null,
         zoneGeographyId: toilet.Facility?.zone_geography_id || null,
         wardGeographyId: toilet.Facility?.ward_geography_id || null,
-        displayAddress: toilet.map_display_address || toilet.location_label || null,
+        displayAddress: toilet.map_display_address || toilet.location_label || toilet.Facility?.map_display_address || toilet.Facility?.address_line || null,
         status: toilet.status || null,
+        // `latest_score` is the persisted score already maintained for each
+        // toilet unit. Expose it on the overview marker so the UI can colour a
+        // shared physical-location marker without doing a second inspection query.
+        latestScore: toNumber(toilet.latest_score, null),
       };
     })
     .filter(Boolean);
@@ -662,6 +833,19 @@ const getOverviewMapScope = async (req) => {
   };
 
   const scopeLevel = String(scope?.level || req.user?.scopeLevel || '').toLowerCase();
+  const tenantWideScope = !hasGeographyRestriction(accessContext);
+  const facilityScopedUser = String(accessContext.scopeLevel || '').toLowerCase() === 'facility';
+  const isUnmappedMarkerInsideScope = (marker) =>
+    !hasFacilityGeographyMapping({
+      geography_id: marker.geographyId,
+      zone_geography_id: marker.zoneGeographyId,
+      ward_geography_id: marker.wardGeographyId,
+    }) &&
+    isPointInsideOverviewScope({
+      latitude: marker.latitude,
+      longitude: marker.longitude,
+      scope,
+    });
   const childGeographies = scopeRow
     ? geographies.filter((row) => String(row.parent_id || '') === String(scopeRow.id))
     : geographies.filter((row) => !row.parent_id);
@@ -682,19 +866,29 @@ const getOverviewMapScope = async (req) => {
 
   const directToiletMarkers = scopeRow
     ? toiletMarkers.filter((marker) =>
-        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || '')))
+        tenantWideScope ||
+        facilityScopedUser ||
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || ''))) ||
+        isUnmappedMarkerInsideScope(marker)
       )
     : toiletMarkers;
   const directAssetMarkers = scopeRow
     ? assetMarkers.filter((marker) =>
-        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || '')))
+        tenantWideScope ||
+        facilityScopedUser ||
+        [marker.geographyId, marker.zoneGeographyId, marker.wardGeographyId].some((id) => scopedGeoSet.has(String(id || ''))) ||
+        isUnmappedMarkerInsideScope(marker)
       )
     : assetMarkers;
+  const showDirectOperationalMarkers =
+    tenantWideScope ||
+    facilityScopedUser ||
+    ['country', 'state', 'district', 'city', 'zone', 'ward', 'cluster'].includes(scopeLevel);
 
   const markers = [
     ...geographyMarkers,
-    ...(['district', 'city', 'zone', 'ward'].includes(scopeLevel) ? directAssetMarkers : []),
-    ...(['district', 'city', 'zone', 'ward'].includes(scopeLevel) ? directToiletMarkers : []),
+    ...(showDirectOperationalMarkers ? directAssetMarkers : []),
+    ...(showDirectOperationalMarkers ? directToiletMarkers : []),
   ];
   const allPoints = [
     ...(scope ? [{ lat: scope.latitude, lng: scope.longitude }] : []),
@@ -1587,4 +1781,10 @@ module.exports = {
   getStorageUsage,
   getPlatformHealth,
   getContractorPerformance,
+  __private: {
+    hasGeographyRestriction,
+    isPointInsideOverviewScope,
+    isFacilityVisibleOnOverviewMap,
+    resolveToiletMarkerCoordinates,
+  },
 };

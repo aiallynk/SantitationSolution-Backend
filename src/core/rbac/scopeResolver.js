@@ -1,5 +1,5 @@
 const { Op } = require('sequelize');
-const { Geography, Facility, InspectionTask, Tenant } = require('../../models');
+const { Geography, Facility, InspectionTask } = require('../../models');
 const { ScopeLevels, resolveScopedRoleLevel, resolveSeedScopeFromMemberships } = require('./accessProfiles');
 
 const uniqueIds = (values = []) =>
@@ -27,18 +27,41 @@ const expandDescendantGeographies = async ({ tenantId, seedGeographyIds = [] }) 
   if (!tenantId || seeds.length === 0) return seeds;
 
   const rows = await Geography.findAll({
-    where: { tenant_id: tenantId },
-    attributes: ['id', 'parent_id'],
+    // A tenant activation copy may point at a platform/global geography rather
+    // than using it as its parent. Keep both sides of that identity in the
+    // traversal, but never load another tenant's geography rows.
+    where: {
+      is_active: true,
+      [Op.or]: [{ tenant_id: tenantId }, { tenant_id: null }],
+    },
+    attributes: ['id', 'parent_id', 'global_geography_id', 'master_geography_id'],
     raw: true,
   });
 
   const childrenByParent = new Map();
+  const rowsByIdentityId = new Map();
+  const rowsById = new Map();
   for (const row of rows) {
+    const rowId = String(row.id || '').trim();
+    if (!rowId) continue;
+    rowsById.set(rowId, row);
+
     const parentId = row.parent_id ? String(row.parent_id) : null;
-    if (!parentId) continue;
-    const bucket = childrenByParent.get(parentId) || [];
-    bucket.push(String(row.id));
-    childrenByParent.set(parentId, bucket);
+    if (parentId) {
+      const bucket = childrenByParent.get(parentId) || [];
+      bucket.push(rowId);
+      childrenByParent.set(parentId, bucket);
+    }
+
+    for (const identityId of uniqueIds([
+      rowId,
+      row.global_geography_id,
+      row.master_geography_id,
+    ])) {
+      const bucket = rowsByIdentityId.get(identityId) || [];
+      bucket.push(rowId);
+      rowsByIdentityId.set(identityId, bucket);
+    }
   }
 
   const visited = new Set();
@@ -50,6 +73,20 @@ const expandDescendantGeographies = async ({ tenantId, seedGeographyIds = [] }) 
     const children = childrenByParent.get(current) || [];
     for (const childId of children) {
       if (!visited.has(childId)) queue.push(childId);
+    }
+
+    const currentRow = rowsById.get(current);
+    const identityIds = currentRow
+      ? uniqueIds([
+          currentRow.id,
+          currentRow.global_geography_id,
+          currentRow.master_geography_id,
+        ])
+      : [current];
+    for (const identityId of identityIds) {
+      for (const relatedId of rowsByIdentityId.get(identityId) || []) {
+        if (!visited.has(relatedId)) queue.push(relatedId);
+      }
     }
   }
   return [...visited];
@@ -87,47 +124,6 @@ const resolveFacilitiesFromAssignedTasks = async ({ tenantId, userId }) => {
   return uniqueIds(rows.map((row) => row.facility_id));
 };
 
-const resolveLegacyFacilitiesFromNamedTenantScope = async ({
-  tenantId,
-  scopeLevel,
-  scopeLocationNames = {},
-}) => {
-  const requiredFieldsByLevel = {
-    country: ['countryName'],
-    state: ['countryName', 'stateName'],
-    district: ['countryName', 'stateName', 'districtName'],
-    city: ['countryName', 'stateName', 'districtName', 'cityName'],
-  };
-  const requiredFields = requiredFieldsByLevel[String(scopeLevel || '').toLowerCase()] || [];
-  if (!tenantId || requiredFields.length === 0) return [];
-
-  const tenant = await Tenant.findByPk(tenantId, {
-    attributes: ['country_name', 'state_name', 'district_name', 'city_name'],
-    raw: true,
-  });
-  if (!tenant) return [];
-
-  const tenantNames = {
-    countryName: tenant.country_name,
-    stateName: tenant.state_name,
-    districtName: tenant.district_name,
-    cityName: tenant.city_name,
-  };
-  const matchesTenantBaseline = requiredFields.every((field) => {
-    const expected = String(scopeLocationNames[field] || '').trim().toLowerCase();
-    const actual = String(tenantNames[field] || '').trim().toLowerCase();
-    return expected && actual && expected === actual;
-  });
-  if (!matchesTenantBaseline) return [];
-
-  const facilities = await Facility.findAll({
-    where: { tenant_id: tenantId },
-    attributes: ['id'],
-    raw: true,
-  });
-  return uniqueIds(facilities.map((row) => row.id));
-};
-
 const resolveEffectiveScope = async ({
   roleCode,
   roleProfile,
@@ -136,7 +132,6 @@ const resolveEffectiveScope = async ({
   activeTenantId = null,
   userId = null,
   fallbackGeographyId = null,
-  scopeLocationNames = {},
 }) => {
   const profileScopeLevel = roleProfile?.scopeLevel || ScopeLevels.ORGANIZATION;
   const fixedRoleScopeLevel = resolveScopedRoleLevel(roleCode);
@@ -288,14 +283,6 @@ const resolveEffectiveScope = async ({
     tenantId: activeTenantId,
     geographyIds: expandedGeographyIds,
   });
-  if (derivedFacilityIds.length === 0) {
-    derivedFacilityIds = await resolveLegacyFacilitiesFromNamedTenantScope({
-      tenantId: activeTenantId,
-      scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
-      scopeLocationNames,
-    });
-  }
-
   return {
     scopeLevel: fixedRoleScopeLevel || profileScopeLevel,
     scopeId: geographySeed,
@@ -311,5 +298,4 @@ module.exports = {
   expandDescendantGeographies,
   resolveFacilitiesFromGeographyScope,
   resolveFacilitiesFromAssignedTasks,
-  resolveLegacyFacilitiesFromNamedTenantScope,
 };

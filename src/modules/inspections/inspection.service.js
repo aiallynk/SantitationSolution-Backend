@@ -6,11 +6,13 @@ const {
   InspectionSubmission,
   InspectionEvent,
   Facility,
+  Geography,
   ToiletUnit,
   InspectionTask,
   AiAnalysisResult,
   PlatformUser,
   AuditLog,
+  Alert,
   SensorReading,
   SensorDevice,
 } = require('../../models');
@@ -147,6 +149,231 @@ const normalizeAlertSeverity = (value) => {
   if (raw === 'urgent') return 'critical';
   if (raw === 'severe') return 'high';
   return 'high';
+};
+
+const resolveFacilityGeographyLevels = async (facility) => {
+  const byLevel = new Map();
+  const seeds = uniqueIds([
+    facility?.ward_geography_id,
+    facility?.zone_geography_id,
+    facility?.geography_id,
+  ]);
+
+  for (const seedId of seeds) {
+    let cursor = seedId;
+    let guard = 0;
+    while (cursor && guard < 16) {
+      // eslint-disable-next-line no-await-in-loop
+      const geography = await Geography.findByPk(cursor, {
+        attributes: ['id', 'parent_id', 'level', 'name'],
+      });
+      if (!geography) break;
+
+      const levelKey = String(geography.level || '').trim().toLowerCase();
+      if (levelKey && !byLevel.has(levelKey)) {
+        byLevel.set(levelKey, {
+          id: geography.id,
+          name: geography.name || null,
+        });
+      }
+
+      cursor = geography.parent_id || null;
+      guard += 1;
+    }
+  }
+
+  return byLevel;
+};
+
+const resolveEscalationRecipients = async ({ target, inspection, facility, geographyByLevel }) => {
+  if (target.key === SUBMISSION_TARGETS.supervisor.key) {
+    const preferredGeographyId =
+      geographyByLevel.get('ward')?.id ||
+      geographyByLevel.get('zone')?.id ||
+      geographyByLevel.get('city')?.id ||
+      facility?.ward_geography_id ||
+      facility?.zone_geography_id ||
+      facility?.geography_id ||
+      null;
+    const supervisorIds = await resolveSupervisorIds({
+      tenantId: inspection.tenant_id,
+      geographyId: preferredGeographyId,
+      facilityId: facility?.id || null,
+    });
+    return {
+      recipientIds: uniqueIds(supervisorIds),
+      geographyId: preferredGeographyId || null,
+    };
+  }
+
+  const requestedScopeKey = target.submittedToScope;
+  const requestedGeographyId = geographyByLevel.get(requestedScopeKey)?.id || null;
+  const recipientIds = await resolveUsersByRoleAndScope({
+    roleCodes: [target.submittedToRole],
+    tenantId: inspection.tenant_id,
+    ...(requestedGeographyId ? { geographyId: requestedGeographyId } : {}),
+    facilityId: facility?.id || null,
+  });
+
+  return {
+    recipientIds: uniqueIds(recipientIds),
+    geographyId: requestedGeographyId,
+  };
+};
+
+const buildEscalationMessage = ({
+  inspectionCode,
+  inspectionTypeLabel,
+  facilityName,
+  toiletLabel,
+  submittedBy,
+  wardName,
+  sectorCode,
+  locationLabel,
+  targetLabel,
+}) =>
+  [
+    `${inspectionCode} submitted to ${targetLabel}`,
+    `Type: ${inspectionTypeLabel}`,
+    facilityName ? `Facility: ${facilityName}` : null,
+    toiletLabel ? `Toilet: ${toiletLabel}` : null,
+    wardName ? `Ward: ${wardName}` : null,
+    sectorCode ? `Sector: ${sectorCode}` : null,
+    locationLabel ? `Location: ${locationLabel}` : null,
+    submittedBy ? `Submitted by: ${submittedBy}` : null,
+  ]
+    .filter(Boolean)
+    .join(' | ');
+
+const createSubmissionEscalationAlert = async ({
+  req,
+  inspection,
+  submission,
+  target,
+  severity,
+  facility,
+  toiletUnit,
+  inspector,
+  geographyByLevel,
+  recipientIds = [],
+  recipientGeographyId = null,
+}) => {
+  try {
+    const inspectionCode = `INS-${String(inspection.id || '').replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+    const inspectionTypeLabel = prettyLabel(inspection.inspection_type);
+    const facilityName = facility?.name || facility?.code || null;
+    const toiletLabel = toiletUnit?.code || toiletUnit?.location_label || null;
+    const submittedBy = inspector?.full_name || inspector?.email || req?.user?.email || 'Unknown user';
+    const wardName = geographyByLevel.get('ward')?.name || null;
+    const sectorCode = toiletUnit?.sector_code || null;
+    const locationLabel = toiletUnit?.location_label || facility?.address_line || null;
+    const message = buildEscalationMessage({
+      inspectionCode,
+      inspectionTypeLabel,
+      facilityName,
+      toiletLabel,
+      submittedBy,
+      wardName,
+      sectorCode,
+      locationLabel,
+      targetLabel: target.label,
+    });
+    const createdAt = new Date();
+    const alert = await Alert.create({
+      tenant_id: inspection.tenant_id,
+      alert_type: 'inspection_submission_escalation',
+      severity,
+      source_type: 'manual',
+      source_id: inspection.id,
+      facility_id: inspection.facility_id || null,
+      message,
+      status: 'open',
+      assigned_to_user_id: recipientIds[0] || null,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+
+    eventBus.emit(EVENTS.ALERT_CREATED, {
+      id: alert.id,
+      tenantId: alert.tenant_id,
+      status: alert.status,
+      severity: alert.severity,
+      sourceType: alert.source_type,
+      sourceId: alert.source_id,
+      facilityId: alert.facility_id,
+      alertType: alert.alert_type,
+    });
+
+    if (recipientIds.length > 0) {
+      const priority =
+        severity === 'critical'
+          ? NotificationPriorities.CRITICAL
+          : severity === 'high'
+            ? NotificationPriorities.HIGH
+            : NotificationPriorities.MEDIUM;
+      const route = target.key === SUBMISSION_TARGETS.supervisor.key ? '/ops/supervisor/alerts' : '/ops/alerts';
+      const submittedAtIso = submission?.submitted_at
+        ? new Date(submission.submitted_at).toISOString()
+        : new Date().toISOString();
+      const notificationTitle = `Inspection Escalation: ${inspectionTypeLabel}`;
+      const notificationBody = `${inspectionCode} at ${facilityName || 'facility'} requires attention (${target.label}).`;
+      await notificationService.publishNotification({
+        recipients: recipientIds,
+        eventType: 'inspection.submission.escalated',
+        notificationType: NotificationTypes.ALERT,
+        priority,
+        title: notificationTitle,
+        body: notificationBody,
+        shortBody: notificationBody,
+        entityType: 'alert',
+        entityId: alert.id,
+        route,
+        iconKey: 'alert',
+        severity,
+        tenantId: inspection.tenant_id,
+        geographyId: recipientGeographyId || null,
+        facilityId: inspection.facility_id || null,
+        audienceKind: NotificationAudienceKinds.TARGETED_LIST,
+        createdByUserId: req?.user?.id || null,
+        dedupeKey: `inspection-escalation:${submission.id}:${target.submittedToRole}:${target.submittedToScope}`,
+        metadata: {
+          inspectionId: inspection.id,
+          submissionId: submission.id,
+          submittedToRole: target.submittedToRole,
+          submittedToScope: target.submittedToScope,
+          facilityName,
+          toiletLabel,
+          ward: wardName,
+          sector: sectorCode,
+          location: locationLabel,
+        },
+        payload: {
+          alertId: alert.id,
+          inspectionId: inspection.id,
+          inspectionCode,
+          inspectionTitle: `${inspectionCode} - ${inspectionTypeLabel}`,
+          inspectionType: inspection.inspection_type,
+          facilityName,
+          toiletName: toiletLabel,
+          severity,
+          submittedBy,
+          submittedAt: submittedAtIso,
+          ward: wardName,
+          sector: sectorCode,
+          location: locationLabel,
+          status: 'new',
+        },
+      });
+    }
+    return alert;
+  } catch (error) {
+    // A review alert is additive. Inspection evidence and submission have
+    // already been safely persisted, so a notification outage must not turn a
+    // successful field submission into a generic server error.
+    // eslint-disable-next-line no-console
+    console.warn('Inspection submission escalation could not be created:', error.message);
+    return null;
+  }
 };
 
 const prettyLabel = (value) =>
@@ -880,6 +1107,80 @@ const normalizeSubmittedMediaCollection = (items, { captureStage = null } = {}) 
         clientImageId: String(item.clientImageId || item.client_image_id || '').trim() || null,
       };
     });
+};
+
+const resolveRequiredAttachmentSections = (inspectionType) => {
+  const normalizedType = String(inspectionType || '').trim().toLowerCase();
+  if (normalizedType === 'before_cleaning') {
+    return { requireBefore: true, requireAfter: false };
+  }
+  if (normalizedType === 'after_cleaning') {
+    return { requireBefore: false, requireAfter: true };
+  }
+  return { requireBefore: true, requireAfter: true };
+};
+
+const serializeSubmissionMediaRow = (row) => {
+  if (!row || !isMediaEvidenceRow(row)) return null;
+  return {
+    id: row.id,
+    captureStage: normalizeCaptureStage(row.capture_stage || row.captureStage || 'evidence'),
+    mediaType: String(row.media_type || row.mediaType || 'image').toLowerCase(),
+    fileUrl: normalizeMediaUrl(row.file_url || row.fileUrl || null),
+    thumbnailUrl: normalizeMediaUrl(
+      row.thumbnail_url || row.thumbnailUrl || row.file_url || row.fileUrl || null
+    ),
+    storageKey: row.storage_key || row.storageKey || null,
+    mimeType:
+      row.metadata && typeof row.metadata === 'object'
+        ? row.metadata.mimeType || null
+        : null,
+    contentLength:
+      row.content_length !== null && row.content_length !== undefined
+        ? Number(row.content_length)
+        : null,
+    uploadedAt: row.uploaded_at || row.uploadedAt || null,
+  };
+};
+
+const resolveAttachmentValidationError = ({
+  inspectionType,
+  beforeMediaCount = 0,
+  afterMediaCount = 0,
+  beforeCsvCount = 0,
+  afterCsvCount = 0,
+}) => {
+  const requirement = resolveRequiredAttachmentSections(inspectionType);
+  const hasBefore = Number(beforeMediaCount) + Number(beforeCsvCount) > 0;
+  const hasAfter = Number(afterMediaCount) + Number(afterCsvCount) > 0;
+
+  if (requirement.requireBefore && !hasBefore) {
+    return {
+      message: 'At least one before-cleaning attachment is required',
+      details: {
+        reason: 'before_attachment_missing',
+        inspectionType,
+        beforeMediaCount,
+        beforeCsvCount,
+        afterMediaCount,
+        afterCsvCount,
+      },
+    };
+  }
+  if (requirement.requireAfter && !hasAfter) {
+    return {
+      message: 'At least one after-cleaning attachment is required',
+      details: {
+        reason: 'after_attachment_missing',
+        inspectionType,
+        beforeMediaCount,
+        beforeCsvCount,
+        afterMediaCount,
+        afterCsvCount,
+      },
+    };
+  }
+  return null;
 };
 
 const mapInspection = (
@@ -1762,7 +2063,16 @@ const uploadInspectionMedia = async (req) => {
     id: media.id,
     inspectionId: inspection.id,
     captureStage: media.capture_stage,
-    fileUrl: mediaFileUrl || normalizeMediaUrl(media.file_url),
+    // `resolveMediaPairUrls` is also used for the direct-upload path. The
+    // multipart compatibility path must return that resolved URL as well;
+    // referencing the old `mediaFileUrl` name here caused a ReferenceError
+    // after an otherwise successful upload, which surfaced in mobile as a
+    // generic server error and prevented inspection submission.
+    fileUrl: urls.fileUrl || normalizeMediaUrl(media.file_url),
+    thumbnailUrl:
+      urls.thumbnailUrl ||
+      urls.fileUrl ||
+      normalizeMediaUrl(media.thumbnail_url || media.file_url),
     capturedAtUtc: capture.capturedAtUtc.toISOString(),
     captureTimezone: capture.captureTimezone,
     displayTimezone: display.timezone,
@@ -1810,6 +2120,14 @@ const submitInspection = async (req) => {
     throw new AppError('Inspection out of scope', 403, { code: 'SCOPE_FORBIDDEN' });
   }
   assertInspectionScope(req, inspection);
+  const submittedToInput =
+    req.body.submittedTo !== undefined
+      ? req.body.submittedTo
+      : req.body.submitTo !== undefined
+        ? req.body.submitTo
+        : req.body.submittedToRole;
+  const escalationTarget = normalizeEscalationTarget(submittedToInput);
+  const alertSeverity = normalizeAlertSeverity(req.body.severity);
   if (inspection.toilet_unit_id) {
     const unit = await ToiletUnit.findByPk(inspection.toilet_unit_id);
     const facility = await Facility.findByPk(inspection.facility_id);

@@ -3,8 +3,11 @@ const assert = require('node:assert/strict');
 const { Op } = require('sequelize');
 
 const { ScopeLevels } = require('../src/core/rbac/accessProfiles');
-const { resolveEffectiveScope } = require('../src/core/rbac/scopeResolver');
-const { Geography, Facility, InspectionTask, Tenant } = require('../src/models');
+const {
+  resolveEffectiveScope,
+  expandDescendantGeographies,
+} = require('../src/core/rbac/scopeResolver');
+const { Geography, Facility, InspectionTask } = require('../src/models');
 
 test('resolveEffectiveScope keeps assignment-based facility scope when assignments exist', async (t) => {
   const originalFindAll = InspectionTask.findAll;
@@ -176,28 +179,53 @@ test('resolveEffectiveScope geography facility lookup matches geography, zone, a
   assert.equal(capturedWhere[Op.or].length, 3);
 });
 
-test('named state scope safely reaches legacy tenant facilities without a parent hierarchy', async (t) => {
+test('geography traversal follows same-tenant global/master identity links without loading another tenant', async (t) => {
+  const originalGeographyFindAll = Geography.findAll;
+  let capturedWhere = null;
+
+  Geography.findAll = async ({ where }) => {
+    capturedWhere = where;
+    return [
+      { id: 'global-state-1', parent_id: null, global_geography_id: null, master_geography_id: null },
+      {
+        id: 'tenant-state-1',
+        parent_id: null,
+        global_geography_id: 'global-state-1',
+        master_geography_id: 'global-state-1',
+      },
+      {
+        id: 'tenant-city-1',
+        parent_id: 'tenant-state-1',
+        global_geography_id: null,
+        master_geography_id: null,
+      },
+    ];
+  };
+
+  t.after(() => {
+    Geography.findAll = originalGeographyFindAll;
+  });
+
+  const ids = await expandDescendantGeographies({
+    tenantId: 'tenant-1',
+    seedGeographyIds: ['global-state-1'],
+  });
+
+  assert.deepEqual(ids, ['global-state-1', 'tenant-state-1', 'tenant-city-1']);
+  assert.equal(capturedWhere.is_active, true);
+  assert.equal(capturedWhere[Op.or].length, 2);
+});
+
+test('geography-scoped role does not receive geography-less legacy facilities through name matching', async (t) => {
   const originalGeographyFindAll = Geography.findAll;
   const originalFacilityFindAll = Facility.findAll;
-  const originalTenantFindByPk = Tenant.findByPk;
-  let facilityLookupCount = 0;
 
   Geography.findAll = async () => [{ id: 'geo-state-1', parent_id: null }];
-  Facility.findAll = async () => {
-    facilityLookupCount += 1;
-    return facilityLookupCount === 1 ? [] : [{ id: 'legacy-facility-1' }];
-  };
-  Tenant.findByPk = async () => ({
-    country_name: 'India',
-    state_name: 'Maharashtra',
-    district_name: 'Nashik',
-    city_name: 'Nashik',
-  });
+  Facility.findAll = async () => [];
 
   t.after(() => {
     Geography.findAll = originalGeographyFindAll;
     Facility.findAll = originalFacilityFindAll;
-    Tenant.findByPk = originalTenantFindByPk;
   });
 
   const scope = await resolveEffectiveScope({
@@ -220,5 +248,5 @@ test('named state scope safely reaches legacy tenant facilities without a parent
   });
 
   assert.equal(scope.scopeLevel, ScopeLevels.STATE);
-  assert.deepEqual(scope.scopeFacilityIds, ['legacy-facility-1']);
+  assert.deepEqual(scope.scopeFacilityIds, []);
 });

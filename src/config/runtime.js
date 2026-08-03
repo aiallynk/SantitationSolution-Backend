@@ -392,7 +392,7 @@ const runtimeConfig = Object.freeze({
   },
   alerts: {
     // BLE wand environmental thresholds (configurable via env; null disables a
-    // bound). PPM channel stays disabled by default until calibrated.
+    // bound). The PPM defaults implement the approved 0-120+ odor tiers.
     sensor: {
       temperature: {
         highWarningC: asNumber(rawEnv.SENSOR_TEMP_HIGH_WARNING_C, defaults.alerts.sensor.temperature.highWarningC),

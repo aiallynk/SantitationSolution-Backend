@@ -30,6 +30,17 @@ test('isFacilityInScope returns false for out-of-scope facility ids', () => {
   assert.equal(isFacilityInScope(req, 'fac-1'), true);
 });
 
+test('isFacilityInScope fails closed for a geography-scoped actor with no authorised facilities', () => {
+  const req = {
+    user: {
+      isSuperAdmin: false,
+      scopeFacilityIds: [],
+      scopeLevel: 'city',
+    },
+  };
+  assert.equal(isFacilityInScope(req, 'legacy-facility-without-geography'), false);
+});
+
 test('applyScopeToQuery enforces facility scope for supervisor access context', () => {
   const accessContext = buildAccessContextFromUser({
     role: 'supervisor',
