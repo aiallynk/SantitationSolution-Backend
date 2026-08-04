@@ -58,6 +58,7 @@ router.post(
 );
 router.get('/inspections', requirePermissions('inspection.review'), validate(validateInspectionListQuery), inspectionController.getAllInspections);
 router.get('/inspections/my', requirePermissions('inspection.create'), validate(validateInspectionListQuery), inspectionController.getMyInspections);
+router.get('/inspections/capture-configuration', requirePermissions('inspection.create'), inspectionController.getInspectionCaptureConfiguration);
 router.get('/toilets/:toiletId/inspections', requirePermissions('dashboard.read'), inspectionController.getToiletInspections);
 router.get('/toilets/:id/details', requirePermissions('dashboard.read'), inspectionController.getToiletDetails);
 router.get('/toilets/:id/latest-inspection', requirePermissions('dashboard.read'), inspectionController.getToiletLatestInspection);

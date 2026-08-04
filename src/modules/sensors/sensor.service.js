@@ -1141,20 +1141,29 @@ const getToiletReadingHistory = async (req) => {
   let where = { device_id: { [Op.in]: deviceIds } };
   where = applyDateRangeToWhere(where, 'timestamp', range);
 
-  const { rows, count } = await SensorReading.findAndCountAll({
+  const { rows } = await SensorReading.findAndCountAll({
     where,
     order: [['timestamp', 'DESC']],
     limit,
     offset,
   });
 
+  // Chart-only day gate — see filterReadingsToInspectionDays. Fetched page is
+  // filtered down to readings captured on days this toilet had an inspection.
+  const dayKeysByToilet = await loadInspectionDayKeysByToilet(req, { toiletUnitIds: [toilet.id], range });
+  const inspectionDays = dayKeysByToilet.get(String(toilet.id)) || new Set();
+  const filteredRows = rows.filter((row) => {
+    const day = toIstDateKey(row.timestamp);
+    return day ? inspectionDays.has(day) : false;
+  });
+
   return {
-    items: rows.map(mapReading),
+    items: filteredRows.map(mapReading),
     meta: {
       page,
       limit,
-      total: count,
-      totalPages: Math.max(1, Math.ceil(count / limit)),
+      total: filteredRows.length,
+      totalPages: Math.max(1, Math.ceil(filteredRows.length / limit)),
       range: range.range,
       toiletUnitId: toilet.id,
     },
@@ -1453,6 +1462,52 @@ const loadReadingsForDevices = async ({ deviceIds, range, limit = 10000 }) => {
   });
 };
 
+/*
+ * Chart-only day gate: trend/breach charts should read as "what did the
+ * environment look like on days this toilet was actually inspected", not a
+ * continuous IoT feed. This intentionally does NOT touch latest readings,
+ * device health/online status, or alerting — those must stay live and
+ * continuous regardless of inspection cadence (see getToiletSensorAnalysis /
+ * getSensorAnalyticsOverview, which only pass chart-bound reading sets
+ * through this filter).
+ */
+const loadInspectionDayKeysByToilet = async (req, { toiletUnitIds = [], range } = {}) => {
+  const ids = uniqueIds(toiletUnitIds);
+  const map = new Map();
+  if (ids.length === 0) return map;
+  let where = scopedWhere(req, { toilet_unit_id: { [Op.in]: ids } }, 'sensor');
+  if (range) where = applyDateRangeToWhere(where, 'captured_at', range);
+  const rows = await Inspection.findAll({
+    where,
+    attributes: ['toilet_unit_id', 'captured_at'],
+    raw: true,
+  });
+  for (const row of rows) {
+    const day = toIstDateKey(row.captured_at);
+    if (!day) continue;
+    const key = String(row.toilet_unit_id);
+    const set = map.get(key) || new Set();
+    set.add(day);
+    map.set(key, set);
+  }
+  return map;
+};
+
+const filterReadingsToInspectionDays = async (req, readings, devicesById, range) => {
+  if (!Array.isArray(readings) || readings.length === 0) return [];
+  const toiletUnitIds = uniqueIds([...devicesById.values()].map((device) => device.toilet_unit_id));
+  const dayKeysByToilet = await loadInspectionDayKeysByToilet(req, { toiletUnitIds, range });
+  return readings.filter((reading) => {
+    const device = devicesById.get(String(reading.device_id || reading.deviceId || ''));
+    const toiletId = device?.toilet_unit_id;
+    if (!toiletId) return false;
+    const days = dayKeysByToilet.get(String(toiletId));
+    if (!days || days.size === 0) return false;
+    const day = toIstDateKey(reading.timestamp);
+    return day ? days.has(day) : false;
+  });
+};
+
 const buildComparisonRows = ({ devices, latestByDeviceId, readings, metricKey, facilitiesById, toiletsById }) => {
   const grouped = new Map();
   for (const device of devices) {
@@ -1523,6 +1578,7 @@ const getSensorAnalyticsOverview = async (req) => {
   }
 
   const devicesById = new Map(devices.map((device) => [String(device.id), device]));
+  const chartReadings = await filterReadingsToInspectionDays(req, readings, devicesById, range);
   const latestStatuses = devices.map((device) =>
     mapOperationalDeviceStatus({
       device,
@@ -1567,8 +1623,8 @@ const getSensorAnalyticsOverview = async (req) => {
       .filter((row) => ['critical', 'warning', 'stale'].includes(row.status))
       .sort((left, right) => (STATUS_RANK[right.status] || 0) - (STATUS_RANK[left.status] || 0))
       .slice(0, 5),
-    timeSeries: aggregateTimeSeries({ readings, devicesById, metricKey, granularity }),
-    breachSeries: buildBreachSeries({ readings, devicesById, granularity: 'daily' }),
+    timeSeries: aggregateTimeSeries({ readings: chartReadings, devicesById, metricKey, granularity }),
+    breachSeries: buildBreachSeries({ readings: chartReadings, devicesById, granularity: 'daily' }),
     comparison: comparison.slice(0, 20),
     health: {
       activeSensors: devices.filter((device) => device.status === 'active').length,
@@ -1596,12 +1652,13 @@ const getSensorTimeSeries = async (req) => {
   const deviceIds = devices.map((device) => device.id);
   const readings = await loadReadingsForDevices({ deviceIds, range, limit: req.query.limit || 20000 });
   const devicesById = new Map(devices.map((device) => [String(device.id), device]));
+  const chartReadings = await filterReadingsToInspectionDays(req, readings, devicesById, range);
   return {
     metric: getMetricConfig(metricKey),
     threshold: getMetricThresholdSummary(metricKey),
     granularity,
     range: { start: toIso(range.start), end: toIso(range.end), label: range.label },
-    points: aggregateTimeSeries({ readings, devicesById, metricKey, granularity }),
+    points: aggregateTimeSeries({ readings: chartReadings, devicesById, metricKey, granularity }),
   };
 };
 
@@ -1765,8 +1822,9 @@ const getToiletSensorAnalysis = async (req) => {
       toiletsById: labels.toiletsById,
     })
   );
-  const timeSeries = aggregateTimeSeries({ readings, devicesById, metricKey, granularity });
-  const breachSeries = buildBreachSeries({ readings, devicesById, granularity: 'daily' });
+  const chartReadings = await filterReadingsToInspectionDays(req, readings, devicesById, range);
+  const timeSeries = aggregateTimeSeries({ readings: chartReadings, devicesById, metricKey, granularity });
+  const breachSeries = buildBreachSeries({ readings: chartReadings, devicesById, granularity: 'daily' });
   const evidence = await getImageLinkedSensorEvidence({
     ...req,
     query: { ...req.query, toiletUnitId: toilet.id, limit: req.query.evidenceLimit || 12 },

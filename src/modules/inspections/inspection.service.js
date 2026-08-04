@@ -15,6 +15,7 @@ const {
   Alert,
   SensorReading,
   SensorDevice,
+  Tenant,
 } = require('../../models');
 const { normalizePagination, sanitizeText, isUuid } = require('../../utils/validators');
 const { uploadImage, removeTempFile } = require('../media/storage.service');
@@ -66,11 +67,14 @@ const {
   getToiletLatestInspection,
   getToiletScoreTrends,
   getToiletInspectionHistory,
+  canViewAdminDiagnostics,
 } = require('./inspectionEvidence.service');
 const {
   IMAGE_PROCESSING_STATES,
 } = require('./imageLifecycle.constants');
 const { runtimeConfig } = require('../../config/runtime');
+const { resolveTenantFeatureFlags } = require('../../core/config/tenantFeatureFlags');
+const { toInspectionMediaSensorEvidenceFields } = require('../sensors/sensorEvidenceV2.service');
 
 const uniqueIds = (values = []) =>
   [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
@@ -90,6 +94,26 @@ const INSPECTION_TYPE_ALIASES = {
   complaint: 'complaint_based',
   complaint_based: 'complaint_based',
   surprise: 'surprise_audit',
+};
+
+// Small authenticated configuration response for the offline-first mobile
+// client. Flags default to false so a missing backend deployment preserves V1.
+const getInspectionCaptureConfiguration = async (req) => {
+  const tenantId = req.user?.tenantId;
+  if (!tenantId) {
+    return {
+      synchronizedSensorCaptureV2: false,
+      explainableScoringV2: false,
+      captureProtocolVersion: 'legacy',
+    };
+  }
+  const tenant = await Tenant.findByPk(tenantId, { attributes: ['id', 'metadata', 'ai_scoring_mode', 'updated_at'] });
+  const flags = resolveTenantFeatureFlags(tenant);
+  return {
+    ...flags,
+    captureProtocolVersion: flags.synchronizedSensorCaptureV2 ? 'sensor-capture-v2' : 'legacy',
+    updatedAt: tenant?.updated_at || null,
+  };
 };
 
 const SUBMISSION_TARGETS = Object.freeze({
@@ -927,7 +951,10 @@ const loadLatestReviewByInspectionIds = async (inspectionIds) => {
   return map;
 };
 
-const mapInspectionMediaItem = (item, { displayTimezone = getDefaultTimezone() } = {}) => {
+const mapInspectionMediaItem = (
+  item,
+  { displayTimezone = getDefaultTimezone(), includeAdminDiagnostics = false } = {}
+) => {
   const aiScoring =
     item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
       ? item.metadata.ai_scoring || null
@@ -1057,6 +1084,46 @@ const mapInspectionMediaItem = (item, { displayTimezone = getDefaultTimezone() }
     deviceId: item.device_id || null,
     workerId: item.worker_id || null,
     assignmentId: item.assignment_id || null,
+    // Per-image evidence is deliberately a public, non-raw summary. Raw BLE
+    // packets and timestamp diagnostics remain restricted to the diagnostics
+    // evidence endpoint for authorised users.
+    sensorEvidence: item.sensor_evidence
+      ? {
+          protocolVersion: item.capture_protocol_version || item.sensor_evidence?.protocolVersion || null,
+          syncQuality: item.sensor_sync_quality || item.sensor_evidence?.validation?.status || 'LEGACY_UNKNOWN',
+          confidence: item.sensor_confidence || item.sensor_evidence?.validation?.confidence || 'UNKNOWN',
+          classification: item.sensor_evidence?.validation?.classification || 'RECORDED_UNCLASSIFIED',
+          stability: item.sensor_stability || 'UNKNOWN',
+          syncDeltaMs:
+            item.sensor_sync_delta_ms !== null && item.sensor_sync_delta_ms !== undefined
+              ? Number(item.sensor_sync_delta_ms)
+              : null,
+          sampleCount:
+            item.sensor_sample_count !== null && item.sensor_sample_count !== undefined
+              ? Number(item.sensor_sample_count)
+              : null,
+          windowMedianPpm:
+            item.sensor_window_median_ppm !== null && item.sensor_window_median_ppm !== undefined
+              ? Number(item.sensor_window_median_ppm)
+              : null,
+          windowMinPpm:
+            item.sensor_window_min_ppm !== null && item.sensor_window_min_ppm !== undefined
+              ? Number(item.sensor_window_min_ppm)
+              : null,
+          windowMaxPpm:
+            item.sensor_window_max_ppm !== null && item.sensor_window_max_ppm !== undefined
+              ? Number(item.sensor_window_max_ppm)
+              : null,
+          windowSpreadPpm:
+            item.sensor_window_spread !== null && item.sensor_window_spread !== undefined
+              ? Number(item.sensor_window_spread)
+              : null,
+          timestampSource: item.sensor_timestamp_source || null,
+          calibrationVersion: item.sensor_calibration_version || null,
+          evidenceId: item.evidence_id || item.sensor_evidence?.evidenceId || null,
+          diagnostics: includeAdminDiagnostics ? item.sensor_evidence : null,
+        }
+      : null,
     metadata: item.metadata,
   };
 };
@@ -1185,7 +1252,13 @@ const resolveAttachmentValidationError = ({
 
 const mapInspection = (
   inspection,
-  { withAnalysis = true, reviewByInspectionId = new Map(), displayTimezone = getDefaultTimezone(), timezoneSource = 'deployment_default' } = {}
+  {
+    withAnalysis = true,
+    reviewByInspectionId = new Map(),
+    displayTimezone = getDefaultTimezone(),
+    timezoneSource = 'deployment_default',
+    includeAdminDiagnostics = false,
+  } = {}
 ) => {
   const allMedia = dedupeInspectionMedia(inspection.InspectionMedia || []);
   const media = allMedia.filter((item) => isMediaEvidenceRow(item));
@@ -1331,6 +1404,15 @@ const mapInspection = (
     lastProcessingError: inspection.last_processing_error || null,
     overallStatus: inspection.overall_status,
     sensorSnapshot: normalizeSensorSnapshot(inspection.sensor_snapshot),
+    scoringMode: inspection.scoring_mode || inspection.ai_scoring_mode_applied || null,
+    scoringConfigVersion: inspection.scoring_config_version || inspection.ai_scoring_policy_version || null,
+    scoringFormulaVersion: inspection.scoring_formula_version || null,
+    aiModelVersion: inspection.ai_model_version || null,
+    sensorCalibrationVersion: inspection.sensor_calibration_version || null,
+    captureProtocolVersion: inspection.capture_protocol_version || 'legacy',
+    scoringExplanation: inspection.scoring_explanation_json || null,
+    componentScores: inspection.component_scores_json || null,
+    scoreReasons: inspection.score_reasons_json || null,
     beforeImageCount:
       beforeMedia.length > 0
         ? beforeMedia.length
@@ -1423,9 +1505,9 @@ const mapInspection = (
           employeeCode: inspection.inspector.employee_code,
         }
       : null,
-    beforeMedia: beforeMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
-    afterMedia: afterMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
-    media: media.map((item) => mapInspectionMediaItem(item, { displayTimezone })),
+    beforeMedia: beforeMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone, includeAdminDiagnostics })),
+    afterMedia: afterMedia.map((item) => mapInspectionMediaItem(item, { displayTimezone, includeAdminDiagnostics })),
+    media: media.map((item) => mapInspectionMediaItem(item, { displayTimezone, includeAdminDiagnostics })),
     timeline,
     analysisResult: result
       ? {
@@ -1720,6 +1802,7 @@ const createInspection = async (req) => {
     withAnalysis: false,
     displayTimezone: display.timezone,
     timezoneSource: display.source,
+    includeAdminDiagnostics: canViewAdminDiagnostics(req),
   });
 };
 
@@ -1761,6 +1844,10 @@ const uploadInspectionMedia = async (req) => {
   const gpsLat = parseOptionalNumber(req.body.gpsLat ?? req.body.gps_lat);
   const gpsLng = parseOptionalNumber(req.body.gpsLng ?? req.body.gps_lng);
   const watermarkMeta = parseOptionalObject(req.body.watermarkMeta);
+  const sensorEvidence = parseOptionalObject(
+    req.body.sensorEvidence ?? req.body.sensor_evidence ?? watermarkMeta?.sensorEvidenceV2 ?? watermarkMeta?.sensorEvidence
+  );
+  const sensorEvidenceFields = toInspectionMediaSensorEvidenceFields(sensorEvidence);
   const mediaType = resolveMediaTypeFromUpload(req.file, req.uploadFileKind);
   const shouldQueueAi = mediaType === 'image' && isAutoAnalysisOnUploadEnabled();
   const now = new Date();
@@ -1886,6 +1973,7 @@ const uploadInspectionMedia = async (req) => {
     gps_lng: gpsLng,
     device_id: req.body.deviceId || req.body.device_id || null,
     watermark_meta: watermarkMeta,
+    ...sensorEvidenceFields,
     captured_at: capture.capturedAtUtc,
     captured_at_utc: capture.capturedAtUtc,
     capture_timezone: capture.captureTimezone,
@@ -2742,6 +2830,7 @@ const getInspectionById = async (req) => {
     reviewByInspectionId: reviewMap,
     displayTimezone: display.timezone,
     timezoneSource: display.source,
+    includeAdminDiagnostics: canViewAdminDiagnostics(req),
   });
 };
 
@@ -2867,6 +2956,7 @@ const getToiletInspectionHistoryById = async (req) => {
 };
 
 module.exports = {
+  getInspectionCaptureConfiguration,
   createInspection,
   startInspection,
   uploadInspectionMedia,

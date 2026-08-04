@@ -31,6 +31,7 @@ const {
 } = require('../media/uploadPolicy');
 const { runtimeConfig } = require('../../config/runtime');
 const { resolveCaptureTimestamp, resolveDisplayTimezone } = require('../../utils/timezone');
+const { toInspectionMediaSensorEvidenceFields } = require('../sensors/sensorEvidenceV2.service');
 
 const ALLOWED_CAPTURE_STAGE = new Set(['before', 'after', 'evidence']);
 const MAX_CONTENT_LENGTH_BYTES = Number(MEDIA_MAX_FILE_SIZE || 8 * 1024 * 1024);
@@ -306,6 +307,9 @@ const createUploadSessions = async (req) => {
         explicitTimezone: image.displayTimezone,
       });
       const capture = resolveCaptureTimestamp(image, display.timezone);
+      const sensorEvidenceFields = toInspectionMediaSensorEvidenceFields(
+        image.sensorEvidence || image.sensor_evidence || image.watermarkMeta?.sensorEvidenceV2 || image.watermarkMeta?.sensorEvidence || null
+      );
       const mediaUpdatePayload = {
         toilet_unit_id: inspection.toilet_unit_id || null,
         worker_id: inspection.inspector_user_id || req.user?.id || null,
@@ -341,6 +345,7 @@ const createUploadSessions = async (req) => {
           image.watermarkMeta && typeof image.watermarkMeta === 'object'
             ? image.watermarkMeta
             : null,
+        ...sensorEvidenceFields,
         overall_score: null,
         confidence_score: null,
         floor_score: null,
@@ -455,6 +460,9 @@ const createUploadSessions = async (req) => {
               image.watermarkMeta && typeof image.watermarkMeta === 'object'
                 ? image.watermarkMeta
                 : media.watermark_meta,
+            ...(image.sensorEvidence || image.sensor_evidence || image.watermarkMeta?.sensorEvidenceV2 || image.watermarkMeta?.sensorEvidence
+              ? toInspectionMediaSensorEvidenceFields(image.sensorEvidence || image.sensor_evidence || image.watermarkMeta?.sensorEvidenceV2 || image.watermarkMeta?.sensorEvidence)
+              : {}),
           },
           { transaction }
         );

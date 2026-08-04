@@ -69,6 +69,9 @@ Return this production schema first:
   "overallScore": 0,
   "starRating": 0.0,
   "confidence": 0.0,
+  "toiletDetected": true,
+  "sceneType": "toilet | urinal | other | unclear",
+  "visibilityScore": 0.0,
   "imageQuality": {
     "usable": true,
     "score": 0.0,
@@ -1104,7 +1107,7 @@ const callOpenAiVisionJson = async ({
   };
 };
 
-const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext = {}, sensorSnapshot = null }) => {
+const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext = {}, sensorSnapshot = null, singleStructuredPass = false }) => {
   assertOpenAiAnalysisConfigured();
 
   const selected = Array.isArray(mediaRows) ? mediaRows[0] : null;
@@ -1131,22 +1134,50 @@ const analyzeInspectionWithOpenAI = async ({ inspection, mediaRows, usageContext
       : 'Sensor context: unavailable',
   ].join(', ');
 
-  const [detectionPass, scoringPass] = await Promise.all([
-    callOpenAiVisionJson({
-      model,
-      promptText: DETECTION_PROMPT,
-      imageUrl,
-      contextText,
-      maxTokens: 220,
-    }),
-    callOpenAiVisionJson({
+  let detectionPass;
+  let scoringPass;
+  if (singleStructuredPass) {
+    // V2 uses one structured vision response. Detection fields are included in
+    // the scoring schema so modes can be recalculated without another billable call.
+    scoringPass = await callOpenAiVisionJson({
       model,
       promptText: SCORING_PROMPT,
       imageUrl,
       contextText,
-      maxTokens: 950,
-    }),
-  ]);
+      maxTokens: 1050,
+    });
+    const raw = scoringPass.parsed || {};
+    detectionPass = {
+      parsed: {
+        toilet_detected: raw.toiletDetected !== false && raw.toilet_detected !== false && raw.imageQuality?.usable !== false,
+        urinal_detected: String(raw.sceneType || raw.scene_type || '').trim().toLowerCase() === 'urinal',
+        scene_type: raw.sceneType || raw.scene_type || 'unclear',
+        visibility_score: raw.visibilityScore ?? raw.visibility_score ?? raw.imageQuality?.score ?? 0.5,
+        toilet_visibility: raw.toiletDetected === false || raw.toilet_detected === false ? 'not_visible' : 'partial',
+        reason: 'Derived from the V2 structured scoring response',
+      },
+      responseId: null,
+      usage: null,
+      latencyMs: 0,
+    };
+  } else {
+    [detectionPass, scoringPass] = await Promise.all([
+      callOpenAiVisionJson({
+        model,
+        promptText: DETECTION_PROMPT,
+        imageUrl,
+        contextText,
+        maxTokens: 220,
+      }),
+      callOpenAiVisionJson({
+        model,
+        promptText: SCORING_PROMPT,
+        imageUrl,
+        contextText,
+        maxTokens: 950,
+      }),
+    ]);
+  }
   const detection = normalizeDetectionPayload(detectionPass.parsed);
   const strictJson = normalizeScoringPayload(scoringPass.parsed);
   const sensorImpact = Number.isFinite(Number(strictJson.sensor_impact))

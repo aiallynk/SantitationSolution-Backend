@@ -1,0 +1,20 @@
+{
+  "version": "1.0.23",
+  "buildNumber": 23,
+  "source": "/Users/tusharmahajan/Ai Ally/Sanitation Solution/SanitationSolution-App/build/app/outputs/flutter-apk/app-release.apk",
+  "target": "/Users/tusharmahajan/Ai Ally/Sanitation Solution/SantitationSolution-Backend/apk/green_toilet_v1.0.23.apk",
+  "sha256": "4eff9bbe42404a8d1f2fe2f9d0bedecb35d1627ec3df5b8e8bb5e9e003546776",
+  "metadata": {
+    "latestVersion": "1.0.23",
+    "latestBuildNumber": 23,
+    "minimumSupportedVersion": "1.0.18",
+    "minimumSupportedBuildNumber": 18,
+    "apkUrl": "",
+    "apkFileName": "green_toilet_v1.0.23.apk",
+    "releaseNotes": "- Improved performance and stability\n- Bug fixes and minor improvements",
+    "sha256": "4eff9bbe42404a8d1f2fe2f9d0bedecb35d1627ec3df5b8e8bb5e9e003546776",
+    "checksum": "4eff9bbe42404a8d1f2fe2f9d0bedecb35d1627ec3df5b8e8bb5e9e003546776"
+  },
+  "firebaseDistribution": "uploaded",
+  "releasedAt": "2026-08-04T10:48:14.638Z"
+}

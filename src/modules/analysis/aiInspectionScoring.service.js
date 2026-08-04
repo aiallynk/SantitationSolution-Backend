@@ -1,5 +1,6 @@
-const AI_SCORING_POLICY_VERSION = 'tenant-ai-scoring-v1';
-const AI_SCORING_MODES = new Set(['light', 'medium', 'high']);
+const AI_SCORING_POLICY_VERSION = 'tenant-ai-scoring-v1-strict-alias';
+// `high` is retained only as a stored/API compatibility alias for `strict`.
+const AI_SCORING_MODES = new Set(['light', 'medium', 'strict', 'high']);
 const DEFAULT_AI_SCORING_MODE = 'medium';
 
 // Medium preserves the established sanitation result. The other policies change
@@ -7,7 +8,7 @@ const DEFAULT_AI_SCORING_MODE = 'medium';
 const AI_SCORING_POLICIES = Object.freeze({
   light: { minor: 0.2, moderate: 0.65, major: 1, critical: 1.1 },
   medium: { minor: 0.75, moderate: 1, major: 1.25, critical: 1.45 },
-  high: { minor: 1.15, moderate: 1.45, major: 1.7, critical: 2 },
+  strict: { minor: 1.15, moderate: 1.45, major: 1.7, critical: 2 },
 });
 
 const SEVERITY_PENALTIES = Object.freeze({ minor: 8, moderate: 20, major: 38, critical: 70 });
@@ -20,6 +21,7 @@ const round2 = (value) => Number(Number(value).toFixed(2));
 
 const resolveAiScoringMode = (value) => {
   const mode = String(value || '').trim().toLowerCase();
+  if (mode === 'high') return 'strict';
   return AI_SCORING_MODES.has(mode) ? mode : DEFAULT_AI_SCORING_MODE;
 };
 
@@ -99,10 +101,10 @@ const criticalCaps = (findings, mode) => {
   const text = findings.map((finding) => `${finding.issue} ${finding.evidence}`).join(' | ');
   const hasBiohazard = BIOHAZARD_KEYWORDS.test(text) && findings.some((finding) => finding.safetyCritical || finding.severity === 'critical');
   const hasUnusable = UNUSABLE_KEYWORDS.test(text) && findings.some((finding) => finding.safetyCritical || finding.severity === 'critical');
-  if (hasBiohazard) return { cap: { light: 35, medium: 25, high: 15 }[mode], reason: 'critical_biohazard' };
-  if (hasUnusable) return { cap: { light: 30, medium: 20, high: 10 }[mode], reason: 'critical_unusable_facility' };
+  if (hasBiohazard) return { cap: { light: 35, medium: 25, strict: 15 }[mode], reason: 'critical_biohazard' };
+  if (hasUnusable) return { cap: { light: 30, medium: 20, strict: 10 }[mode], reason: 'critical_unusable_facility' };
   if (findings.some((finding) => finding.safetyCritical || finding.severity === 'critical')) {
-    return { cap: { light: 40, medium: 30, high: 20 }[mode], reason: 'critical_hygiene_or_safety' };
+    return { cap: { light: 40, medium: 30, strict: 20 }[mode], reason: 'critical_hygiene_or_safety' };
   }
   return null;
 };

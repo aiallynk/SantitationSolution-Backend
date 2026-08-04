@@ -731,6 +731,30 @@ const mapMediaEvidence = async (row, options = {}) => {
     operationalStatus,
     explanationSummary: row.explanation_summary || null,
     watermarkMeta: row.watermark_meta || null,
+    sensorEvidence: row.sensor_evidence
+      ? {
+          protocolVersion: row.capture_protocol_version || row.sensor_evidence?.protocolVersion || null,
+          syncQuality: row.sensor_sync_quality || row.sensor_evidence?.validation?.status || 'LEGACY_UNKNOWN',
+          confidence: row.sensor_confidence || row.sensor_evidence?.validation?.confidence || 'UNKNOWN',
+          stability: row.sensor_stability || 'UNKNOWN',
+          syncDeltaMs: toNumber(row.sensor_sync_delta_ms, null),
+          sampleCount: toNumber(row.sensor_sample_count, null),
+          windowMedianPpm: toNumber(row.sensor_window_median_ppm, null),
+          windowMinPpm: toNumber(row.sensor_window_min_ppm, null),
+          windowMaxPpm: toNumber(row.sensor_window_max_ppm, null),
+          windowSpreadPpm: toNumber(row.sensor_window_spread, null),
+          timestampSource: row.sensor_timestamp_source || null,
+          calibrationVersion: row.sensor_calibration_version || null,
+          evidenceId: row.evidence_id || row.sensor_evidence?.evidenceId || null,
+          diagnostics: includeAdminDiagnostics ? row.sensor_evidence : null,
+        }
+      : {
+          protocolVersion: 'legacy',
+          syncQuality: 'LEGACY_UNKNOWN',
+          confidence: 'UNKNOWN',
+          stability: 'UNKNOWN',
+          diagnostics: null,
+        },
     metadata: row.metadata || null,
   };
 };
@@ -2880,6 +2904,7 @@ const getToiletDetails = async (toiletId, req) => {
 };
 
 module.exports = {
+  canViewAdminDiagnostics,
   mapMediaEvidence,
   resolveInspectionDisplayTime,
   scoreLabel,

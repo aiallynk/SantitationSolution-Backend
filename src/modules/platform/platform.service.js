@@ -60,6 +60,7 @@ const {
   AI_SCORING_MODES,
   resolveAiScoringMode,
 } = require('../analysis/aiInspectionScoring.service');
+const { FLAG_KEYS, resolveTenantFeatureFlags } = require('../../core/config/tenantFeatureFlags');
 
 const tenantScope = (req, requestedTenantId) => {
   if (req.user.isSuperAdmin) {
@@ -2940,6 +2941,7 @@ const mapTenantProfileForClient = (tenant) => {
     addressLine2: metadata.addressLine2 || null,
     pincode: metadata.pincode || null,
     timezone: normalizeTimezone(tenant.timezone || metadata.timezone || getDefaultTimezone()),
+    featureFlags: resolveTenantFeatureFlags(tenant),
   };
 };
 
@@ -2972,7 +2974,7 @@ const patchOwnTenantProfile = async (req) => {
     req.body.aiScoringMode !== undefined ? String(req.body.aiScoringMode || '').trim().toLowerCase() : null;
   const previousAiScoringMode = resolveAiScoringMode(tenant.ai_scoring_mode);
   if (requestedAiScoringMode !== null && !AI_SCORING_MODES.has(requestedAiScoringMode)) {
-    throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+    throw new AppError('aiScoringMode must be light, medium, or strict (high is accepted as a legacy alias)', 400, { code: 'INVALID_AI_SCORING_MODE' });
   }
   if (requestedAiScoringMode !== null) {
     nextMetadata.aiScoringModeUpdatedAt = new Date().toISOString();
@@ -2990,6 +2992,28 @@ const patchOwnTenantProfile = async (req) => {
   }
   if (req.body.timezone !== undefined) {
     nextMetadata.timezone = normalizeTimezoneInput(req.body.timezone, { nullable: false });
+  }
+  const requestedFeatureFlags = req.body.inspectionFeatureFlags;
+  if (requestedFeatureFlags !== undefined) {
+    if (!requestedFeatureFlags || typeof requestedFeatureFlags !== 'object' || Array.isArray(requestedFeatureFlags)) {
+      throw new AppError('inspectionFeatureFlags must be an object', 400, { code: 'VALIDATION_ERROR' });
+    }
+    const currentFlags =
+      nextMetadata.featureFlags && typeof nextMetadata.featureFlags === 'object' && !Array.isArray(nextMetadata.featureFlags)
+        ? { ...nextMetadata.featureFlags }
+        : {};
+    const updates = [
+      ['synchronizedSensorCaptureV2', FLAG_KEYS.synchronizedSensorCaptureV2],
+      ['explainableScoringV2', FLAG_KEYS.explainableScoringV2],
+    ];
+    for (const [requestKey, storedKey] of updates) {
+      if (requestedFeatureFlags[requestKey] === undefined) continue;
+      if (typeof requestedFeatureFlags[requestKey] !== 'boolean') {
+        throw new AppError(`${requestKey} must be boolean`, 400, { code: 'VALIDATION_ERROR' });
+      }
+      currentFlags[storedKey] = requestedFeatureFlags[requestKey];
+    }
+    nextMetadata.featureFlags = currentFlags;
   }
   const nextTimezone = nextMetadata.timezone || normalizeTimezone(tenant.timezone || getDefaultTimezone());
 
@@ -3054,6 +3078,12 @@ const patchOwnTenantProfile = async (req) => {
       details: { previousMode: previousAiScoringMode, newMode: requestedAiScoringMode, changedByRole: req.user?.role || req.user?.roleCodes?.[0] || null, source: 'tenant_settings' },
     });
   }
+  if (requestedFeatureFlags !== undefined) {
+    await createAuditLog({
+      req, actorUserId: req.user?.id, tenantId, action: 'tenant.inspection_feature_flags_update', entityType: 'tenant', entityId: tenant.id,
+      details: { flags: resolveTenantFeatureFlags({ metadata: nextMetadata }), source: 'tenant_settings', requestId: req.id || null },
+    });
+  }
 
   return mapTenantProfileForClient(tenant);
 };
@@ -3078,7 +3108,7 @@ const patchOwnTenantAiScoringMode = async (req) => {
   if (!tenantId) throw new AppError('Tenant context is required', 403, { code: 'SCOPE_FORBIDDEN' });
   const requestedMode = String(req.body?.aiScoringMode || '').trim().toLowerCase();
   if (!AI_SCORING_MODES.has(requestedMode)) {
-    throw new AppError('aiScoringMode must be light, medium, or high', 400, { code: 'INVALID_AI_SCORING_MODE' });
+    throw new AppError('aiScoringMode must be light, medium, or strict (high is accepted as a legacy alias)', 400, { code: 'INVALID_AI_SCORING_MODE' });
   }
   const tenant = await Tenant.findByPk(tenantId);
   if (!tenant) throw new AppError('Tenant not found', 404, { code: 'TENANT_NOT_FOUND' });

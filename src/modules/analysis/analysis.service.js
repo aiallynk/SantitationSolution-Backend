@@ -43,6 +43,11 @@ const {
   scoreInspectionFindings,
 } = require('./aiInspectionScoring.service');
 const { resolvePpmOdorTier } = require('../sensors/ppmOdorTier.service');
+const { resolveTenantFeatureFlags } = require('../../core/config/tenantFeatureFlags');
+const {
+  EXPLAINABLE_SCORING_V2_VERSION,
+  scoreExplainableInspection,
+} = require('./explainableScoringV2.service');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round2 = (value) =>
@@ -1172,6 +1177,8 @@ const runInspectionAnalysis = async ({
   // A missing/legacy tenant configuration must never block the inspection worker.
   const scoringTenant = await Tenant.findByPk(inspection.tenant_id, { attributes: ['id', 'ai_scoring_mode', 'metadata'] }).catch(() => null);
   const tenantAiScoringMode = resolveAiScoringMode(scoringTenant?.metadata?.aiScoringMode || scoringTenant?.ai_scoring_mode);
+  const tenantFeatureFlags = resolveTenantFeatureFlags(scoringTenant);
+  const explainableScoringV2Enabled = tenantFeatureFlags.explainableScoringV2;
 
   const processingJob = queueJobId
     ? await AiProcessingJob.findOne({
@@ -1383,7 +1390,18 @@ const runInspectionAnalysis = async ({
       const providerResult = await analyzeInspectionWithOpenAI({
         inspection,
         mediaRows: [mediaRow],
-        sensorSnapshot: inspection.sensor_snapshot || null,
+        // V2 keeps each image tied to its own evidence. Legacy analysis keeps
+        // the existing inspection-wide snapshot for backward compatibility.
+        sensorSnapshot: explainableScoringV2Enabled
+          ? (mediaRow.sensor_evidence?.nearestSample
+              ? {
+                  ...mediaRow.sensor_evidence.nearestSample,
+                  readingTime: mediaRow.sensor_evidence.nearestSample.sensorMeasuredAt || mediaRow.sensor_evidence.nearestSample.sensorReceivedAt || null,
+                  sensorStatus: mediaRow.sensor_evidence?.validation?.status || null,
+                }
+              : null)
+          : inspection.sensor_snapshot || null,
+        singleStructuredPass: explainableScoringV2Enabled,
         usageContext: {
           tenantId: inspection.tenant_id || req?.user?.tenantId || null,
           userId: req?.user?.id || null,
@@ -1480,14 +1498,46 @@ const runInspectionAnalysis = async ({
       });
       const visualScore = Number(singleImagePost.score_0_100 || 0);
       let overallScore = clamp(visualScore + appliedSensorImpact, 0, 100);
-      const appliedScoringPolicy = scoreInspectionFindings({
+      let appliedScoringPolicy = scoreInspectionFindings({
         mode: tenantAiScoringMode,
         baseScore: overallScore,
         strictJson: { ...strictJson, ...singleImagePost, detected_issues: issues },
         fallbackIssues: issues,
       });
       overallScore = appliedScoringPolicy.finalScore;
-      const finalConfidence = Number(singleImagePost.confidence || confidence || 0);
+      let presentation = singleImagePost;
+      let v2Scoring = null;
+      if (explainableScoringV2Enabled) {
+        v2Scoring = scoreExplainableInspection({
+          mode: tenantAiScoringMode,
+          findings: Array.isArray(strictJson.findings) && strictJson.findings.length > 0
+            ? strictJson.findings
+            : issues.map((issue) => ({ issue, severity: strictJson.severity_level, confidence: strictJson.confidence_score })),
+          sensorEvidence: mediaRow.sensor_evidence || null,
+        });
+        overallScore = v2Scoring.score;
+        appliedScoringPolicy = {
+          mode: v2Scoring.mode,
+          policyVersion: v2Scoring.scoringFormulaVersion,
+          baseScore: v2Scoring.components.visualHygiene.score,
+          finalScore: v2Scoring.score,
+          totalPenalty: round2(100 - v2Scoring.components.visualHygiene.score),
+          severityCounts: {},
+          findings: v2Scoring.findings,
+          capsApplied: v2Scoring.capsApplied,
+          explainable: v2Scoring,
+        };
+        presentation = {
+          ...singleImagePost,
+          score_0_100: v2Scoring.score,
+          star_rating_0_5: Number((v2Scoring.score / 20).toFixed(1)),
+          hygiene_risk: String(v2Scoring.hygieneRisk || 'MEDIUM').toLowerCase(),
+          cleanliness_level: String(v2Scoring.band || 'FAIR').toLowerCase(),
+          caps_applied: v2Scoring.capsApplied.map((item) => item.reason),
+          score_reason: v2Scoring.reasons.map((item) => item.explanation).filter(Boolean).join(' '),
+        };
+      }
+      const finalConfidence = Number(presentation.confidence || confidence || 0);
       const floorScore =
         strictJson && strictJson.floor_cleanliness !== undefined
           ? Number(strictJson.floor_cleanliness)
@@ -1517,11 +1567,11 @@ const runInspectionAnalysis = async ({
       });
       reviewRequired =
         reviewRequired ||
-        singleImagePost.requires_retake ||
-        ['high', 'severe'].includes(String(singleImagePost.hygiene_risk || '').toLowerCase()) ||
+        presentation.requires_retake ||
+        ['high', 'severe'].includes(String(presentation.hygiene_risk || '').toLowerCase()) ||
         Boolean(similarityResult?.suspicious);
       const severity =
-        severityFromHygieneRisk(singleImagePost.hygiene_risk) ||
+        severityFromHygieneRisk(presentation.hygiene_risk) ||
         strictJson?.severity_level ||
         (String(result.severityLabel || '').toLowerCase() === 'critical'
           ? 'high'
@@ -1534,11 +1584,11 @@ const runInspectionAnalysis = async ({
       if (confidenceEngine.reviewRequired) {
         suspiciousFlags.push('low_confidence');
       }
-      if (singleImagePost.requires_retake) {
+      if (presentation.requires_retake) {
         suspiciousFlags.push('retake_required');
       }
       const qualityWarning = qualityValidationStatus !== 'VALID';
-      const resolvedValidationStatus = singleImagePost.requires_retake
+      const resolvedValidationStatus = presentation.requires_retake
         ? 'RETAKE_REQUIRED'
         : lowConfidenceReview
           ? qualityWarning
@@ -1556,38 +1606,38 @@ const runInspectionAnalysis = async ({
       if (lowConfidenceReview) {
         validationReasons.push('Confidence below review threshold');
       }
-      if (singleImagePost.requires_retake && singleImagePost.retake_reason) {
-        validationReasons.push(singleImagePost.retake_reason);
+      if (presentation.requires_retake && presentation.retake_reason) {
+        validationReasons.push(presentation.retake_reason);
       }
       const resolvedValidationReason =
         validationReasons.length > 0 ? validationReasons.join(' | ').slice(0, 500) : null;
       const supervisorFlags = buildSupervisorReviewFlags({
-        singleImageResult: singleImagePost,
+        singleImageResult: presentation,
         pairwiseComparison: null,
         afterScore: overallScore,
       });
       const strictJsonFinal = {
         ...strictJson,
-        ...singleImagePost,
+        ...presentation,
         overall_cleanliness_score: overallScore,
         score_0_100: overallScore,
         star_rating_0_5: Number((overallScore / 20).toFixed(1)),
         visual_score: visualScore,
-        environmental_score: clamp(100 + appliedSensorImpact, 0, 100),
-        sensor_impact: appliedSensorImpact,
-        sensor_context: inspectionSensorContext,
+        environmental_score: v2Scoring ? v2Scoring.components.environmental.score : clamp(100 + appliedSensorImpact, 0, 100),
+        sensor_impact: v2Scoring ? 0 : appliedSensorImpact,
+        sensor_context: v2Scoring ? v2Scoring.sensor.evidence : inspectionSensorContext,
         sensor_reasons:
-          localSensorFusion.reasons.length > 0 ? localSensorFusion.reasons : undefined,
-        ppm_odor_tier: localSensorFusion.ppmOdorTier || undefined,
+          v2Scoring ? v2Scoring.sensor.reasons : (localSensorFusion.reasons.length > 0 ? localSensorFusion.reasons : undefined),
+        ppm_odor_tier: v2Scoring ? undefined : localSensorFusion.ppmOdorTier || undefined,
         confidence_score: finalConfidence,
-        critical_findings: singleImagePost.critical_findings,
+        critical_findings: presentation.critical_findings,
         detected_issues: issues,
         severity_level: severity,
         human_review_required: reviewRequired,
         findings: appliedScoringPolicy.findings,
         ai_scoring: appliedScoringPolicy,
         explanation_summary:
-          singleImagePost.score_reason ||
+          presentation.score_reason ||
           strictJson?.explanation_summary ||
           result.explanationText ||
           null,
@@ -1597,14 +1647,15 @@ const runInspectionAnalysis = async ({
           ? mediaRow.metadata
           : {};
       const scoringMetadata = {
-        ...singleImagePost,
+        ...presentation,
         ...appliedScoringPolicy,
         applied_at: new Date().toISOString(),
         prompt_version: result.promptVersion || PROMPT_VERSION,
         scoring_version: result.scoringVersion || SCORING_VERSION,
-        tenant_scoring_policy_version: AI_SCORING_POLICY_VERSION,
+        tenant_scoring_policy_version: v2Scoring ? EXPLAINABLE_SCORING_V2_VERSION : AI_SCORING_POLICY_VERSION,
         tenant_scoring_mode: appliedScoringPolicy.mode,
-        ppm_odor_tier: localSensorFusion.ppmOdorTier || null,
+        ppm_odor_tier: v2Scoring ? null : localSensorFusion.ppmOdorTier || null,
+        explainable_scoring_v2: v2Scoring,
         supervisor_flags: supervisorFlags,
       };
       const metadata = {
@@ -1635,7 +1686,7 @@ const runInspectionAnalysis = async ({
           quality !== 'ok' ||
           Boolean(similarityResult?.suspicious) ||
           lowConfidenceReview ||
-          singleImagePost.requires_retake,
+          presentation.requires_retake,
         model_version: result.modelVersion || null,
         prompt_version: result.promptVersion || PROMPT_VERSION,
         scoring_version: result.scoringVersion || SCORING_VERSION,
@@ -1686,11 +1737,11 @@ const runInspectionAnalysis = async ({
           finalScore: round2(overallScore),
           scoringMode: appliedScoringPolicy.mode,
           policyVersion: appliedScoringPolicy.policyVersion,
-          stars: singleImagePost.star_rating_0_5,
-          hygieneRisk: singleImagePost.hygiene_risk,
-          capsApplied: singleImagePost.caps_applied,
+          stars: presentation.star_rating_0_5,
+          hygieneRisk: presentation.hygiene_risk,
+          capsApplied: presentation.caps_applied,
           confidence: round2(finalConfidence),
-          requiresRetake: Boolean(singleImagePost.requires_retake),
+          requiresRetake: Boolean(presentation.requires_retake),
           suspiciousSimilarity: Boolean(similarityResult?.suspicious),
           supervisorFlags,
         })
@@ -1722,15 +1773,15 @@ const runInspectionAnalysis = async ({
             quality !== 'ok' ||
             Boolean(similarityResult?.suspicious) ||
             lowConfidenceReview ||
-            singleImagePost.requires_retake,
+            presentation.requires_retake,
           suspiciousFlags,
           validationStatus: resolvedValidationStatus,
           scoringRejected: false,
           lowConfidenceReview,
-          requiresRetake: Boolean(singleImagePost.requires_retake),
-          retakeReason: singleImagePost.retake_reason || null,
-          hygieneRisk: singleImagePost.hygiene_risk,
-          starRating: singleImagePost.star_rating_0_5,
+          requiresRetake: Boolean(presentation.requires_retake),
+          retakeReason: presentation.retake_reason || null,
+          hygieneRisk: presentation.hygiene_risk,
+          starRating: presentation.star_rating_0_5,
           similarityScore: similarityResult?.maxSimilarity || null,
           processingMs,
         },
@@ -2280,17 +2331,20 @@ const runInspectionAnalysis = async ({
   });
   result.processingMs = processingMs;
   const policyRows = imageResults.map((item) => item?.strictJson?.ai_scoring).filter(Boolean);
+  const explainableRows = policyRows.map((row) => row?.explainable).filter(Boolean);
+  const selectedExplainable = explainableRows[explainableRows.length - 1] || null;
   const severitySummary = policyRows.reduce((summary, row) => {
     for (const key of ['minor', 'moderate', 'major', 'critical']) summary[key] += Number(row?.severityCounts?.[key] || 0);
     return summary;
   }, { minor: 0, moderate: 0, major: 0, critical: 0 });
   result.aiScoring = {
-    mode: tenantAiScoringMode,
-    policyVersion: AI_SCORING_POLICY_VERSION,
+    mode: selectedExplainable?.mode || tenantAiScoringMode,
+    policyVersion: selectedExplainable?.scoringFormulaVersion || AI_SCORING_POLICY_VERSION,
     baseScore: round2(mean(policyRows.map((row) => row.baseScore)) ?? result.overallCleanlinessScore),
     finalScore: result.overallCleanlinessScore,
     severitySummary,
     capsApplied: policyRows.flatMap((row) => row.capsApplied || []),
+    explainable: selectedExplainable,
   };
   result.rawResult = { ...result.rawResult, aiScoring: result.aiScoring };
 
@@ -2320,6 +2374,15 @@ const runInspectionAnalysis = async ({
     ai_base_score: result.aiScoring.baseScore,
     ai_final_score: result.aiScoring.finalScore,
     ai_severity_summary: result.aiScoring.severitySummary,
+    scoring_mode: selectedExplainable?.mode || null,
+    scoring_config_version: selectedExplainable?.scoringConfigVersion || null,
+    scoring_formula_version: selectedExplainable?.scoringFormulaVersion || null,
+    ai_model_version_v2: selectedExplainable ? result.modelVersion : null,
+    sensor_calibration_version: selectedExplainable?.sensor?.evidence?.sensorCalibrationVersion || null,
+    capture_protocol_version: selectedExplainable?.sensor?.evidence?.protocolVersion || null,
+    scoring_explanation_json: selectedExplainable || null,
+    component_scores_json: selectedExplainable?.components || null,
+    score_reasons_json: selectedExplainable?.reasons || null,
     processed_at: processedAt,
   });
 
@@ -2332,6 +2395,15 @@ const runInspectionAnalysis = async ({
     last_processing_error: imageFailures.length > 0 ? failureMessage : null,
     ai_scoring_mode_applied: result.aiScoring.mode,
     ai_scoring_policy_version: result.aiScoring.policyVersion,
+    scoring_mode: selectedExplainable?.mode || null,
+    scoring_config_version: selectedExplainable?.scoringConfigVersion || null,
+    scoring_formula_version: selectedExplainable?.scoringFormulaVersion || null,
+    ai_model_version: selectedExplainable ? result.modelVersion : null,
+    sensor_calibration_version: selectedExplainable?.sensor?.evidence?.sensorCalibrationVersion || null,
+    capture_protocol_version: selectedExplainable?.sensor?.evidence?.protocolVersion || null,
+    scoring_explanation_json: selectedExplainable || null,
+    component_scores_json: selectedExplainable?.components || null,
+    score_reasons_json: selectedExplainable?.reasons || null,
     updated_at: processedAt,
   });
 

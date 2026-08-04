@@ -1,11 +1,11 @@
 {
-  "latestVersion": "1.0.22",
-  "latestBuildNumber": 22,
+  "latestVersion": "1.0.23",
+  "latestBuildNumber": 23,
   "minimumSupportedVersion": "1.0.18",
   "minimumSupportedBuildNumber": 18,
   "apkUrl": "",
-  "apkFileName": "green_toilet_v1.0.22.apk",
+  "apkFileName": "green_toilet_v1.0.23.apk",
   "releaseNotes": "- Improved performance and stability\n- Bug fixes and minor improvements",
-  "sha256": "1e8ee644c10528e0cf371fa9ee3b715fd8a7cdc0e28ca34a8901c38c5c39d035",
-  "checksum": "1e8ee644c10528e0cf371fa9ee3b715fd8a7cdc0e28ca34a8901c38c5c39d035"
+  "sha256": "4eff9bbe42404a8d1f2fe2f9d0bedecb35d1627ec3df5b8e8bb5e9e003546776",
+  "checksum": "4eff9bbe42404a8d1f2fe2f9d0bedecb35d1627ec3df5b8e8bb5e9e003546776"
 }

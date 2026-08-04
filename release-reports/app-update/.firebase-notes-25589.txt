@@ -1,0 +1,5 @@
+- Improved performance and stability
+- Bug fixes and minor improvements
+
+Version: 1.0.22+22
+SHA-256: 40ad2469992b0c24b56a2f87f6729f511803eb3f79baa887cddadc1d59c95b30

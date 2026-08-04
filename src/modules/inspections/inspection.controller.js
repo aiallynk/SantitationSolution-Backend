@@ -175,6 +175,15 @@ const postInspectionSensorReading = async (req, res, next) => {
   }
 };
 
+const getInspectionCaptureConfiguration = async (req, res, next) => {
+  try {
+    const data = await inspectionService.getInspectionCaptureConfiguration(req);
+    return sendSuccess(res, { message: 'Inspection capture configuration fetched successfully', data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getMyInspections = async (req, res, next) => {
   try {
     const result = await inspectionService.listInspections(req, true);
@@ -338,6 +347,7 @@ module.exports = {
   postSubmitInspection,
   getInspectionById,
   postInspectionSensorReading,
+  getInspectionCaptureConfiguration,
   getInspectionImages,
   getInspectionImageJobs,
   getInspectionImageById,
